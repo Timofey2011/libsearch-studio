@@ -45,6 +45,27 @@ cargo clippy --all-targets
 cargo fmt --all --check
 ```
 
+## Indexing (hybrid Python/MPS → Rust)
+
+Bulk embedding runs on Apple's GPU via Python (ONNX Runtime in Rust is CPU-only on
+macOS — ~6–14× slower; see the benchmark in git history). Because the Rust query
+embedder is parity-identical to Python's (cosine 1.0000), the index is fully
+compatible. Workflow:
+
+```bash
+# 1. Embed on MPS and write a Parquet of chunks+vectors (reuses the ebook-kb engine).
+/path/to/ebook-kb/.venv/bin/python scripts/index_to_parquet.py \
+    --out bench/books.parquet  book1.pdf book2.pdf ...
+
+# 2. Import the Parquet into LanceDB from Rust (fast; builds the FTS index).
+cargo run -p ls-cli -- import bench/books.parquet
+```
+
+Throughput (256 chunks @ ~370 tokens): Python MPS **14.4/s** vs Rust ORT CPU int8 2.2/s
+/ fp32 1.0/s. The indexer sets `HF_HUB_OFFLINE` to avoid a network revision-check
+stall. Pure-Rust CPU ingest (`ls-cli ingest <pdf>`) still exists for small/incremental
+sets but is slow for large libraries.
+
 ## Run (engine CLI, before the GUI)
 
 The dev CLI searches an existing LanceDB index (e.g. one built by `ebook-kb`). Because the
