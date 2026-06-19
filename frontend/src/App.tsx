@@ -72,6 +72,52 @@ export default function App() {
     setReader({ path: s.source_path, page: s.page });
   }
 
+  function chooseModel(m: string) {
+    setModel(m);
+    // Preload it so the next ask is warm (cold-load otherwise dominates latency).
+    invoke("warm_model", { model: m }).catch(console.error);
+  }
+
+  function openByRank(rank: number) {
+    const s = sources.find((x) => x.rank === rank);
+    if (s) openSource(s);
+  }
+
+  // Render the answer, turning [n] / [n, m] citation markers into clickable links
+  // (active once sources arrive) that jump straight to the cited page.
+  function renderAnswer(text: string) {
+    return text.split(/(\[[\d,\s]+\])/g).map((part, i) => {
+      const m = part.match(/^\[([\d,\s]+)\]$/);
+      if (!m) return <span key={i}>{part}</span>;
+      const nums = m[1].split(",").map((s) => s.trim()).filter(Boolean);
+      return (
+        <span key={i}>
+          [
+          {nums.map((n, j) => {
+            const rank = parseInt(n, 10);
+            const has = sources.some((x) => x.rank === rank);
+            return (
+              <span key={j}>
+                {j > 0 ? ", " : ""}
+                {has ? (
+                  <a
+                    onClick={() => openByRank(rank)}
+                    style={{ color: "#0a58ca", cursor: "pointer", textDecoration: "underline" }}
+                  >
+                    {n}
+                  </a>
+                ) : (
+                  n
+                )}
+              </span>
+            );
+          })}
+          ]
+        </span>
+      );
+    });
+  }
+
   // PDF.js / WKWebView honors the #page fragment to jump to a page.
   const readerSrc = reader
     ? convertFileSrc(reader.path) + (reader.page ? `#page=${reader.page}` : "")
@@ -90,7 +136,7 @@ export default function App() {
               </option>
             ))}
           </select>
-          <select value={model} onChange={(e) => setModel(e.target.value)}>
+          <select value={model} onChange={(e) => chooseModel(e.target.value)}>
             {models.length === 0 && <option value="">(no models)</option>}
             {models.map((m) => (
               <option key={m} value={m}>
@@ -112,7 +158,7 @@ export default function App() {
 
         {answer && (
           <div style={{ whiteSpace: "pre-wrap", marginTop: 16, padding: 12, background: "#f5f5f5", borderRadius: 8 }}>
-            {answer}
+            {renderAnswer(answer)}
           </div>
         )}
 

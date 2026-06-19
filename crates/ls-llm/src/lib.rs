@@ -81,6 +81,18 @@ impl OllamaClient {
         }
     }
 
+    /// Preload a model into memory without generating, so the first real request
+    /// is warm (cold-load of a multi-GB model otherwise dominates first-token latency).
+    pub async fn warm(&self, model: &str) -> Result<(), LlmError> {
+        self.http
+            .post(format!("{}/api/generate", self.base))
+            .json(&serde_json::json!({ "model": model, "prompt": "", "keep_alive": "30m" }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// Models available locally (`ollama list`).
     pub async fn list_models(&self) -> Result<Vec<String>, LlmError> {
         let body = self

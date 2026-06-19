@@ -71,6 +71,17 @@ async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> 
     state.llm.list_models().await.map_err(|e| e.to_string())
 }
 
+/// Preload a model into Ollama so the next `ask` is warm. Called when the user
+/// picks a model in the UI; errors are non-fatal (best-effort).
+#[tauri::command]
+async fn warm_model(state: State<'_, AppState>, model: String) -> Result<(), String> {
+    if model.trim().is_empty() {
+        return Ok(());
+    }
+    let _ = state.llm.warm(&model).await;
+    Ok(())
+}
+
 #[tauri::command]
 async fn ask(
     state: State<'_, AppState>,
@@ -182,12 +193,38 @@ pub fn run() {
                 )?;
             }
             app.manage(init_state());
+
+            // Pre-load the embedder/reranker in the background so the first ask
+            // doesn't pay the ONNX load cost.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let models = handle.state::<AppState>().models_dir.clone();
+                let loaded = tauri::async_runtime::spawn_blocking(move || {
+                    let e = Embedder::load(models.join("bge-m3")).ok()?;
+                    let r = Reranker::load(models.join("bge-reranker-v2-m3")).ok()?;
+                    Some(Engine {
+                        embedder: e,
+                        reranker: r,
+                    })
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(engine) = loaded {
+                    let state = handle.state::<AppState>();
+                    let mut guard = state.engine.lock().await;
+                    if guard.is_none() {
+                        *guard = Some(engine);
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_collections,
             create_collection,
             list_models,
+            warm_model,
             ask
         ])
         .run(tauri::generate_context!())
