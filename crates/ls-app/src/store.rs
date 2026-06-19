@@ -204,7 +204,7 @@ impl Db {
             out.push(Message {
                 id,
                 conversation_id,
-                role: Role::from_str(&role)
+                role: Role::parse(&role)
                     .ok_or_else(|| DbError::NotFound(format!("bad role {role}")))?,
                 content,
                 citations,

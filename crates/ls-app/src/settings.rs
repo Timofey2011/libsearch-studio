@@ -76,9 +76,11 @@ mod tests {
     fn roundtrips_through_toml() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
-        let mut s = Settings::default();
-        s.ollama_model = "qwen2.5:7b".into();
-        s.final_top_k = 8;
+        let s = Settings {
+            ollama_model: "qwen2.5:7b".into(),
+            final_top_k: 8,
+            ..Settings::default()
+        };
         s.save(&path).unwrap();
         let loaded = Settings::load(&path).unwrap();
         assert_eq!(loaded, s);

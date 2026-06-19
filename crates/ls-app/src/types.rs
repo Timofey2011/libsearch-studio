@@ -30,7 +30,7 @@ impl Role {
             Role::Assistant => "assistant",
         }
     }
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "user" => Some(Role::User),
             "assistant" => Some(Role::Assistant),
