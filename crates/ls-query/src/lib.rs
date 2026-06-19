@@ -21,7 +21,7 @@ pub enum QueryError {
     Embed(#[from] ls_embed::EmbedError),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub rank: usize,
     pub score: f32,

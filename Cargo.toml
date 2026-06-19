@@ -9,6 +9,7 @@ members = [
     "crates/ls-llm",
     "crates/ls-app",
     "crates/ls-cli",
+    "src-tauri",
 ]
 
 [workspace.package]
