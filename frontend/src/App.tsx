@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 type Collection = {
@@ -20,6 +20,8 @@ type SearchResult = {
   text: string;
 };
 
+type Reader = { path: string; page: number | null };
+
 export default function App() {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [models, setModels] = useState<string[]>([]);
@@ -29,6 +31,7 @@ export default function App() {
   const [answer, setAnswer] = useState("");
   const [sources, setSources] = useState<SearchResult[]>([]);
   const [busy, setBusy] = useState(false);
+  const [reader, setReader] = useState<Reader | null>(null);
 
   useEffect(() => {
     invoke<Collection[]>("list_collections").then(setCollections).catch(console.error);
@@ -57,11 +60,7 @@ export default function App() {
     setAnswer("");
     setSources([]);
     try {
-      const res = await invoke<SearchResult[]>("ask", {
-        collectionId: collId,
-        question,
-        model,
-      });
+      const res = await invoke<SearchResult[]>("ask", { collectionId: collId, question, model });
       setSources(res);
     } catch (e) {
       setAnswer("Error: " + String(e));
@@ -69,50 +68,93 @@ export default function App() {
     setBusy(false);
   }
 
+  function openSource(s: SearchResult) {
+    setReader({ path: s.source_path, page: s.page });
+  }
+
+  // PDF.js / WKWebView honors the #page fragment to jump to a page.
+  const readerSrc = reader
+    ? convertFileSrc(reader.path) + (reader.page ? `#page=${reader.page}` : "")
+    : "";
+
   return (
-    <div style={{ fontFamily: "system-ui, sans-serif", maxWidth: 820, margin: "2rem auto", padding: "0 1rem" }}>
-      <h1>LibSearch Studio</h1>
-      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-        <select value={collId} onChange={(e) => setCollId(e.target.value)}>
-          {collections.length === 0 && <option value="">(no collections)</option>}
-          {collections.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name}
-            </option>
-          ))}
-        </select>
-        <select value={model} onChange={(e) => setModel(e.target.value)}>
-          {models.length === 0 && <option value="">(no models)</option>}
-          {models.map((m) => (
-            <option key={m} value={m}>
-              {m}
-            </option>
-          ))}
-        </select>
-      </div>
-      <textarea
-        value={question}
-        onChange={(e) => setQuestion(e.target.value)}
-        rows={3}
-        style={{ width: "100%", boxSizing: "border-box" }}
-        placeholder="Ask your library…"
-      />
-      <button onClick={ask} disabled={busy || !collId}>
-        {busy ? "Thinking…" : "Ask"}
-      </button>
-      {answer && (
-        <div style={{ whiteSpace: "pre-wrap", marginTop: 16, padding: 12, background: "#f5f5f5", borderRadius: 8 }}>
-          {answer}
-        </div>
-      )}
-      {sources.length > 0 && (
-        <div style={{ marginTop: 16 }}>
-          <b>Sources</b>
-          <ol>
-            {sources.map((s) => (
-              <li key={s.rank}>{s.citation}</li>
+    <div style={{ display: "flex", height: "100vh", fontFamily: "system-ui, sans-serif" }}>
+      <div style={{ flex: 1, overflow: "auto", padding: "1rem 1.25rem", minWidth: 0 }}>
+        <h1 style={{ marginTop: 0 }}>LibSearch Studio</h1>
+        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+          <select value={collId} onChange={(e) => setCollId(e.target.value)}>
+            {collections.length === 0 && <option value="">(no collections)</option>}
+            {collections.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
             ))}
-          </ol>
+          </select>
+          <select value={model} onChange={(e) => setModel(e.target.value)}>
+            {models.length === 0 && <option value="">(no models)</option>}
+            {models.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </div>
+        <textarea
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          rows={3}
+          style={{ width: "100%", boxSizing: "border-box" }}
+          placeholder="Ask your library…"
+        />
+        <button onClick={ask} disabled={busy || !collId}>
+          {busy ? "Thinking…" : "Ask"}
+        </button>
+
+        {answer && (
+          <div style={{ whiteSpace: "pre-wrap", marginTop: 16, padding: 12, background: "#f5f5f5", borderRadius: 8 }}>
+            {answer}
+          </div>
+        )}
+
+        {sources.length > 0 && (
+          <div style={{ marginTop: 16 }}>
+            <b>Sources</b>
+            <ol style={{ paddingLeft: 20 }}>
+              {sources.map((s) => (
+                <li key={s.rank} style={{ marginBottom: 4 }}>
+                  <button
+                    onClick={() => openSource(s)}
+                    title="Open source at the cited page"
+                    style={{
+                      background: "none",
+                      border: "none",
+                      padding: 0,
+                      color: "#0a58ca",
+                      textAlign: "left",
+                      cursor: "pointer",
+                      textDecoration: "underline",
+                      font: "inherit",
+                    }}
+                  >
+                    {s.citation}
+                  </button>
+                </li>
+              ))}
+            </ol>
+          </div>
+        )}
+      </div>
+
+      {reader && (
+        <div style={{ flex: 1.2, borderLeft: "1px solid #ddd", display: "flex", flexDirection: "column", minWidth: 0 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 10px", background: "#fafafa", borderBottom: "1px solid #eee" }}>
+            <span style={{ fontSize: 13, color: "#555", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {reader.path.split("/").pop()}
+              {reader.page ? ` · p.${reader.page}` : ""}
+            </span>
+            <button onClick={() => setReader(null)}>✕</button>
+          </div>
+          <iframe key={readerSrc} title="source" src={readerSrc} style={{ flex: 1, border: "none" }} />
         </div>
       )}
     </div>

@@ -61,6 +61,12 @@ fn parse_tags(body: &str) -> Result<Vec<String>, LlmError> {
         .unwrap_or_default())
 }
 
+/// Context window passed to Ollama. Capping this is important for latency: some
+/// models register a very large default context (e.g. 262144), whose KV-cache
+/// prefill is slow. Our prompts are a handful of ~400-token passages, so 8192 is
+/// ample and keeps first-token fast.
+const NUM_CTX: u32 = 8192;
+
 /// Local Ollama client.
 pub struct OllamaClient {
     base: String,
@@ -97,7 +103,12 @@ impl OllamaClient {
         let resp = self
             .http
             .post(format!("{}/api/generate", self.base))
-            .json(&serde_json::json!({ "model": model, "prompt": prompt, "stream": true }))
+            .json(&serde_json::json!({
+                "model": model,
+                "prompt": prompt,
+                "stream": true,
+                "options": { "num_ctx": NUM_CTX }
+            }))
             .send()
             .await?
             .error_for_status()?;
