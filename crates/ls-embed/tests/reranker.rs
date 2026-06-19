@@ -8,8 +8,11 @@ use ls_embed::Reranker;
 
 #[test]
 fn reranker_ranks_relevant_above_irrelevant() {
-    let dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/bge-reranker-v2-m3");
+    let dir = std::env::var("LS_RERANKER_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/bge-reranker-v2-m3")
+        });
     let mut rr = Reranker::load(&dir).expect("load reranker onnx");
 
     let query = "how do neural networks learn from data?";

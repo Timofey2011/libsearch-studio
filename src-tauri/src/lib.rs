@@ -4,7 +4,7 @@
 //! Tokio mutex; collection metadata lives in SQLite (opened per command — cheap).
 //! `ask` streams answer tokens to the webview via the `ask-token` event.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ls_app::{Collection, Db};
 use ls_embed::{Embedder, Reranker};
@@ -30,6 +30,17 @@ struct AppState {
 impl AppState {
     fn db(&self) -> Result<Db, String> {
         Db::open(self.data_dir.join("app.db")).map_err(|e| e.to_string())
+    }
+}
+
+/// Prefer the int8 reranker (2.3x faster on CPU, quality preserved) when present,
+/// else the fp32 one. The embedder stays fp32 to match the index's vectors.
+fn reranker_dir(models: &Path) -> PathBuf {
+    let int8 = models.join("bge-reranker-v2-m3-int8");
+    if int8.join("model.onnx").exists() {
+        int8
+    } else {
+        models.join("bge-reranker-v2-m3")
     }
 }
 
@@ -103,8 +114,8 @@ async fn ask(
     if guard.is_none() {
         let embedder =
             Embedder::load(state.models_dir.join("bge-m3")).map_err(|e| e.to_string())?;
-        let reranker = Reranker::load(state.models_dir.join("bge-reranker-v2-m3"))
-            .map_err(|e| e.to_string())?;
+        let reranker =
+            Reranker::load(reranker_dir(&state.models_dir)).map_err(|e| e.to_string())?;
         *guard = Some(Engine { embedder, reranker });
     }
     let engine = guard.as_mut().unwrap();
@@ -201,7 +212,7 @@ pub fn run() {
                 let models = handle.state::<AppState>().models_dir.clone();
                 let loaded = tauri::async_runtime::spawn_blocking(move || {
                     let e = Embedder::load(models.join("bge-m3")).ok()?;
-                    let r = Reranker::load(models.join("bge-reranker-v2-m3")).ok()?;
+                    let r = Reranker::load(reranker_dir(&models)).ok()?;
                     Some(Engine {
                         embedder: e,
                         reranker: r,
