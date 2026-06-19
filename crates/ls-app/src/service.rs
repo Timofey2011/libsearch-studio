@@ -211,6 +211,7 @@ impl Service {
 
     /// Retrieve + rerank for a collection, then stream a grounded answer; returns
     /// the cited results. `on_token` receives streamed answer chunks.
+    #[allow(clippy::too_many_arguments)] // engine handles are passed in by design
     pub async fn answer(
         &self,
         collection: &Collection,
