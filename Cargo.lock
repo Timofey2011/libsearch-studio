@@ -3817,6 +3817,11 @@ name = "ls-app"
 version = "0.1.0"
 dependencies = [
  "ls-core",
+ "ls-embed",
+ "ls-extract",
+ "ls-index",
+ "ls-llm",
+ "ls-query",
  "rusqlite",
  "serde",
  "serde_json",

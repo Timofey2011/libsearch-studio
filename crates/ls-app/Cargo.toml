@@ -7,6 +7,11 @@ rust-version.workspace = true
 
 [dependencies]
 ls-core = { workspace = true }
+ls-index = { workspace = true }
+ls-embed = { workspace = true }
+ls-extract = { workspace = true }
+ls-query = { workspace = true }
+ls-llm = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
 toml = "0.8"
