@@ -6,6 +6,7 @@ members = [
     "crates/ls-embed",
     "crates/ls-extract",
     "crates/ls-query",
+    "crates/ls-app",
     "crates/ls-cli",
 ]
 
