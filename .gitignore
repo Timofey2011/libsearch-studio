@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Models (downloaded/exported, large) and local app data
+/models/
+*.onnx
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Local Claude settings
+.claude/settings.local.json
