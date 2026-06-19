@@ -14,5 +14,6 @@ ls-index = { workspace = true }
 ls-embed = { workspace = true }
 ls-extract = { workspace = true }
 ls-query = { workspace = true }
+ls-llm = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"

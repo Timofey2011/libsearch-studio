@@ -90,7 +90,9 @@ pub async fn search(
 ) -> Result<Vec<SearchResult>, QueryError> {
     let qvec = embedder.embed_query(query)?;
     let vec_hits = store.vector_search(qvec, hybrid_k).await?;
-    let fts_hits = store.fts_search(query, hybrid_k).await?;
+    // Degrade to vector-only if the FTS index isn't built yet (e.g. a collection
+    // mid-index) instead of failing the whole query.
+    let fts_hits = store.fts_search(query, hybrid_k).await.unwrap_or_default();
 
     let candidates = rrf_fuse(&[vec_hits, fts_hits], hybrid_k);
     if candidates.is_empty() {

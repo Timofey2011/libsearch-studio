@@ -3833,6 +3833,7 @@ dependencies = [
  "ls-embed",
  "ls-extract",
  "ls-index",
+ "ls-llm",
  "ls-query",
  "tokio",
 ]
@@ -3878,6 +3879,19 @@ dependencies = [
  "ls-core",
  "regex",
  "thiserror",
+]
+
+[[package]]
+name = "ls-llm"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "ls-query",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

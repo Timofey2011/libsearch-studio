@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use ls_embed::{BgeTokenCounter, Embedder, Reranker};
 use ls_index::{chunk_book, ChunkParams, Store};
+use ls_llm::{build_prompt, OllamaClient};
 use ls_query::search;
 
 const EMBED_BATCH: usize = 64;
@@ -32,7 +33,14 @@ async fn main() -> Result<()> {
             }
             run_ingest(&paths).await
         }
-        _ => bail!("usage: ls-cli <search|ingest> ..."),
+        Some("ask") => {
+            let question = args.collect::<Vec<_>>().join(" ");
+            if question.trim().is_empty() {
+                bail!("usage: ls-cli ask <question>");
+            }
+            run_ask(&question).await
+        }
+        _ => bail!("usage: ls-cli <search|ingest|ask> ..."),
     }
 }
 
@@ -102,6 +110,42 @@ async fn run_ingest(paths: &[String]) -> Result<()> {
         "done: {total} chunks; index now has {} rows",
         store.count().await?
     );
+    Ok(())
+}
+
+async fn run_ask(question: &str) -> Result<()> {
+    let models = models_dir();
+    let db = db_path();
+    let host = std::env::var("LS_OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".into());
+    let model = std::env::var("LS_OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:12b-mlx".into());
+
+    let store = Store::open(&db, "chunks").await.context("open index")?;
+    let mut embedder = Embedder::load(models.join("bge-m3")).context("load embedder")?;
+    let mut reranker =
+        Reranker::load(models.join("bge-reranker-v2-m3")).context("load reranker")?;
+
+    let results = search(&store, &mut embedder, &mut reranker, question, 8, 50).await?;
+    if results.is_empty() {
+        println!("(no matching passages)");
+        return Ok(());
+    }
+
+    let prompt = build_prompt(question, &results);
+    eprintln!("synthesizing with {model} …\n");
+    let client = OllamaClient::new(&host);
+    use std::io::Write;
+    client
+        .generate_stream(&model, &prompt, |tok| {
+            print!("{tok}");
+            let _ = std::io::stdout().flush();
+        })
+        .await
+        .context("ollama generate")?;
+
+    println!("\n\nSources:");
+    for r in &results {
+        println!("  [{}] {}", r.rank, r.citation);
+    }
     Ok(())
 }
 

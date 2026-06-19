@@ -6,6 +6,7 @@ members = [
     "crates/ls-embed",
     "crates/ls-extract",
     "crates/ls-query",
+    "crates/ls-llm",
     "crates/ls-app",
     "crates/ls-cli",
 ]
@@ -23,6 +24,7 @@ ls-index = { path = "crates/ls-index" }
 ls-embed = { path = "crates/ls-embed" }
 ls-extract = { path = "crates/ls-extract" }
 ls-query = { path = "crates/ls-query" }
+ls-llm = { path = "crates/ls-llm" }
 serde = { version = "1", features = ["derive"] }
 regex = "1"
 thiserror = "2"
