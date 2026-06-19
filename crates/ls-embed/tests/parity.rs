@@ -21,8 +21,12 @@ fn bge_m3_matches_python_oracle() {
     let raw = include_str!("fixtures/bge_m3_parity.json");
     let fx: Fixture = serde_json::from_str(raw).expect("valid fixture json");
 
-    // Model exported by scripts/export_onnx.py into <repo>/models/bge-m3.
-    let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/bge-m3");
+    // Model dir: env override (e.g. the int8 model) or the fp32 export under <repo>/models.
+    let model_dir = std::env::var("LS_BGE_M3_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/bge-m3")
+        });
     let mut embedder = Embedder::load(&model_dir).expect("load bge-m3 onnx");
     let texts: Vec<&str> = fx.texts.iter().map(String::as_str).collect();
     let got = embedder.embed(&texts).expect("embed");
