@@ -11,5 +11,6 @@ regex = { workspace = true }
 lancedb = "0.21"
 arrow-array = "55"
 arrow-schema = "55"
+parquet = "55"
 futures = "0.3"
 thiserror = { workspace = true }

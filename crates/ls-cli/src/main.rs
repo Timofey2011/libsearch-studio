@@ -40,7 +40,14 @@ async fn main() -> Result<()> {
             }
             run_ask(&question).await
         }
-        _ => bail!("usage: ls-cli <search|ingest|ask> ..."),
+        Some("import") => {
+            let parquet = args.next().unwrap_or_default();
+            if parquet.is_empty() {
+                bail!("usage: ls-cli import <file.parquet>");
+            }
+            run_import(&parquet).await
+        }
+        _ => bail!("usage: ls-cli <search|ingest|import|ask> ..."),
     }
 }
 
@@ -108,6 +115,27 @@ async fn run_ingest(paths: &[String]) -> Result<()> {
     }
     eprintln!(
         "done: {total} chunks; index now has {} rows",
+        store.count().await?
+    );
+    Ok(())
+}
+
+async fn run_import(parquet: &str) -> Result<()> {
+    let db = db_path();
+    eprintln!("importing {parquet} -> {db}");
+    let store = Store::open_or_create(&db, "chunks")
+        .await
+        .context("open/create index")?;
+    let n = store
+        .import_parquet(parquet)
+        .await
+        .context("import parquet")?;
+    if n > 0 {
+        eprintln!("building FTS index over {n} chunks …");
+        store.ensure_fts_index().await.context("fts index")?;
+    }
+    eprintln!(
+        "imported {n} chunks; index now has {} rows",
         store.count().await?
     );
     Ok(())

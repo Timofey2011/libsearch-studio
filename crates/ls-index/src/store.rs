@@ -18,6 +18,7 @@ use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table};
 use ls_core::{Chunk, Format};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Embedding dimension (bge-m3).
 pub const VECTOR_DIM: i32 = 1024;
@@ -180,6 +181,24 @@ impl Store {
         Ok(chunks.len())
     }
 
+    /// Import chunks (with vectors) from a Parquet file produced by the Python/MPS
+    /// indexer (`scripts/index_to_parquet.py`). Returns rows written.
+    pub async fn import_parquet(&self, path: impl AsRef<Path>) -> Result<usize, StoreError> {
+        let file = std::fs::File::open(path.as_ref())
+            .map_err(|e| StoreError::Schema(format!("open parquet: {e}")))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| StoreError::Schema(e.to_string()))?
+            .build()
+            .map_err(|e| StoreError::Schema(e.to_string()))?;
+        let mut total = 0;
+        for batch in reader {
+            let batch = batch.map_err(|e| StoreError::Stream(e.to_string()))?;
+            let chunks = chunks_with_vectors(&batch)?;
+            total += self.add_chunks(&chunks).await?;
+        }
+        Ok(total)
+    }
+
     /// Build (or rebuild) the full-text index on `text`.
     pub async fn ensure_fts_index(&self) -> Result<(), StoreError> {
         self.table
@@ -260,6 +279,56 @@ fn int_col<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a Int64Array, StoreEr
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| StoreError::Schema(format!("column {name} is not Int64")))
+}
+
+/// Parse a RecordBatch (including the `vector` column) into embedded `Chunk`s,
+/// for importing a Parquet file into the store.
+fn chunks_with_vectors(batch: &RecordBatch) -> Result<Vec<Chunk>, StoreError> {
+    let id = str_col(batch, "id")?;
+    let book_id = str_col(batch, "book_id")?;
+    let title = str_col(batch, "title")?;
+    let author = str_col(batch, "author")?;
+    let source_path = str_col(batch, "source_path")?;
+    let format = str_col(batch, "format")?;
+    let chapter = str_col(batch, "chapter")?;
+    let text = str_col(batch, "text")?;
+    let page = int_col(batch, "page")?;
+    let loc_start = int_col(batch, "loc_start")?;
+    let loc_end = int_col(batch, "loc_end")?;
+    let vectors = batch
+        .column_by_name("vector")
+        .ok_or_else(|| StoreError::Schema("missing column vector".into()))?
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| StoreError::Schema("vector is not FixedSizeList".into()))?;
+
+    let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        let sub = vectors.value(i);
+        let v = sub
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| StoreError::Schema("vector values not Float32".into()))?
+            .values()
+            .to_vec();
+        let p = page.value(i);
+        out.push(Chunk {
+            id: id.value(i).to_string(),
+            book_id: book_id.value(i).to_string(),
+            title: title.value(i).to_string(),
+            author: opt(author.value(i)),
+            source_path: source_path.value(i).to_string(),
+            format: Format::from_ext(format.value(i)).unwrap_or(Format::Pdf),
+            chapter: opt(chapter.value(i)),
+            page: if p < 0 { None } else { Some(p as u32) },
+            loc_start: loc_start.value(i) as usize,
+            loc_end: loc_end.value(i) as usize,
+            text: text.value(i).to_string(),
+            vector: Some(v),
+        });
+    }
+    Ok(out)
 }
 
 fn rows_from_batch(batch: &RecordBatch, out: &mut Vec<RetrievedChunk>) -> Result<(), StoreError> {
