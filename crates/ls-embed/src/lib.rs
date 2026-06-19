@@ -142,6 +142,79 @@ impl Embedder {
     }
 }
 
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Cross-encoder reranker backed by an ONNX `bge-reranker-v2-m3` model directory.
+///
+/// Scores (query, passage) pairs; higher = more relevant. `max_length` is capped
+/// at 512 — required for stability (the Python engine hit native crashes without it).
+pub struct Reranker {
+    session: Session,
+    tokenizer: Tokenizer,
+}
+
+impl Reranker {
+    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
+        let dir = model_dir.as_ref();
+        let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
+        tokenizer
+            .with_padding(Some(tokenizers::PaddingParams {
+                strategy: tokenizers::PaddingStrategy::BatchLongest,
+                ..Default::default()
+            }))
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: MAX_LEN,
+                ..Default::default()
+            }))
+            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
+        let session = Session::builder()?.commit_from_file(dir.join("model.onnx"))?;
+        Ok(Self { session, tokenizer })
+    }
+
+    /// Relevance score in (0, 1) for each passage against the query.
+    pub fn score(&mut self, query: &str, passages: &[&str]) -> Result<Vec<f32>, EmbedError> {
+        if passages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pairs: Vec<(&str, &str)> = passages.iter().map(|p| (query, *p)).collect();
+        let encodings = self
+            .tokenizer
+            .encode_batch(pairs, true)
+            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
+
+        let batch = encodings.len();
+        let seq = encodings[0].get_ids().len();
+        let mut ids = Array2::<i64>::zeros((batch, seq));
+        let mut mask = Array2::<i64>::zeros((batch, seq));
+        for (i, enc) in encodings.iter().enumerate() {
+            for (j, &id) in enc.get_ids().iter().enumerate() {
+                ids[[i, j]] = id as i64;
+            }
+            for (j, &m) in enc.get_attention_mask().iter().enumerate() {
+                mask[[i, j]] = m as i64;
+            }
+        }
+
+        let outputs = self
+            .session
+            .run(ort::inputs!["input_ids" => ids, "attention_mask" => mask]?)?;
+        let (shape, data) = outputs["logits"]
+            .try_extract_raw_tensor::<f32>()
+            .map_err(|e| EmbedError::Output(e.to_string()))?;
+        // logits shape [batch, 1] (single relevance label) -> one score per pair.
+        if data.len() != batch {
+            return Err(EmbedError::Output(format!(
+                "expected {batch} logits, got {} (shape {shape:?})",
+                data.len()
+            )));
+        }
+        Ok(data.iter().map(|&x| sigmoid(x)).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
