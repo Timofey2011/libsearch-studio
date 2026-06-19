@@ -1,5 +1,5 @@
 [package]
-name = "ls-index"
+name = "ls-query"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 ls-core = { workspace = true }
-regex = { workspace = true }
-lancedb = "0.21"
-arrow-array = "55"
-arrow-schema = "55"
-futures = "0.3"
+ls-index = { workspace = true }
+ls-embed = { workspace = true }
 thiserror = { workspace = true }

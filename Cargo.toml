@@ -4,6 +4,9 @@ members = [
     "crates/ls-core",
     "crates/ls-index",
     "crates/ls-embed",
+    "crates/ls-extract",
+    "crates/ls-query",
+    "crates/ls-cli",
 ]
 
 [workspace.package]
@@ -15,6 +18,10 @@ repository = "https://github.com/timofey/libsearch-studio"
 
 [workspace.dependencies]
 ls-core = { path = "crates/ls-core" }
+ls-index = { path = "crates/ls-index" }
+ls-embed = { path = "crates/ls-embed" }
+ls-extract = { path = "crates/ls-extract" }
+ls-query = { path = "crates/ls-query" }
 serde = { version = "1", features = ["derive"] }
 regex = "1"
 thiserror = "2"

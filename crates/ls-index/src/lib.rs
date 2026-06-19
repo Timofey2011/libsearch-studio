@@ -1,12 +1,12 @@
-//! Indexing-side logic: structural chunking (and, later, the LanceDB store).
+//! Indexing-side logic: structural chunking + the LanceDB store.
 //!
 //! The chunker is a faithful Rust port of the validated Python strategy
-//! (`ebook-kb/src/chunk.py`): split on structure (chapter -> paragraph), never
-//! cross a chapter boundary, greedily pack into ~target-token windows with
-//! overlap, hard-split oversized paragraphs in O(words) (one token count per
-//! paragraph, splitting by the tokens/word ratio), and merge a short trailing
-//! window into the previous one.
+//! (`ebook-kb/src/chunk.py`). The store reads the same on-disk LanceDB schema the
+//! Python engine writes, so existing indexes are directly usable.
 
 pub mod chunk;
+pub mod store;
 
-pub use chunk::{chunk_book, ChunkParams, TokenCounter, WhitespaceCounter};
+pub use chunk::{chunk_book, ChunkParams};
+pub use ls_core::{TokenCounter, WhitespaceCounter};
+pub use store::{RetrievedChunk, Store, StoreError};

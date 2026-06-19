@@ -1,23 +1,8 @@
 //! Chapter-aware structural chunking (port of the validated Python strategy).
 
-use ls_core::{BookDoc, Chunk};
+use ls_core::{BookDoc, Chunk, TokenCounter};
 use regex::Regex;
 use std::sync::OnceLock;
-
-/// Counts tokens for chunk sizing. The real implementation wraps the embedder's
-/// tokenizer (in `ls-embed`); tests use [`WhitespaceCounter`].
-pub trait TokenCounter {
-    fn count(&self, text: &str) -> usize;
-}
-
-/// Cheap, offline token estimate: one token per whitespace-delimited word.
-pub struct WhitespaceCounter;
-
-impl TokenCounter for WhitespaceCounter {
-    fn count(&self, text: &str) -> usize {
-        text.split_whitespace().count()
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkParams {
@@ -242,7 +227,7 @@ pub fn chunk_book(doc: &BookDoc, counter: &dyn TokenCounter, params: &ChunkParam
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ls_core::{Block, Format};
+    use ls_core::{Block, Format, WhitespaceCounter};
 
     const P: ChunkParams = ChunkParams {
         target_tokens: 10,

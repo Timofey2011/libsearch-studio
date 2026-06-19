@@ -88,6 +88,23 @@ pub struct Chunk {
     pub vector: Option<Vec<f32>>,
 }
 
+/// Counts tokens for chunk sizing. The real implementation (in `ls-embed`) wraps
+/// the embedder's tokenizer; tests use [`WhitespaceCounter`]. Defined here in the
+/// leaf crate so both `ls-index` (consumer) and `ls-embed` (provider) can use it
+/// without an orphan-rule violation.
+pub trait TokenCounter {
+    fn count(&self, text: &str) -> usize;
+}
+
+/// Cheap, offline token estimate: one token per whitespace-delimited word.
+pub struct WhitespaceCounter;
+
+impl TokenCounter for WhitespaceCounter {
+    fn count(&self, text: &str) -> usize {
+        text.split_whitespace().count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

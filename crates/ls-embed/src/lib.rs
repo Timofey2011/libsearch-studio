@@ -146,6 +146,29 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Token counter backed by the bge-m3 tokenizer, for sizing chunks at ingest.
+/// Implements [`ls_core::TokenCounter`] so the chunker counts real model tokens.
+pub struct BgeTokenCounter {
+    tokenizer: Tokenizer,
+}
+
+impl BgeTokenCounter {
+    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
+        let tokenizer = Tokenizer::from_file(model_dir.as_ref().join("tokenizer.json"))
+            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
+        Ok(Self { tokenizer })
+    }
+}
+
+impl ls_core::TokenCounter for BgeTokenCounter {
+    fn count(&self, text: &str) -> usize {
+        self.tokenizer
+            .encode(text, false)
+            .map(|e| e.len())
+            .unwrap_or_else(|_| text.split_whitespace().count())
+    }
+}
+
 /// Cross-encoder reranker backed by an ONNX `bge-reranker-v2-m3` model directory.
 ///
 /// Scores (query, passage) pairs; higher = more relevant. `max_length` is capped

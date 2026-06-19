@@ -1,0 +1,18 @@
+[package]
+name = "ls-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ls-cli"
+path = "src/main.rs"
+
+[dependencies]
+ls-index = { workspace = true }
+ls-embed = { workspace = true }
+ls-extract = { workspace = true }
+ls-query = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
