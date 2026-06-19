@@ -26,8 +26,11 @@ impl Default for Settings {
             artifacts_dir: "artifacts".to_string(),
             ollama_host: "http://localhost:11434".to_string(),
             ollama_model: "gemma4:12b-mlx".to_string(),
-            hybrid_top_k: 50,
-            final_top_k: 10,
+            // Candidates reranked per query. The cross-encoder runs on CPU, so this
+            // is the main per-query latency knob; 24 keeps recall high while being
+            // ~2x faster than 50. (int8-quantizing the reranker is the next lever.)
+            hybrid_top_k: 24,
+            final_top_k: 8,
         }
     }
 }
@@ -93,6 +96,6 @@ mod tests {
         std::fs::write(&path, "ollama_model = \"llama3.1:8b\"\n").unwrap();
         let s = Settings::load(&path).unwrap();
         assert_eq!(s.ollama_model, "llama3.1:8b");
-        assert_eq!(s.hybrid_top_k, 50); // default preserved
+        assert_eq!(s.hybrid_top_k, 24); // default preserved
     }
 }
