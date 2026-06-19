@@ -41,6 +41,13 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Build an ONNX session. Uses the CPU execution provider: for this 560M-param
+/// fp32 transformer it measured faster than CoreML (whose graph-compilation and
+/// CPU↔ANE transfer overhead dominated). int8 quantization is the future speed lever.
+fn build_session(model_path: &Path) -> Result<Session, EmbedError> {
+    Ok(Session::builder()?.commit_from_file(model_path)?)
+}
+
 fn l2_normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -75,7 +82,7 @@ impl Embedder {
             }))
             .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
 
-        let session = Session::builder()?.commit_from_file(dir.join("model.onnx"))?;
+        let session = build_session(&dir.join("model.onnx"))?;
         Ok(Self {
             session,
             tokenizer,
@@ -193,7 +200,7 @@ impl Reranker {
                 ..Default::default()
             }))
             .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
-        let session = Session::builder()?.commit_from_file(dir.join("model.onnx"))?;
+        let session = build_session(&dir.join("model.onnx"))?;
         Ok(Self { session, tokenizer })
     }
 
