@@ -8,10 +8,7 @@ use ls_index::{chunk_book, ChunkParams, WhitespaceCounter};
 fn main() {
     // A tiny two-chapter "book" with normal paragraphs, one long paragraph, and
     // a short trailing line — exercises packing, oversize split, and tail-merge.
-    let long = std::iter::repeat("idea")
-        .take(60)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let long = vec!["idea"; 60].join(" ");
     let doc = BookDoc {
         book_id: "demo".into(),
         title: "Demo Book".into(),

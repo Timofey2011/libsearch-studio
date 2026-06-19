@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ls-core",
     "crates/ls-index",
+    "crates/ls-embed",
 ]
 
 [workspace.package]

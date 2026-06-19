@@ -1,0 +1,22 @@
+[package]
+name = "ls-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Tests that load a real ONNX model and run inference. Off by default so
+# `cargo test` stays fast and offline (mirrors the Python integration split).
+models = []
+
+[dependencies]
+ls-core = { workspace = true }
+ort = { version = "=2.0.0-rc.9", features = ["ndarray", "download-binaries"] }
+ndarray = "0.16"
+tokenizers = "0.21"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = "1"
