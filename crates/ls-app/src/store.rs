@@ -303,11 +303,10 @@ mod tests {
             role: Role::Assistant,
             content: "answer [1]".into(),
             citations: vec![Citation {
+                rank: 1,
+                citation: "X · p.5".into(),
                 source_path: "/b/x.pdf".into(),
-                title: "X".into(),
                 page: Some(5),
-                chapter: None,
-                loc_start: 10,
                 text: "cited".into(),
             }],
         })

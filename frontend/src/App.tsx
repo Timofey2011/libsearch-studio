@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -21,6 +21,12 @@ type SearchResult = {
   text: string;
 };
 
+// A cited source, in the shape shared by live results, stored citations, and artifacts.
+type Src = { rank: number; citation: string; source_path: string; page: number | null; text?: string };
+type ChatMessage = { role: "user" | "assistant"; content: string; sources: Src[] };
+type Conversation = { id: string; title: string; collection_ids: string[] };
+type BackendMessage = { role: "user" | "assistant"; content: string; citations: Src[] };
+
 type Reader = { path: string; page: number | null };
 
 // Mirrors ls_app::IndexEvent (serde tag = "kind", snake_case).
@@ -39,18 +45,28 @@ type IndexStats = {
   chunks_written: number;
 };
 
+const toSrc = (r: SearchResult): Src => ({
+  rank: r.rank,
+  citation: r.citation,
+  source_path: r.source_path,
+  page: r.page,
+  text: r.text,
+});
+
 export default function App() {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [models, setModels] = useState<string[]>([]);
   const [collId, setCollId] = useState("");
   const [model, setModel] = useState("");
   const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
-  const [sources, setSources] = useState<SearchResult[]>([]);
   const [busy, setBusy] = useState(false);
   const [reader, setReader] = useState<Reader | null>(null);
-  const [saved, setSaved] = useState<string | null>(null);
-  const [asked, setAsked] = useState("");
+
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [convId, setConvId] = useState("");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [savedByIdx, setSavedByIdx] = useState<Record<number, string>>({});
+
   const [managing, setManaging] = useState(false);
   const [newName, setNewName] = useState("");
   const [newPaths, setNewPaths] = useState<string[]>([]);
@@ -59,9 +75,11 @@ export default function App() {
   const [indexNote, setIndexNote] = useState<string | null>(null);
 
   const currentColl = collections.find((c) => c.id === collId) || null;
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     invoke<Collection[]>("list_collections").then(setCollections).catch(console.error);
+    invoke<Conversation[]>("list_conversations").then(setConversations).catch(console.error);
     invoke<string[]>("list_models")
       .then((m) => {
         setModels(m);
@@ -71,13 +89,22 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Initialize the selection once; don't clobber it when the list grows
-    // (e.g. after creating a new collection, which selects itself).
+    // Initialize the selection once; don't clobber it when the list grows.
     setCollId((cur) => cur || collections[0]?.id || "");
   }, [collections]);
 
+  // Append streamed tokens to the in-flight assistant message (the last one).
   useEffect(() => {
-    const un = listen<string>("ask-token", (e) => setAnswer((a) => a + e.payload));
+    const un = listen<string>("ask-token", (e) =>
+      setMessages((prev) => {
+        if (!prev.length) return prev;
+        const last = prev.length - 1;
+        if (prev[last].role !== "assistant") return prev;
+        const copy = [...prev];
+        copy[last] = { ...copy[last], content: copy[last].content + e.payload };
+        return copy;
+      })
+    );
     return () => {
       un.then((f) => f());
     };
@@ -105,23 +132,75 @@ export default function App() {
     };
   }, []);
 
-  async function ask() {
-    if (!collId || !question.trim()) return;
+  // Keep the transcript scrolled to the latest turn.
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [messages]);
+
+  async function send() {
+    const q = question.trim();
+    if (!collId || !q || busy) return;
+    setQuestion("");
     setBusy(true);
-    setAnswer("");
-    setSources([]);
-    setSaved(null);
-    setAsked(question.trim());
+    setSavedByIdx({});
+
+    let cid = convId;
     try {
-      const res = await invoke<SearchResult[]>("ask", { collectionId: collId, question, model });
-      setSources(res);
+      if (!cid) {
+        const c = await invoke<Conversation>("create_conversation", { collectionId: collId, title: q });
+        cid = c.id;
+        setConvId(c.id);
+        setConversations((prev) => [c, ...prev]);
+      }
+      // Optimistic: show the user turn + an empty assistant turn to stream into.
+      setMessages((prev) => [...prev, { role: "user", content: q, sources: [] }, { role: "assistant", content: "", sources: [] }]);
+      const res = await invoke<SearchResult[]>("ask", {
+        collectionId: collId,
+        conversationId: cid,
+        question: q,
+        model,
+      });
+      setMessages((prev) => {
+        const copy = [...prev];
+        const last = copy.length - 1;
+        if (copy[last]?.role === "assistant") copy[last] = { ...copy[last], sources: res.map(toSrc) };
+        return copy;
+      });
     } catch (e) {
-      setAnswer("Error: " + String(e));
+      setMessages((prev) => {
+        const copy = [...prev];
+        const last = copy.length - 1;
+        if (copy[last]?.role === "assistant")
+          copy[last] = { ...copy[last], content: copy[last].content + `\n[Error: ${String(e)}]` };
+        return copy;
+      });
     }
     setBusy(false);
   }
 
-  function openSource(s: SearchResult) {
+  function newChat() {
+    setConvId("");
+    setMessages([]);
+    setSavedByIdx({});
+    setReader(null);
+  }
+
+  async function openConversation(c: Conversation) {
+    setConvId(c.id);
+    setSavedByIdx({});
+    if (c.collection_ids[0]) setCollId(c.collection_ids[0]);
+    const msgs = await invoke<BackendMessage[]>("list_messages", { conversationId: c.id });
+    setMessages(msgs.map((m) => ({ role: m.role, content: m.content, sources: m.citations })));
+  }
+
+  async function deleteConversation(id: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    await invoke("delete_conversation", { conversationId: id });
+    setConversations((prev) => prev.filter((c) => c.id !== id));
+    if (convId === id) newChat();
+  }
+
+  function openSource(s: Src) {
     setReader({ path: s.source_path, page: s.page });
   }
 
@@ -137,10 +216,7 @@ export default function App() {
 
   async function createCollection() {
     if (!newName.trim() || newPaths.length === 0) return;
-    const coll = await invoke<Collection>("create_collection", {
-      name: newName.trim(),
-      sourcePaths: newPaths,
-    });
+    const coll = await invoke<Collection>("create_collection", { name: newName.trim(), sourcePaths: newPaths });
     setCollections((cs) => [...cs, coll]);
     setCollId(coll.id);
     setNewName("");
@@ -173,37 +249,31 @@ export default function App() {
     setProgress(null);
   }
 
-  async function saveArtifact() {
-    if (!answer || busy) return;
+  async function saveArtifact(idx: number) {
+    const a = messages[idx];
+    const q = messages[idx - 1]?.content ?? "";
     try {
       const path = await invoke<string>("save_artifact", {
         collectionId: collId,
-        question: asked || question,
-        answer,
+        question: q,
+        answer: a.content,
         model,
         created: new Date().toISOString().slice(0, 19).replace("T", " "),
-        sources,
+        sources: a.sources,
       });
-      setSaved(path);
+      setSavedByIdx((prev) => ({ ...prev, [idx]: path }));
     } catch (e) {
-      setSaved("Error: " + String(e));
+      setSavedByIdx((prev) => ({ ...prev, [idx]: "Error: " + String(e) }));
     }
   }
 
   function chooseModel(m: string) {
     setModel(m);
-    // Preload it so the next ask is warm (cold-load otherwise dominates latency).
     invoke("warm_model", { model: m }).catch(console.error);
   }
 
-  function openByRank(rank: number) {
-    const s = sources.find((x) => x.rank === rank);
-    if (s) openSource(s);
-  }
-
-  // Render the answer, turning [n] / [n, m] citation markers into clickable links
-  // (active once sources arrive) that jump straight to the cited page.
-  function renderAnswer(text: string) {
+  // Turn [n] / [n, m] markers into links that jump to the cited page in the reader.
+  function renderAnswer(text: string, sources: Src[]) {
     return text.split(/(\[[\d,\s]+\])/g).map((part, i) => {
       const m = part.match(/^\[([\d,\s]+)\]$/);
       if (!m) return <span key={i}>{part}</span>;
@@ -213,13 +283,13 @@ export default function App() {
           [
           {nums.map((n, j) => {
             const rank = parseInt(n, 10);
-            const has = sources.some((x) => x.rank === rank);
+            const s = sources.find((x) => x.rank === rank);
             return (
               <span key={j}>
                 {j > 0 ? ", " : ""}
-                {has ? (
+                {s ? (
                   <a
-                    onClick={() => openByRank(rank)}
+                    onClick={() => openSource(s)}
                     style={{ color: "#0a58ca", cursor: "pointer", textDecoration: "underline" }}
                   >
                     {n}
@@ -236,16 +306,52 @@ export default function App() {
     });
   }
 
-  // PDF.js / WKWebView honors the #page fragment to jump to a page.
-  const readerSrc = reader
-    ? convertFileSrc(reader.path) + (reader.page ? `#page=${reader.page}` : "")
-    : "";
+  // WKWebView honors the #page fragment to jump to a page.
+  const readerSrc = reader ? convertFileSrc(reader.path) + (reader.page ? `#page=${reader.page}` : "") : "";
 
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "system-ui, sans-serif" }}>
-      <div style={{ flex: 1, overflow: "auto", padding: "1rem 1.25rem", minWidth: 0 }}>
-        <h1 style={{ marginTop: 0 }}>LibSearch Studio</h1>
-        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+      {/* Conversation sidebar */}
+      <div style={{ width: 210, flexShrink: 0, borderRight: "1px solid #e3e3e3", display: "flex", flexDirection: "column", background: "#fafafa" }}>
+        <div style={{ padding: "10px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <b style={{ fontSize: 14 }}>Conversations</b>
+          <button onClick={newChat} title="Start a new conversation">+ New</button>
+        </div>
+        <div style={{ overflow: "auto", flex: 1 }}>
+          {conversations.length === 0 && (
+            <div style={{ padding: "0 12px", fontSize: 12, color: "#999" }}>No conversations yet.</div>
+          )}
+          {conversations.map((c) => (
+            <div
+              key={c.id}
+              onClick={() => openConversation(c)}
+              style={{
+                padding: "8px 12px",
+                cursor: "pointer",
+                fontSize: 13,
+                background: c.id === convId ? "#e7f0ff" : "transparent",
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 6,
+                alignItems: "center",
+              }}
+            >
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.title}</span>
+              <button
+                onClick={(e) => deleteConversation(c.id, e)}
+                title="Delete conversation"
+                style={{ border: "none", background: "none", color: "#aaa", cursor: "pointer", padding: 0 }}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Chat column */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        <div style={{ display: "flex", gap: 8, padding: "10px 12px", borderBottom: "1px solid #eee", alignItems: "center" }}>
           <select value={collId} onChange={(e) => setCollId(e.target.value)}>
             {collections.length === 0 && <option value="">(no collections)</option>}
             {collections.map((c) => (
@@ -268,7 +374,7 @@ export default function App() {
         </div>
 
         {managing && (
-          <div style={{ marginBottom: 12, padding: 12, border: "1px solid #ddd", borderRadius: 8, background: "#fafafa" }}>
+          <div style={{ margin: 12, padding: 12, border: "1px solid #ddd", borderRadius: 8, background: "#fafafa" }}>
             {currentColl && (
               <div style={{ marginBottom: 12 }}>
                 <div style={{ fontWeight: 600, marginBottom: 4 }}>
@@ -346,65 +452,92 @@ export default function App() {
           </div>
         )}
 
-        <textarea
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          rows={3}
-          style={{ width: "100%", boxSizing: "border-box" }}
-          placeholder="Ask your library…"
-        />
-        <button onClick={ask} disabled={busy || !collId}>
-          {busy ? "Thinking…" : "Ask"}
-        </button>
+        {/* Transcript */}
+        <div ref={scrollRef} style={{ flex: 1, overflow: "auto", padding: "1rem 1.25rem" }}>
+          {messages.length === 0 && (
+            <div style={{ color: "#999", marginTop: 24 }}>
+              Ask a question to start a conversation grounded in your library.
+            </div>
+          )}
+          {messages.map((msg, idx) =>
+            msg.role === "user" ? (
+              <div key={idx} style={{ margin: "12px 0" }}>
+                <div style={{ fontSize: 12, color: "#888", marginBottom: 2 }}>You</div>
+                <div style={{ whiteSpace: "pre-wrap" }}>{msg.content}</div>
+              </div>
+            ) : (
+              <div key={idx} style={{ margin: "12px 0 20px" }}>
+                <div style={{ whiteSpace: "pre-wrap", padding: 12, background: "#f5f5f5", borderRadius: 8 }}>
+                  {msg.content ? renderAnswer(msg.content, msg.sources) : <span style={{ color: "#999" }}>Thinking…</span>}
+                </div>
+                {msg.sources.length > 0 && (
+                  <>
+                    <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 10 }}>
+                      <button onClick={() => saveArtifact(idx)} title="Save this answer + sources as Markdown">
+                        Save as Markdown
+                      </button>
+                      {savedByIdx[idx] && (
+                        <span style={{ fontSize: 12, color: savedByIdx[idx].startsWith("Error") ? "#b00" : "#2a7" }}>
+                          {savedByIdx[idx].startsWith("Error") ? savedByIdx[idx] : `Saved → ${savedByIdx[idx]}`}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ marginTop: 10 }}>
+                      <b style={{ fontSize: 13 }}>Sources</b>
+                      <ol style={{ paddingLeft: 20, margin: "4px 0 0" }}>
+                        {msg.sources.map((s) => (
+                          <li key={s.rank} style={{ marginBottom: 4 }}>
+                            <button
+                              onClick={() => openSource(s)}
+                              title="Open source at the cited page"
+                              style={{
+                                background: "none",
+                                border: "none",
+                                padding: 0,
+                                color: "#0a58ca",
+                                textAlign: "left",
+                                cursor: "pointer",
+                                textDecoration: "underline",
+                                font: "inherit",
+                              }}
+                            >
+                              {s.citation}
+                            </button>
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                  </>
+                )}
+              </div>
+            )
+          )}
+        </div>
 
-        {answer && (
-          <div style={{ whiteSpace: "pre-wrap", marginTop: 16, padding: 12, background: "#f5f5f5", borderRadius: 8 }}>
-            {renderAnswer(answer)}
-          </div>
-        )}
-
-        {answer && !busy && (
-          <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 10 }}>
-            <button onClick={saveArtifact} title="Save this answer + sources as a Markdown file">
-              Save as Markdown
+        {/* Input */}
+        <div style={{ borderTop: "1px solid #eee", padding: 12 }}>
+          <textarea
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
+            rows={2}
+            style={{ width: "100%", boxSizing: "border-box", resize: "none" }}
+            placeholder="Ask your library…  (Enter to send, Shift+Enter for newline)"
+          />
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 6 }}>
+            <button onClick={send} disabled={busy || !collId || !question.trim()}>
+              {busy ? "Thinking…" : "Send"}
             </button>
-            {saved && (
-              <span style={{ fontSize: 12, color: saved.startsWith("Error") ? "#b00" : "#2a7" }}>
-                {saved.startsWith("Error") ? saved : `Saved → ${saved}`}
-              </span>
-            )}
           </div>
-        )}
-
-        {sources.length > 0 && (
-          <div style={{ marginTop: 16 }}>
-            <b>Sources</b>
-            <ol style={{ paddingLeft: 20 }}>
-              {sources.map((s) => (
-                <li key={s.rank} style={{ marginBottom: 4 }}>
-                  <button
-                    onClick={() => openSource(s)}
-                    title="Open source at the cited page"
-                    style={{
-                      background: "none",
-                      border: "none",
-                      padding: 0,
-                      color: "#0a58ca",
-                      textAlign: "left",
-                      cursor: "pointer",
-                      textDecoration: "underline",
-                      font: "inherit",
-                    }}
-                  >
-                    {s.citation}
-                  </button>
-                </li>
-              ))}
-            </ol>
-          </div>
-        )}
+        </div>
       </div>
 
+      {/* Reader */}
       {reader && (
         <div style={{ flex: 1.2, borderLeft: "1px solid #ddd", display: "flex", flexDirection: "column", minWidth: 0 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 10px", background: "#fafafa", borderBottom: "1px solid #eee" }}>

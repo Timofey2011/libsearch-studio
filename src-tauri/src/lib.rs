@@ -6,14 +6,37 @@
 
 use std::path::{Path, PathBuf};
 
-use ls_app::{Collection, Db, IndexStats, Service};
+use ls_app::{Citation, Collection, Conversation, Db, IndexStats, Message, Role, Service};
 use ls_artifacts::{ArtifactDoc, ArtifactRenderer, Markdown, Source};
 use ls_embed::{BgeTokenCounter, Embedder, Reranker};
 use ls_index::Store;
-use ls_llm::{build_prompt, OllamaClient};
+use ls_llm::{build_prompt_with_history, HistoryTurn, OllamaClient};
 use ls_query::{search, SearchResult};
 use tauri::{Emitter, Manager, State, WebviewWindow};
 use tokio::sync::Mutex;
+
+/// Monotonic-ish unique id from the wall clock (nanos, hex).
+fn new_id() -> String {
+    format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+/// Map a fresh search result to the persisted citation shape (kept in sync so a
+/// reloaded message renders identically to a live one).
+fn to_citation(r: &SearchResult) -> Citation {
+    Citation {
+        rank: r.rank,
+        citation: r.citation.clone(),
+        source_path: r.source_path.clone(),
+        page: r.page,
+        text: r.text.clone(),
+    }
+}
 
 struct Engine {
     embedder: Embedder,
@@ -166,21 +189,95 @@ async fn warm_model(state: State<'_, AppState>, model: String) -> Result<(), Str
     Ok(())
 }
 
+// ---- conversations ----
+
+#[tauri::command]
+async fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>, String> {
+    state.db()?.list_conversations().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn create_conversation(
+    state: State<'_, AppState>,
+    collection_id: String,
+    title: String,
+) -> Result<Conversation, String> {
+    let title = title.trim();
+    let conv = Conversation {
+        id: new_id(),
+        title: if title.is_empty() {
+            "New conversation".into()
+        } else {
+            title.chars().take(80).collect()
+        },
+        collection_ids: vec![collection_id],
+    };
+    state
+        .db()?
+        .create_conversation(&conv)
+        .map_err(|e| e.to_string())?;
+    Ok(conv)
+}
+
+#[tauri::command]
+async fn list_messages(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<Message>, String> {
+    state
+        .db()?
+        .list_messages(&conversation_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<(), String> {
+    state
+        .db()?
+        .delete_conversation(&conversation_id)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn ask(
     state: State<'_, AppState>,
     window: WebviewWindow,
     collection_id: String,
+    conversation_id: String,
     question: String,
     model: String,
 ) -> Result<Vec<SearchResult>, String> {
-    let coll = state
-        .db()?
+    let db = state.db()?;
+    let coll = db
         .list_collections()
         .map_err(|e| e.to_string())?
         .into_iter()
         .find(|c| c.id == collection_id)
         .ok_or_else(|| format!("collection {collection_id} not found"))?;
+
+    // Prior turns for follow-up context (before we add the new question).
+    let history: Vec<HistoryTurn> = db
+        .list_messages(&conversation_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|m| HistoryTurn {
+            role: m.role.as_str().to_string(),
+            content: m.content,
+        })
+        .collect();
+
+    // Persist the user's turn immediately.
+    db.add_message(&Message {
+        id: new_id(),
+        conversation_id: conversation_id.clone(),
+        role: Role::User,
+        content: question.clone(),
+        citations: vec![],
+    })
+    .map_err(|e| e.to_string())?;
 
     // Lazily load the engine on first ask (kept resident afterwards).
     let mut guard = state.engine.lock().await;
@@ -208,6 +305,16 @@ async fn ask(
     .map_err(|e| e.to_string())?;
 
     if results.is_empty() {
+        let msg = "I couldn't find any matching passages in this collection.";
+        db.add_message(&Message {
+            id: new_id(),
+            conversation_id: conversation_id.clone(),
+            role: Role::Assistant,
+            content: msg.into(),
+            citations: vec![],
+        })
+        .map_err(|e| e.to_string())?;
+        let _ = window.emit("ask-token", msg.to_string());
         let _ = window.emit("ask-done", ());
         return Ok(results);
     }
@@ -217,15 +324,26 @@ async fn ask(
     } else {
         model
     };
-    let prompt = build_prompt(&question, &results);
+    let prompt = build_prompt_with_history(&question, &results, &history);
     let w = window.clone();
-    state
+    let answer = state
         .llm
         .generate_stream(&model, &prompt, |tok| {
             let _ = w.emit("ask-token", tok.to_string());
         })
         .await
         .map_err(|e| e.to_string())?;
+
+    // Persist the assistant turn with its grounding citations.
+    db.add_message(&Message {
+        id: new_id(),
+        conversation_id: conversation_id.clone(),
+        role: Role::Assistant,
+        content: answer,
+        citations: results.iter().map(to_citation).collect(),
+    })
+    .map_err(|e| e.to_string())?;
+
     let _ = window.emit("ask-done", ());
     Ok(results)
 }
@@ -358,6 +476,10 @@ pub fn run() {
             create_collection,
             set_collection_paths,
             index_collection,
+            list_conversations,
+            create_conversation,
+            list_messages,
+            delete_conversation,
             list_models,
             warm_model,
             ask,

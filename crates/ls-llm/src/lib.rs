@@ -20,13 +20,65 @@ const SYSTEM: &str = "You answer strictly from the numbered sources below. Cite 
 you use as [n]. If the sources do not contain the answer, say so plainly. Do not invent facts \
 beyond the sources.";
 
+/// One prior chat turn, used to give the model conversational context for follow-ups.
+#[derive(Debug, Clone)]
+pub struct HistoryTurn {
+    /// "user" or "assistant".
+    pub role: String,
+    pub content: String,
+}
+
+/// Keep the prompt bounded: only the most recent turns, each truncated.
+const MAX_HISTORY_TURNS: usize = 6;
+const MAX_TURN_CHARS: usize = 1500;
+
 /// Assemble a grounded prompt from reranked passages with citation markers.
 pub fn build_prompt(question: &str, results: &[SearchResult]) -> String {
+    build_prompt_with_history(question, results, &[])
+}
+
+/// Like [`build_prompt`] but prepends recent conversation turns so the model can
+/// resolve follow-ups ("what about X?"). Retrieval still targets the current
+/// question; history is context only, not a source to cite.
+pub fn build_prompt_with_history(
+    question: &str,
+    results: &[SearchResult],
+    history: &[HistoryTurn],
+) -> String {
     let mut sources = String::new();
     for r in results {
         sources.push_str(&format!("[{}] {}\n{}\n\n", r.rank, r.citation, r.text));
     }
-    format!("{SYSTEM}\n\nSources:\n{sources}\nQuestion: {question}\nAnswer (with [n] citations):")
+
+    let mut convo = String::new();
+    let start = history.len().saturating_sub(MAX_HISTORY_TURNS);
+    for turn in &history[start..] {
+        let speaker = if turn.role == "assistant" {
+            "Assistant"
+        } else {
+            "User"
+        };
+        let content = truncate(&turn.content, MAX_TURN_CHARS);
+        convo.push_str(&format!("{speaker}: {content}\n"));
+    }
+    let history_block = if convo.is_empty() {
+        String::new()
+    } else {
+        format!("Conversation so far:\n{convo}\n")
+    };
+
+    format!(
+        "{SYSTEM}\n\n{history_block}Sources:\n{sources}\nQuestion: {question}\nAnswer (with [n] citations):"
+    )
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
+    }
 }
 
 /// Parse one NDJSON line from Ollama `/api/generate` (stream=true).
@@ -190,6 +242,31 @@ mod tests {
         assert!(p.contains("Coroutines suspend without blocking."));
         assert!(p.contains("how do coroutines work?"));
         assert!(p.to_lowercase().contains("cite"));
+    }
+
+    #[test]
+    fn prompt_with_history_includes_recent_turns() {
+        let history = vec![
+            HistoryTurn {
+                role: "user".into(),
+                content: "what are coroutines?".into(),
+            },
+            HistoryTurn {
+                role: "assistant".into(),
+                content: "Lightweight threads [1].".into(),
+            },
+        ];
+        let p = build_prompt_with_history(
+            "how do they differ from threads?",
+            &[result(1, "Kotlin · p.5", "Coroutines suspend.")],
+            &history,
+        );
+        assert!(p.contains("Conversation so far:"));
+        assert!(p.contains("User: what are coroutines?"));
+        assert!(p.contains("Assistant: Lightweight threads [1]."));
+        assert!(p.contains("how do they differ from threads?"));
+        // No history -> no conversation block.
+        assert!(!build_prompt("q", &[]).contains("Conversation so far"));
     }
 
     #[test]

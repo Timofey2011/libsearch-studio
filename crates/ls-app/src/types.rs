@@ -39,14 +39,16 @@ impl Role {
     }
 }
 
-/// A citation attached to an assistant message (so the reader/artifacts can use it).
+/// A citation attached to an assistant message. Fields mirror `ls_query::SearchResult`
+/// (and `ls_artifacts::Source`) so a reloaded message renders, links into the reader,
+/// and exports to Markdown identically to a fresh answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Citation {
+    pub rank: usize,
+    /// Human-readable citation label, e.g. "Title — Author · Ch. X, p.42".
+    pub citation: String,
     pub source_path: String,
-    pub title: String,
     pub page: Option<u32>,
-    pub chapter: Option<String>,
-    pub loc_start: i64,
     pub text: String,
 }
 
