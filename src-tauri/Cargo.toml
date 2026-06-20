@@ -29,3 +29,4 @@ ls-embed = { path = "../crates/ls-embed" }
 ls-llm = { path = "../crates/ls-llm" }
 ls-query = { path = "../crates/ls-query" }
 ls-index = { path = "../crates/ls-index" }
+ls-artifacts = { path = "../crates/ls-artifacts" }

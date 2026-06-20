@@ -119,6 +119,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "ls-app",
+ "ls-artifacts",
  "ls-embed",
  "ls-index",
  "ls-llm",
@@ -4835,6 +4836,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.2",
+]
+
+[[package]]
+name = "ls-artifacts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
 ]
 
 [[package]]

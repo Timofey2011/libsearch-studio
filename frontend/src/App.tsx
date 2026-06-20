@@ -32,6 +32,8 @@ export default function App() {
   const [sources, setSources] = useState<SearchResult[]>([]);
   const [busy, setBusy] = useState(false);
   const [reader, setReader] = useState<Reader | null>(null);
+  const [saved, setSaved] = useState<string | null>(null);
+  const [asked, setAsked] = useState("");
 
   useEffect(() => {
     invoke<Collection[]>("list_collections").then(setCollections).catch(console.error);
@@ -59,6 +61,8 @@ export default function App() {
     setBusy(true);
     setAnswer("");
     setSources([]);
+    setSaved(null);
+    setAsked(question.trim());
     try {
       const res = await invoke<SearchResult[]>("ask", { collectionId: collId, question, model });
       setSources(res);
@@ -70,6 +74,23 @@ export default function App() {
 
   function openSource(s: SearchResult) {
     setReader({ path: s.source_path, page: s.page });
+  }
+
+  async function saveArtifact() {
+    if (!answer || busy) return;
+    try {
+      const path = await invoke<string>("save_artifact", {
+        collectionId: collId,
+        question: asked || question,
+        answer,
+        model,
+        created: new Date().toISOString().slice(0, 19).replace("T", " "),
+        sources,
+      });
+      setSaved(path);
+    } catch (e) {
+      setSaved("Error: " + String(e));
+    }
   }
 
   function chooseModel(m: string) {
@@ -159,6 +180,19 @@ export default function App() {
         {answer && (
           <div style={{ whiteSpace: "pre-wrap", marginTop: 16, padding: 12, background: "#f5f5f5", borderRadius: 8 }}>
             {renderAnswer(answer)}
+          </div>
+        )}
+
+        {answer && !busy && (
+          <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 10 }}>
+            <button onClick={saveArtifact} title="Save this answer + sources as a Markdown file">
+              Save as Markdown
+            </button>
+            {saved && (
+              <span style={{ fontSize: 12, color: saved.startsWith("Error") ? "#b00" : "#2a7" }}>
+                {saved.startsWith("Error") ? saved : `Saved → ${saved}`}
+              </span>
+            )}
           </div>
         )}
 

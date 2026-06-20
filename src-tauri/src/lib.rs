@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use ls_app::{Collection, Db};
+use ls_artifacts::{ArtifactDoc, ArtifactRenderer, Markdown, Source};
 use ls_embed::{Embedder, Reranker};
 use ls_index::Store;
 use ls_llm::{build_prompt, OllamaClient};
@@ -157,6 +158,54 @@ async fn ask(
     Ok(results)
 }
 
+/// Render the given answer + citations to a Markdown artifact and write it to the
+/// configured artifacts directory. Returns the absolute path written.
+#[tauri::command]
+async fn save_artifact(
+    state: State<'_, AppState>,
+    collection_id: String,
+    question: String,
+    answer: String,
+    model: String,
+    created: String,
+    sources: Vec<Source>,
+) -> Result<String, String> {
+    let collection = state
+        .db()?
+        .list_collections()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .map(|c| c.name)
+        .unwrap_or_else(|| "Library".to_string());
+
+    let model = if model.trim().is_empty() {
+        state.settings.ollama_model.clone()
+    } else {
+        model
+    };
+
+    // Resolve the artifacts dir: absolute as-is, else under the app data dir.
+    let configured = Path::new(&state.settings.artifacts_dir);
+    let dir = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        state.data_dir.join(configured)
+    };
+
+    let doc = ArtifactDoc {
+        question,
+        answer,
+        model,
+        collection,
+        created,
+        sources,
+    };
+    let path = ls_artifacts::write_artifact(&Markdown as &dyn ArtifactRenderer, &doc, &dir)
+        .map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn init_state() -> AppState {
     // Load embedding models from the local HF cache only (no network at runtime).
     std::env::set_var("HF_HUB_OFFLINE", "1");
@@ -236,7 +285,8 @@ pub fn run() {
             create_collection,
             list_models,
             warm_model,
-            ask
+            ask,
+            save_artifact
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

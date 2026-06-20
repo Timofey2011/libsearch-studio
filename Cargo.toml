@@ -7,6 +7,7 @@ members = [
     "crates/ls-extract",
     "crates/ls-query",
     "crates/ls-llm",
+    "crates/ls-artifacts",
     "crates/ls-app",
     "crates/ls-cli",
     "src-tauri",
@@ -26,6 +27,7 @@ ls-embed = { path = "crates/ls-embed" }
 ls-extract = { path = "crates/ls-extract" }
 ls-query = { path = "crates/ls-query" }
 ls-llm = { path = "crates/ls-llm" }
+ls-artifacts = { path = "crates/ls-artifacts" }
 serde = { version = "1", features = ["derive"] }
 regex = "1"
 thiserror = "2"
