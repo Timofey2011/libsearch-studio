@@ -11,7 +11,7 @@ use ls_artifacts::{ArtifactDoc, ArtifactRenderer, Markdown, Source};
 use ls_embed::{BgeTokenCounter, Embedder, Reranker};
 use ls_index::Store;
 use ls_llm::{build_prompt_with_history, HistoryTurn, OllamaClient};
-use ls_query::{search, SearchResult};
+use ls_query::{search_multi, SearchResult};
 use tauri::{Emitter, Manager, State, WebviewWindow};
 use tokio::sync::Mutex;
 
@@ -235,7 +235,7 @@ async fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversati
 #[tauri::command]
 async fn create_conversation(
     state: State<'_, AppState>,
-    collection_id: String,
+    collection_ids: Vec<String>,
     title: String,
 ) -> Result<Conversation, String> {
     let title = title.trim();
@@ -246,7 +246,7 @@ async fn create_conversation(
         } else {
             title.chars().take(80).collect()
         },
-        collection_ids: vec![collection_id],
+        collection_ids,
     };
     state
         .db()?
@@ -300,18 +300,20 @@ async fn delete_conversation(
 async fn ask(
     state: State<'_, AppState>,
     window: WebviewWindow,
-    collection_id: String,
+    collection_ids: Vec<String>,
     conversation_id: String,
     question: String,
     model: String,
 ) -> Result<Vec<SearchResult>, String> {
     let db = state.db()?;
-    let coll = db
-        .list_collections()
-        .map_err(|e| e.to_string())?
+    let all_colls = db.list_collections().map_err(|e| e.to_string())?;
+    let colls: Vec<Collection> = all_colls
         .into_iter()
-        .find(|c| c.id == collection_id)
-        .ok_or_else(|| format!("collection {collection_id} not found"))?;
+        .filter(|c| collection_ids.contains(&c.id))
+        .collect();
+    if colls.is_empty() {
+        return Err("no valid collection selected".into());
+    }
 
     // Prior turns for follow-up context (before we add the new question).
     let history: Vec<HistoryTurn> = db
@@ -346,11 +348,17 @@ async fn ask(
     let engine = guard.as_mut().unwrap();
 
     let settings = state.settings();
-    let store = Store::open(&coll.db_path, "chunks")
-        .await
-        .map_err(|e| e.to_string())?;
-    let results = search(
-        &store,
+    let mut stores = Vec::with_capacity(colls.len());
+    for c in &colls {
+        stores.push(
+            Store::open(&c.db_path, "chunks")
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    let store_refs: Vec<&Store> = stores.iter().collect();
+    let results = search_multi(
+        &store_refs,
         &mut engine.embedder,
         &mut engine.reranker,
         &question,
@@ -361,7 +369,7 @@ async fn ask(
     .map_err(|e| e.to_string())?;
 
     if results.is_empty() {
-        let msg = "I couldn't find any matching passages in this collection.";
+        let msg = "I couldn't find any matching passages in the selected collection(s).";
         db.add_message(&Message {
             id: new_id(),
             conversation_id: conversation_id.clone(),
@@ -409,21 +417,26 @@ async fn ask(
 #[tauri::command]
 async fn save_artifact(
     state: State<'_, AppState>,
-    collection_id: String,
+    collection_ids: Vec<String>,
     question: String,
     answer: String,
     model: String,
     created: String,
     sources: Vec<Source>,
 ) -> Result<String, String> {
-    let collection = state
+    let names: Vec<String> = state
         .db()?
         .list_collections()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .find(|c| c.id == collection_id)
+        .filter(|c| collection_ids.contains(&c.id))
         .map(|c| c.name)
-        .unwrap_or_else(|| "Library".to_string());
+        .collect();
+    let collection = if names.is_empty() {
+        "Library".to_string()
+    } else {
+        names.join(", ")
+    };
 
     let settings = state.settings();
     let model = if model.trim().is_empty() {

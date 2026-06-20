@@ -4,7 +4,7 @@
 //! Rank Fusion (RRF) merges the vector and full-text candidate lists with no model;
 //! the cross-encoder then reranks the fused set down to the final top-k.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ls_core::Format;
 use ls_embed::{Embedder, Reranker};
@@ -79,26 +79,30 @@ pub fn rrf_fuse(lists: &[Vec<RetrievedChunk>], k: usize) -> Vec<RetrievedChunk> 
         .collect()
 }
 
-/// Run the full retrieve → rerank → cite pipeline for one query.
-pub async fn search(
+/// Hybrid retrieve (vector + full-text) → RRF for one store, without reranking.
+async fn retrieve(
     store: &Store,
-    embedder: &mut Embedder,
-    reranker: &mut Reranker,
+    qvec: Vec<f32>,
     query: &str,
-    final_k: usize,
     hybrid_k: usize,
-) -> Result<Vec<SearchResult>, QueryError> {
-    let qvec = embedder.embed_query(query)?;
+) -> Result<Vec<RetrievedChunk>, QueryError> {
     let vec_hits = store.vector_search(qvec, hybrid_k).await?;
     // Degrade to vector-only if the FTS index isn't built yet (e.g. a collection
     // mid-index) instead of failing the whole query.
     let fts_hits = store.fts_search(query, hybrid_k).await.unwrap_or_default();
+    Ok(rrf_fuse(&[vec_hits, fts_hits], hybrid_k))
+}
 
-    let candidates = rrf_fuse(&[vec_hits, fts_hits], hybrid_k);
+/// Cross-encoder rerank a candidate set down to the final top-k cited results.
+fn rerank(
+    reranker: &mut Reranker,
+    query: &str,
+    candidates: Vec<RetrievedChunk>,
+    final_k: usize,
+) -> Result<Vec<SearchResult>, QueryError> {
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-
     let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
     let scores = reranker.score(query, &texts)?;
 
@@ -123,6 +127,50 @@ pub async fn search(
             id: c.id,
         })
         .collect())
+}
+
+/// Run the full retrieve → rerank → cite pipeline for one query over one store.
+pub async fn search(
+    store: &Store,
+    embedder: &mut Embedder,
+    reranker: &mut Reranker,
+    query: &str,
+    final_k: usize,
+    hybrid_k: usize,
+) -> Result<Vec<SearchResult>, QueryError> {
+    let qvec = embedder.embed_query(query)?;
+    let candidates = retrieve(store, qvec, query, hybrid_k).await?;
+    rerank(reranker, query, candidates, final_k)
+}
+
+/// Fan out a query over several collections: retrieve from each, merge into one
+/// pool, then rerank once so results from different collections compete fairly.
+/// The candidate budget is split across stores to bound rerank latency.
+pub async fn search_multi(
+    stores: &[&Store],
+    embedder: &mut Embedder,
+    reranker: &mut Reranker,
+    query: &str,
+    final_k: usize,
+    hybrid_k: usize,
+) -> Result<Vec<SearchResult>, QueryError> {
+    if stores.is_empty() {
+        return Ok(Vec::new());
+    }
+    let qvec = embedder.embed_query(query)?;
+    // Split the candidate pool across collections (keep a floor so each still
+    // contributes), so the rerank pool stays ~hybrid_k regardless of N.
+    let per = (hybrid_k / stores.len()).max(6);
+
+    let mut all: Vec<RetrievedChunk> = Vec::new();
+    for store in stores {
+        all.extend(retrieve(store, qvec.clone(), query, per).await?);
+    }
+    // Same chunk may be indexed in multiple collections — keep the first.
+    let mut seen = HashSet::new();
+    all.retain(|c| seen.insert(c.id.clone()));
+
+    rerank(reranker, query, all, final_k)
 }
 
 #[cfg(test)]

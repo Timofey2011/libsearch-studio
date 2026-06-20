@@ -67,7 +67,8 @@ const toSrc = (r: SearchResult): Src => ({
 export default function App() {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [models, setModels] = useState<string[]>([]);
-  const [collId, setCollId] = useState("");
+  const [collIds, setCollIds] = useState<string[]>([]);
+  const [showCollPicker, setShowCollPicker] = useState(false);
   const [model, setModel] = useState("");
   const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
@@ -90,7 +91,14 @@ export default function App() {
   const [progress, setProgress] = useState<{ n: number; total: number; label: string } | null>(null);
   const [indexNote, setIndexNote] = useState<string | null>(null);
 
-  const currentColl = collections.find((c) => c.id === collId) || null;
+  // Manage operates on the first selected collection.
+  const currentColl = collections.find((c) => c.id === collIds[0]) || null;
+  const collLabel =
+    collIds.length === 0
+      ? "Select collections"
+      : collIds.length === 1
+        ? collections.find((c) => c.id === collIds[0])?.name ?? "1 collection"
+        : `${collIds.length} collections`;
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -106,8 +114,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Initialize the selection once; don't clobber it when the list grows.
-    setCollId((cur) => cur || collections[0]?.id || "");
+    // Default to the first collection once; don't clobber an existing selection.
+    setCollIds((cur) => (cur.length ? cur : collections[0] ? [collections[0].id] : []));
   }, [collections]);
 
   // Append streamed tokens to the in-flight assistant message (the last one).
@@ -154,9 +162,13 @@ export default function App() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
 
+  function toggleColl(id: string) {
+    setCollIds((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+  }
+
   async function send() {
     const q = question.trim();
-    if (!collId || !q || busy) return;
+    if (!collIds.length || !q || busy) return;
     setQuestion("");
     setBusy(true);
     setSavedByIdx({});
@@ -164,7 +176,7 @@ export default function App() {
     let cid = convId;
     try {
       if (!cid) {
-        const c = await invoke<Conversation>("create_conversation", { collectionId: collId, title: q });
+        const c = await invoke<Conversation>("create_conversation", { collectionIds: collIds, title: q });
         cid = c.id;
         setConvId(c.id);
         setConversations((prev) => [c, ...prev]);
@@ -172,7 +184,7 @@ export default function App() {
       // Optimistic: show the user turn + an empty assistant turn to stream into.
       setMessages((prev) => [...prev, { role: "user", content: q, sources: [] }, { role: "assistant", content: "", sources: [] }]);
       const res = await invoke<SearchResult[]>("ask", {
-        collectionId: collId,
+        collectionIds: collIds,
         conversationId: cid,
         question: q,
         model,
@@ -205,7 +217,7 @@ export default function App() {
   async function openConversation(c: Conversation) {
     setConvId(c.id);
     setSavedByIdx({});
-    if (c.collection_ids[0]) setCollId(c.collection_ids[0]);
+    if (c.collection_ids.length) setCollIds(c.collection_ids);
     const msgs = await invoke<BackendMessage[]>("list_messages", { conversationId: c.id });
     setMessages(msgs.map((m) => ({ role: m.role, content: m.content, sources: m.citations })));
   }
@@ -254,7 +266,7 @@ export default function App() {
     if (!newName.trim() || newPaths.length === 0) return;
     const coll = await invoke<Collection>("create_collection", { name: newName.trim(), sourcePaths: newPaths });
     setCollections((cs) => [...cs, coll]);
-    setCollId(coll.id);
+    setCollIds([coll.id]);
     setNewName("");
     setNewPaths([]);
     setIndexNote(null);
@@ -290,7 +302,7 @@ export default function App() {
     const q = messages[idx - 1]?.content ?? "";
     try {
       const path = await invoke<string>("save_artifact", {
-        collectionId: collId,
+        collectionIds: collIds,
         question: q,
         answer: a.content,
         model,
@@ -473,14 +485,22 @@ export default function App() {
       {/* Chat column */}
       <div className="main">
         <div className="toolbar">
-          <select value={collId} onChange={(e) => setCollId(e.target.value)}>
-            {collections.length === 0 && <option value="">(no collections)</option>}
-            {collections.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
+          <div className="coll-picker">
+            <button onClick={() => setShowCollPicker((v) => !v)} title="Choose one or more collections to search">
+              {collLabel} ▾
+            </button>
+            {showCollPicker && (
+              <div className="coll-menu" onMouseLeave={() => setShowCollPicker(false)}>
+                {collections.length === 0 && <div className="muted" style={{ padding: 6 }}>No collections.</div>}
+                {collections.map((c) => (
+                  <label key={c.id} className="coll-opt">
+                    <input type="checkbox" checked={collIds.includes(c.id)} onChange={() => toggleColl(c.id)} />
+                    {c.name}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
           <select value={model} onChange={(e) => chooseModel(e.target.value)}>
             {models.length === 0 && <option value="">(no models)</option>}
             {models.map((m) => (
@@ -688,7 +708,7 @@ export default function App() {
             placeholder="Ask your library…  (Enter to send, Shift+Enter for newline)"
           />
           <div className="send-row">
-            <button className="primary" onClick={send} disabled={busy || !collId || !question.trim()}>
+            <button className="primary" onClick={send} disabled={busy || !collIds.length || !question.trim()}>
               {busy ? "Thinking…" : "Send"}
             </button>
           </div>
