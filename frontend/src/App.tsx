@@ -47,7 +47,10 @@ const ANTHROPIC_MODELS = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-
 
 // Mirrors ls_app::IndexEvent (serde tag = "kind", snake_case).
 type IndexEvent =
+  | { kind: "loading" }
   | { kind: "started"; total: number }
+  | { kind: "working"; n: number; total: number; path: string }
+  | { kind: "embedding"; n: number; total: number; title: string; chunks_done: number; chunks_total: number }
   | { kind: "indexed"; n: number; total: number; title: string; chunks: number }
   | { kind: "unchanged"; n: number; total: number; title: string }
   | { kind: "skipped"; n: number; total: number; path: string; reason: string }
@@ -93,8 +96,9 @@ export default function App() {
   const [newName, setNewName] = useState("");
   const [newPaths, setNewPaths] = useState<string[]>([]);
   const [indexing, setIndexing] = useState(false);
-  const [progress, setProgress] = useState<{ n: number; total: number; label: string } | null>(null);
+  const [progress, setProgress] = useState<{ pct: number; label: string } | null>(null);
   const [indexNote, setIndexNote] = useState<string | null>(null);
+  const [llmStatus, setLlmStatus] = useState<{ ok: boolean; message: string } | null>(null);
 
   // Manage operates on the first selected collection.
   const currentColl = collections.find((c) => c.id === collIds[0]) || null;
@@ -113,9 +117,13 @@ export default function App() {
     invoke<string[]>("list_models")
       .then((m) => {
         setModels(m);
-        if (m[0]) setModel(m[0]);
+        const first = m[0] ?? "";
+        if (first) setModel(first);
       })
       .catch(console.error);
+    // Always probe the provider, even if list_models fails (Ollama down) — that
+    // is exactly the state the status indicator needs to surface.
+    checkLlm("");
   }, []);
 
   useEffect(() => {
@@ -143,13 +151,21 @@ export default function App() {
   useEffect(() => {
     const un = listen<IndexEvent>("index-progress", (e) => {
       const ev = e.payload;
-      if (ev.kind === "started") setProgress({ n: 0, total: ev.total, label: "Starting…" });
-      else if (ev.kind === "indexed")
-        setProgress({ n: ev.n, total: ev.total, label: `Indexed ${ev.title} (${ev.chunks} chunks)` });
+      const file = (p: string) => p.split("/").pop();
+      if (ev.kind === "loading") setProgress({ pct: 0, label: "Loading models…" });
+      else if (ev.kind === "started") setProgress({ pct: 0, label: `Found ${ev.total} file(s)` });
+      else if (ev.kind === "working")
+        setProgress({ pct: (ev.total ? (ev.n - 1) / ev.total : 0) * 100, label: `Reading ${file(ev.path)} (${ev.n}/${ev.total})` });
+      else if (ev.kind === "embedding") {
+        const within = ev.chunks_total ? ev.chunks_done / ev.chunks_total : 0;
+        const pct = (ev.total ? (ev.n - 1 + within) / ev.total : 0) * 100;
+        setProgress({ pct, label: `Indexing ${ev.title} — ${ev.chunks_done}/${ev.chunks_total} chunks (${ev.n}/${ev.total})` });
+      } else if (ev.kind === "indexed")
+        setProgress({ pct: (ev.n / ev.total) * 100, label: `Indexed ${ev.title}` });
       else if (ev.kind === "unchanged")
-        setProgress({ n: ev.n, total: ev.total, label: `Unchanged ${ev.title}` });
+        setProgress({ pct: (ev.n / ev.total) * 100, label: `Unchanged ${ev.title}` });
       else if (ev.kind === "skipped")
-        setProgress({ n: ev.n, total: ev.total, label: `Skipped ${ev.path.split("/").pop()}: ${ev.reason}` });
+        setProgress({ pct: (ev.n / ev.total) * 100, label: `Skipped ${file(ev.path)}: ${ev.reason}` });
       else if (ev.kind === "finished") {
         const s = ev.stats;
         setIndexNote(
@@ -320,9 +336,16 @@ export default function App() {
     }
   }
 
+  function checkLlm(m: string) {
+    invoke<{ ok: boolean; message: string }>("check_llm", { model: m })
+      .then(setLlmStatus)
+      .catch((e) => setLlmStatus({ ok: false, message: String(e) }));
+  }
+
   function chooseModel(m: string) {
     setModel(m);
     invoke("warm_model", { model: m }).catch(console.error);
+    checkLlm(m);
   }
 
   function editSetting<K extends keyof Settings>(key: K, value: Settings[K]) {
@@ -342,7 +365,9 @@ export default function App() {
       const m = await invoke<string[]>("list_models");
       setModels(m);
       // Keep the toolbar model valid for the (possibly changed) provider.
-      setModel((cur) => (m.includes(cur) ? cur : m[0] ?? ""));
+      const next = m.includes(model) ? model : m[0] ?? "";
+      setModel(next);
+      checkLlm(next);
       setTimeout(() => setSettingsNote(null), 2000);
     } catch (e) {
       setSettingsNote("Error: " + String(e));
@@ -516,6 +541,16 @@ export default function App() {
               </option>
             ))}
           </select>
+          {llmStatus && (
+            <span
+              className="llm-status"
+              title={llmStatus.message}
+              onClick={() => checkLlm(model)}
+            >
+              <span className={"dot " + (llmStatus.ok ? "ok" : "bad")} />
+              <span className="muted">{llmStatus.message}</span>
+            </span>
+          )}
           <span className="spacer" />
           <button onClick={() => setManaging((v) => !v)} title="Add folders and (re)index">
             {managing ? "Done" : "Manage…"}
@@ -639,13 +674,10 @@ export default function App() {
                 {progress && (
                   <>
                     <div className="progress-track">
-                      <div
-                        className="progress-bar"
-                        style={{ width: `${progress.total ? (progress.n / progress.total) * 100 : 0}%` }}
-                      />
+                      <div className="progress-bar" style={{ width: `${Math.min(100, progress.pct)}%` }} />
                     </div>
                     <div className="muted" style={{ marginTop: 4 }}>
-                      {progress.n}/{progress.total} · {progress.label}
+                      {progress.label}
                     </div>
                   </>
                 )}

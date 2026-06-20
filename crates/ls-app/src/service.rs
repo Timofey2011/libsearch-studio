@@ -49,8 +49,25 @@ pub struct IndexStats {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IndexEvent {
+    /// Engine (ONNX models) loading before the run starts.
+    Loading,
     Started {
         total: usize,
+    },
+    /// About to read/extract file `n` (shown so a slow/large file is visible
+    /// rather than looking frozen).
+    Working {
+        n: usize,
+        total: usize,
+        path: String,
+    },
+    /// Per-batch embedding progress within the current book.
+    Embedding {
+        n: usize,
+        total: usize,
+        title: String,
+        chunks_done: usize,
+        chunks_total: usize,
     },
     Indexed {
         n: usize,
@@ -135,6 +152,13 @@ impl Service {
         for (i, path) in paths.iter().enumerate() {
             let n = i + 1;
             let p = Path::new(path);
+            // Announce the file before the (potentially slow) extract so a large
+            // or problematic PDF is visible instead of the bar looking frozen.
+            on_event(IndexEvent::Working {
+                n,
+                total,
+                path: path.clone(),
+            });
             let doc = match ls_extract::extract(p) {
                 Ok(d) => d,
                 Err(e) => {
@@ -179,12 +203,29 @@ impl Service {
             }
 
             let mut chunks = chunk_book(&doc, counter, &params);
+            let chunks_total = chunks.len();
+            let mut chunks_done = 0;
+            on_event(IndexEvent::Embedding {
+                n,
+                total,
+                title: doc.title.clone(),
+                chunks_done,
+                chunks_total,
+            });
             for batch in chunks.chunks_mut(EMBED_BATCH) {
                 let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
                 let vectors = embedder.embed(&texts)?;
                 for (c, v) in batch.iter_mut().zip(vectors) {
                     c.vector = Some(v);
                 }
+                chunks_done += batch.len();
+                on_event(IndexEvent::Embedding {
+                    n,
+                    total,
+                    title: doc.title.clone(),
+                    chunks_done,
+                    chunks_total,
+                });
             }
             store.delete_book(&doc.book_id).await.ok();
             stats.chunks_written += store.add_chunks(&chunks).await?;

@@ -6,7 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ls_app::{Citation, Collection, Conversation, Db, IndexStats, Message, Role, Service};
+use ls_app::{
+    Citation, Collection, Conversation, Db, IndexEvent, IndexStats, Message, Role, Service,
+};
 use ls_artifacts::{ArtifactDoc, ArtifactRenderer, Markdown, Source};
 use ls_embed::{BgeTokenCounter, Embedder, Reranker};
 use ls_index::Store;
@@ -162,6 +164,10 @@ async fn index_collection(
     let data_dir = state.data_dir.clone();
     let w = window.clone();
 
+    // The embedder load below takes ~20s on first index; tell the UI so the bar
+    // doesn't look frozen before the first book is processed.
+    let _ = window.emit("index-progress", IndexEvent::Loading);
+
     // Run the whole job on a blocking thread with its own runtime: the rusqlite
     // connection and tokenizer aren't Send, so they must never cross an await on
     // the main (multi-threaded) runtime. A dedicated embedder is loaded here
@@ -204,6 +210,51 @@ async fn warm_model(state: State<'_, AppState>, model: String) -> Result<(), Str
     }
     let _ = state.llm().warm(&model).await;
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct LlmStatus {
+    ok: bool,
+    message: String,
+}
+
+/// Health-check the active synthesis provider so the UI can show readiness.
+/// For Ollama: confirm it's reachable and the chosen model is pulled. For
+/// Anthropic: confirm a key is configured (a real call would cost tokens).
+#[tauri::command]
+async fn check_llm(state: State<'_, AppState>, model: String) -> Result<LlmStatus, String> {
+    let settings = state.settings();
+    if settings.llm_provider == "anthropic" {
+        let ok = !settings.anthropic_api_key.trim().is_empty();
+        return Ok(LlmStatus {
+            ok,
+            message: if ok {
+                "Anthropic API key set".into()
+            } else {
+                "No Anthropic API key — add one in Settings".into()
+            },
+        });
+    }
+    match state.llm().list_models().await {
+        Ok(models) => {
+            let model = model.trim();
+            if model.is_empty() || models.iter().any(|m| m == model) {
+                Ok(LlmStatus {
+                    ok: true,
+                    message: format!("Ollama up · {} model(s)", models.len()),
+                })
+            } else {
+                Ok(LlmStatus {
+                    ok: false,
+                    message: format!("'{model}' not pulled — run `ollama pull {model}`"),
+                })
+            }
+        }
+        Err(e) => Ok(LlmStatus {
+            ok: false,
+            message: format!("Ollama unreachable — is it running? ({e})"),
+        }),
+    }
 }
 
 /// Current persisted settings (for the Settings UI).
@@ -556,6 +607,7 @@ pub fn run() {
             delete_conversation,
             list_models,
             warm_model,
+            check_llm,
             get_settings,
             save_settings,
             ask,

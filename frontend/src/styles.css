@@ -196,6 +196,33 @@ a:hover {
   flex: 1;
 }
 
+.llm-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  max-width: 280px;
+  overflow: hidden;
+}
+.llm-status .muted {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot.ok {
+  background: var(--ok);
+}
+.dot.bad {
+  background: var(--danger);
+}
+
 .coll-picker {
   position: relative;
 }
