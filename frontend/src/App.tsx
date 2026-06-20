@@ -36,9 +36,14 @@ type Settings = {
   artifacts_dir: string;
   ollama_host: string;
   ollama_model: string;
+  llm_provider: string;
+  anthropic_api_key: string;
+  anthropic_model: string;
   hybrid_top_k: number;
   final_top_k: number;
 };
+
+const ANTHROPIC_MODELS = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-fable-5"];
 
 // Mirrors ls_app::IndexEvent (serde tag = "kind", snake_case).
 type IndexEvent =
@@ -336,6 +341,8 @@ export default function App() {
       setSettingsNote("Saved.");
       const m = await invoke<string[]>("list_models");
       setModels(m);
+      // Keep the toolbar model valid for the (possibly changed) provider.
+      setModel((cur) => (m.includes(cur) ? cur : m[0] ?? ""));
       setTimeout(() => setSettingsNote(null), 2000);
     } catch (e) {
       setSettingsNote("Error: " + String(e));
@@ -522,11 +529,38 @@ export default function App() {
           <div className="panel">
             <h4>Settings</h4>
             <div className="settings-grid">
-              <label>Ollama host</label>
-              <input value={settings.ollama_host} onChange={(e) => editSetting("ollama_host", e.target.value)} />
+              <label>Synthesis provider</label>
+              <select value={settings.llm_provider} onChange={(e) => editSetting("llm_provider", e.target.value)}>
+                <option value="ollama">Ollama (local)</option>
+                <option value="anthropic">Anthropic (cloud)</option>
+              </select>
 
-              <label>Default model</label>
-              <input value={settings.ollama_model} onChange={(e) => editSetting("ollama_model", e.target.value)} />
+              {settings.llm_provider === "anthropic" ? (
+                <>
+                  <label>Anthropic API key</label>
+                  <input
+                    type="password"
+                    placeholder="sk-ant-…"
+                    value={settings.anthropic_api_key}
+                    onChange={(e) => editSetting("anthropic_api_key", e.target.value)}
+                  />
+                  <label>Anthropic model</label>
+                  <select value={settings.anthropic_model} onChange={(e) => editSetting("anthropic_model", e.target.value)}>
+                    {ANTHROPIC_MODELS.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              ) : (
+                <>
+                  <label>Ollama host</label>
+                  <input value={settings.ollama_host} onChange={(e) => editSetting("ollama_host", e.target.value)} />
+                  <label>Default model</label>
+                  <input value={settings.ollama_model} onChange={(e) => editSetting("ollama_model", e.target.value)} />
+                </>
+              )}
 
               <label>Candidate pool (hybrid_top_k)</label>
               <input
@@ -563,7 +597,8 @@ export default function App() {
               )}
             </div>
             <div className="muted" style={{ marginTop: 6 }}>
-              Retrieval changes apply to the next question. Changing the host reconnects Ollama.
+              Changes apply to the next question. The Anthropic key is stored locally in plaintext
+              (settings.toml) and used only to call the Messages API.
             </div>
           </div>
         )}

@@ -96,6 +96,15 @@ cargo run -p ls-cli -- search "how do event-driven microservices communicate"
 | `LS_MODELS_DIR` | `models` | Dir containing `bge-m3/` and `bge-reranker-v2-m3/` |
 | `LS_DB_PATH` | `~/.local/share/ebook-kb/lancedb` | LanceDB index directory |
 
+## Synthesis providers
+
+The answer is synthesized by either a **local Ollama** model (default) or **Anthropic**
+(cloud), chosen in Settings. Retrieval (embeddings + rerank) is always local; only the final
+generation call differs. For Anthropic, paste an API key in Settings — it is stored in
+plaintext in `settings.toml` under the app data dir and used only for the Messages API call;
+prefer Ollama if you don't want a key on disk. The grounded `[n]`-citation prompt is identical
+across providers, so citations and the reader work the same way.
+
 ## Packaging (desktop bundles)
 
 Build the GUI app and platform installers with the Tauri CLI:

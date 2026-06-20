@@ -10,7 +10,7 @@ use ls_app::{Citation, Collection, Conversation, Db, IndexStats, Message, Role, 
 use ls_artifacts::{ArtifactDoc, ArtifactRenderer, Markdown, Source};
 use ls_embed::{BgeTokenCounter, Embedder, Reranker};
 use ls_index::Store;
-use ls_llm::{build_prompt_with_history, HistoryTurn, OllamaClient};
+use ls_llm::{build_prompt_with_history, AnthropicClient, HistoryTurn, Llm, OllamaClient};
 use ls_query::{search_multi, SearchResult};
 use tauri::{Emitter, Manager, State, WebviewWindow};
 use tokio::sync::Mutex;
@@ -49,7 +49,7 @@ struct AppState {
     // Settings and the LLM client are editable at runtime (Settings UI), so both
     // sit behind plain mutexes; values are cloned out before any await.
     settings: std::sync::Mutex<ls_app::Settings>,
-    llm: std::sync::Mutex<OllamaClient>,
+    llm: std::sync::Mutex<Llm>,
     engine: Mutex<Option<Engine>>,
 }
 
@@ -60,8 +60,17 @@ impl AppState {
     fn settings(&self) -> ls_app::Settings {
         self.settings.lock().unwrap().clone()
     }
-    fn llm(&self) -> OllamaClient {
+    fn llm(&self) -> Llm {
         self.llm.lock().unwrap().clone()
+    }
+}
+
+/// Build the synthesis client for the configured provider.
+fn build_llm(s: &ls_app::Settings) -> Llm {
+    if s.llm_provider == "anthropic" {
+        Llm::Anthropic(AnthropicClient::new(&s.anthropic_api_key))
+    } else {
+        Llm::Ollama(OllamaClient::new(&s.ollama_host))
     }
 }
 
@@ -213,15 +222,9 @@ async fn save_settings(
     settings
         .save(state.data_dir.join("settings.toml"))
         .map_err(|e| e.to_string())?;
-    let host_changed = {
-        let mut g = state.settings.lock().unwrap();
-        let changed = g.ollama_host != settings.ollama_host;
-        *g = settings.clone();
-        changed
-    };
-    if host_changed {
-        *state.llm.lock().unwrap() = OllamaClient::new(&settings.ollama_host);
-    }
+    *state.settings.lock().unwrap() = settings.clone();
+    // Rebuild the client so provider/host/key changes take effect immediately.
+    *state.llm.lock().unwrap() = build_llm(&settings);
     Ok(())
 }
 
@@ -384,7 +387,7 @@ async fn ask(
     }
 
     let model = if model.trim().is_empty() {
-        settings.ollama_model.clone()
+        settings.default_model()
     } else {
         model
     };
@@ -440,7 +443,7 @@ async fn save_artifact(
 
     let settings = state.settings();
     let model = if model.trim().is_empty() {
-        settings.ollama_model.clone()
+        settings.default_model()
     } else {
         model
     };
@@ -491,7 +494,7 @@ fn init_state() -> AppState {
         }
     }
 
-    let llm = OllamaClient::new(&settings.ollama_host);
+    let llm = build_llm(&settings);
     AppState {
         data_dir,
         models_dir,

@@ -14,6 +14,12 @@ pub struct Settings {
     /// Ollama endpoint and default synthesis model.
     pub ollama_host: String,
     pub ollama_model: String,
+    /// Synthesis provider: "ollama" (local) or "anthropic" (cloud).
+    pub llm_provider: String,
+    /// Anthropic credentials/model (used when `llm_provider == "anthropic"`).
+    /// Stored in plaintext in settings.toml under the app data dir.
+    pub anthropic_api_key: String,
+    pub anthropic_model: String,
     /// Retrieval breadth: hybrid candidate pool and final reranked count.
     pub hybrid_top_k: usize,
     pub final_top_k: usize,
@@ -26,11 +32,25 @@ impl Default for Settings {
             artifacts_dir: "artifacts".to_string(),
             ollama_host: "http://localhost:11434".to_string(),
             ollama_model: "gemma4:12b-mlx".to_string(),
+            llm_provider: "ollama".to_string(),
+            anthropic_api_key: String::new(),
+            anthropic_model: "claude-sonnet-4-6".to_string(),
             // Candidates reranked per query. The cross-encoder runs on CPU, so this
             // is the main per-query latency knob; 24 keeps recall high while being
             // ~2x faster than 50. (int8-quantizing the reranker is the next lever.)
             hybrid_top_k: 24,
             final_top_k: 8,
+        }
+    }
+}
+
+impl Settings {
+    /// The default synthesis model for the active provider.
+    pub fn default_model(&self) -> String {
+        if self.llm_provider == "anthropic" {
+            self.anthropic_model.clone()
+        } else {
+            self.ollama_model.clone()
         }
     }
 }

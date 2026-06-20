@@ -99,6 +99,31 @@ fn parse_generate_line(line: &str) -> Result<Option<(String, bool)>, LlmError> {
     Ok(Some((token, done)))
 }
 
+/// Parse one SSE `data:` line from Anthropic's `/v1/messages` stream, returning
+/// any text delta. Non-data lines, non-text events, and `[DONE]` yield `None`.
+fn parse_anthropic_sse_line(line: &str) -> Result<Option<String>, LlmError> {
+    let line = line.trim_start();
+    let Some(rest) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let rest = rest.trim();
+    if rest.is_empty() || rest == "[DONE]" {
+        return Ok(None);
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(rest).map_err(|e| LlmError::Decode(e.to_string()))?;
+    if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
+        if let Some(text) = v
+            .get("delta")
+            .and_then(|d| d.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            return Ok(Some(text.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// Parse the `/api/tags` response into a list of model names.
 fn parse_tags(body: &str) -> Result<Vec<String>, LlmError> {
     let v: serde_json::Value =
@@ -209,6 +234,120 @@ impl OllamaClient {
     }
 }
 
+/// Current Claude model ids offered when the Anthropic provider is selected.
+pub const ANTHROPIC_MODELS: &[&str] = &[
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    "claude-fable-5",
+];
+
+const ANTHROPIC_MAX_TOKENS: u32 = 2048;
+
+/// Anthropic Messages API client (cloud). The API key is supplied by the user
+/// via settings and never originates from code.
+#[derive(Clone)]
+pub struct AnthropicClient {
+    api_key: String,
+    http: reqwest::Client,
+}
+
+impl AnthropicClient {
+    pub fn new(api_key: &str) -> Self {
+        Self {
+            api_key: api_key.to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn models() -> Vec<String> {
+        ANTHROPIC_MODELS.iter().map(|s| s.to_string()).collect()
+    }
+
+    async fn generate_stream(
+        &self,
+        model: &str,
+        prompt: &str,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<String, LlmError> {
+        if self.api_key.trim().is_empty() {
+            return Err(LlmError::Decode(
+                "no Anthropic API key set (add one in Settings)".into(),
+            ));
+        }
+        let resp = self
+            .http
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": model,
+                "max_tokens": ANTHROPIC_MAX_TOKENS,
+                "stream": true,
+                "messages": [{ "role": "user", "content": prompt }],
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut full = String::new();
+        while let Some(chunk) = stream.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk?));
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                if let Some(text) = parse_anthropic_sse_line(&line)? {
+                    on_token(&text);
+                    full.push_str(&text);
+                }
+            }
+        }
+        if let Some(text) = parse_anthropic_sse_line(&buf)? {
+            on_token(&text);
+            full.push_str(&text);
+        }
+        Ok(full)
+    }
+}
+
+/// Provider-agnostic chat client. The bridge holds one of these, rebuilt from
+/// settings when the provider/host/key changes.
+#[derive(Clone)]
+pub enum Llm {
+    Ollama(OllamaClient),
+    Anthropic(AnthropicClient),
+}
+
+impl Llm {
+    pub async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        match self {
+            Llm::Ollama(c) => c.list_models().await,
+            Llm::Anthropic(_) => Ok(AnthropicClient::models()),
+        }
+    }
+
+    /// Preload (Ollama only); a no-op for cloud providers.
+    pub async fn warm(&self, model: &str) -> Result<(), LlmError> {
+        match self {
+            Llm::Ollama(c) => c.warm(model).await,
+            Llm::Anthropic(_) => Ok(()),
+        }
+    }
+
+    pub async fn generate_stream(
+        &self,
+        model: &str,
+        prompt: &str,
+        on_token: impl FnMut(&str),
+    ) -> Result<String, LlmError> {
+        match self {
+            Llm::Ollama(c) => c.generate_stream(model, prompt, on_token).await,
+            Llm::Anthropic(c) => c.generate_stream(model, prompt, on_token).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +421,28 @@ mod tests {
             Some(("".into(), true))
         );
         assert!(parse_generate_line("not json").is_err());
+    }
+
+    #[test]
+    fn parses_anthropic_text_deltas() {
+        assert_eq!(
+            parse_anthropic_sse_line("event: content_block_delta").unwrap(),
+            None
+        );
+        assert_eq!(parse_anthropic_sse_line("").unwrap(), None);
+        assert_eq!(parse_anthropic_sse_line("data: [DONE]").unwrap(), None);
+        assert_eq!(
+            parse_anthropic_sse_line(
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#
+            )
+            .unwrap(),
+            Some("Hello".into())
+        );
+        // message_start / ping events carry no text delta.
+        assert_eq!(
+            parse_anthropic_sse_line(r#"data: {"type":"message_start","message":{}}"#).unwrap(),
+            None
+        );
     }
 
     #[test]
