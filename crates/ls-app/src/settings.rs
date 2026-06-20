@@ -1,8 +1,16 @@
 //! Persistent app settings (TOML).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+/// API key + model for one cloud provider (keyed by provider id in `Settings`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCreds {
+    pub api_key: String,
+    pub model: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -14,12 +22,12 @@ pub struct Settings {
     /// Ollama endpoint and default synthesis model.
     pub ollama_host: String,
     pub ollama_model: String,
-    /// Synthesis provider: "ollama" (local) or "anthropic" (cloud).
+    /// Active synthesis provider: "ollama" (local) or a cloud id
+    /// ("anthropic" | "openai" | "gemini" | "fireworks" | "ollama_cloud").
     pub llm_provider: String,
-    /// Anthropic credentials/model (used when `llm_provider == "anthropic"`).
-    /// Stored in plaintext in settings.toml under the app data dir.
-    pub anthropic_api_key: String,
-    pub anthropic_model: String,
+    /// Per-cloud-provider credentials, keyed by provider id. API keys are stored
+    /// in plaintext in settings.toml under the app data dir.
+    pub providers: BTreeMap<String, ProviderCreds>,
     /// Retrieval breadth: hybrid candidate pool and final reranked count.
     pub hybrid_top_k: usize,
     pub final_top_k: usize,
@@ -33,8 +41,7 @@ impl Default for Settings {
             ollama_host: "http://localhost:11434".to_string(),
             ollama_model: "gemma4:12b-mlx".to_string(),
             llm_provider: "ollama".to_string(),
-            anthropic_api_key: String::new(),
-            anthropic_model: "claude-sonnet-4-6".to_string(),
+            providers: BTreeMap::new(),
             // Candidates reranked per query. The cross-encoder runs on CPU, so this
             // is the main per-query latency knob; 24 keeps recall high while being
             // ~2x faster than 50. (int8-quantizing the reranker is the next lever.)
@@ -45,12 +52,24 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Credentials for a cloud provider (empty if unset).
+    pub fn creds(&self, provider: &str) -> ProviderCreds {
+        self.providers.get(provider).cloned().unwrap_or_default()
+    }
+
     /// The default synthesis model for the active provider.
     pub fn default_model(&self) -> String {
-        if self.llm_provider == "anthropic" {
-            self.anthropic_model.clone()
-        } else {
-            self.ollama_model.clone()
+        match self.llm_provider.as_str() {
+            "ollama" => self.ollama_model.clone(),
+            "anthropic" => {
+                let m = self.creds("anthropic").model;
+                if m.is_empty() {
+                    "claude-sonnet-4-6".to_string()
+                } else {
+                    m
+                }
+            }
+            p => self.creds(p).model,
         }
     }
 }

@@ -98,12 +98,25 @@ cargo run -p ls-cli -- search "how do event-driven microservices communicate"
 
 ## Synthesis providers
 
-The answer is synthesized by either a **local Ollama** model (default) or **Anthropic**
-(cloud), chosen in Settings. Retrieval (embeddings + rerank) is always local; only the final
-generation call differs. For Anthropic, paste an API key in Settings — it is stored in
-plaintext in `settings.toml` under the app data dir and used only for the Messages API call;
-prefer Ollama if you don't want a key on disk. The grounded `[n]`-citation prompt is identical
-across providers, so citations and the reader work the same way.
+The answer is synthesized by a provider chosen in Settings; retrieval (embeddings + rerank) is
+always local, only the final generation call differs. The grounded `[n]`-citation prompt is
+identical across providers, so citations and the reader behave the same way.
+
+| Provider | Auth | Endpoint | Notes |
+|----------|------|----------|-------|
+| **Ollama** (local, default) | none | `http://localhost:11434` | no key, runs on-device |
+| **Anthropic** | API key | Messages API | model picker (Claude ids) |
+| **OpenAI** | API key | `api.openai.com/v1` | OpenAI-compatible |
+| **Google Gemini** | API key | `…/v1beta/openai` | Gemini's OpenAI-compatible surface |
+| **Fireworks AI** | API key | `api.fireworks.ai/inference/v1` | OpenAI-compatible |
+| **Ollama Cloud** | API key | `ollama.com/v1` | OpenAI-compatible |
+
+**Auth is API keys, not OAuth.** These inference APIs don't offer OAuth for programmatic access
+(OpenAI has none for chat/completions; Gemini's OAuth path is Vertex AI / GCP, out of scope).
+Paste a key in Settings — it is stored in plaintext in `settings.toml` under the app data dir
+and used only to call that provider; prefer Ollama if you don't want keys on disk. OpenAI,
+Gemini, Fireworks, and Ollama Cloud are all served by one OpenAI-compatible client (base URL +
+key); their model lists are fetched from `/models` after you save the key.
 
 ## Packaging (desktop bundles)
 

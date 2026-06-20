@@ -124,6 +124,42 @@ fn parse_anthropic_sse_line(line: &str) -> Result<Option<String>, LlmError> {
     Ok(None)
 }
 
+/// Parse one SSE `data:` line from an OpenAI-compatible `/chat/completions`
+/// stream, returning any content delta. `[DONE]` and non-content lines → `None`.
+fn parse_openai_sse_line(line: &str) -> Result<Option<String>, LlmError> {
+    let line = line.trim_start();
+    let Some(rest) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let rest = rest.trim();
+    if rest.is_empty() || rest == "[DONE]" {
+        return Ok(None);
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(rest).map_err(|e| LlmError::Decode(e.to_string()))?;
+    let text = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+        .and_then(|d| d.get("content"))
+        .and_then(|t| t.as_str());
+    Ok(text.filter(|t| !t.is_empty()).map(String::from))
+}
+
+/// Parse an OpenAI-compatible `/models` response (`{ "data": [{ "id": ... }] }`).
+fn parse_openai_models(body: &str) -> Result<Vec<String>, LlmError> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| LlmError::Decode(e.to_string()))?;
+    Ok(v.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// Parse the `/api/tags` response into a list of model names.
 fn parse_tags(body: &str) -> Result<Vec<String>, LlmError> {
     let v: serde_json::Value =
@@ -311,12 +347,89 @@ impl AnthropicClient {
     }
 }
 
+/// Client for any OpenAI-compatible chat API (OpenAI, Gemini's compat endpoint,
+/// Fireworks, Ollama Cloud) — same wire format, different `base_url`.
+#[derive(Clone)]
+pub struct OpenAiCompatClient {
+    base_url: String,
+    api_key: String,
+    http: reqwest::Client,
+}
+
+impl OpenAiCompatClient {
+    pub fn new(base_url: &str, api_key: &str) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key: api_key.to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        let body = self
+            .http
+            .get(format!("{}/models", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        parse_openai_models(&body)
+    }
+
+    async fn generate_stream(
+        &self,
+        model: &str,
+        prompt: &str,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<String, LlmError> {
+        if self.api_key.trim().is_empty() {
+            return Err(LlmError::Decode(
+                "no API key set (add one in Settings)".into(),
+            ));
+        }
+        let resp = self
+            .http
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&serde_json::json!({
+                "model": model,
+                "stream": true,
+                "messages": [{ "role": "user", "content": prompt }],
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut full = String::new();
+        while let Some(chunk) = stream.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk?));
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                if let Some(text) = parse_openai_sse_line(&line)? {
+                    on_token(&text);
+                    full.push_str(&text);
+                }
+            }
+        }
+        if let Some(text) = parse_openai_sse_line(&buf)? {
+            on_token(&text);
+            full.push_str(&text);
+        }
+        Ok(full)
+    }
+}
+
 /// Provider-agnostic chat client. The bridge holds one of these, rebuilt from
 /// settings when the provider/host/key changes.
 #[derive(Clone)]
 pub enum Llm {
     Ollama(OllamaClient),
     Anthropic(AnthropicClient),
+    OpenAiCompat(OpenAiCompatClient),
 }
 
 impl Llm {
@@ -324,6 +437,7 @@ impl Llm {
         match self {
             Llm::Ollama(c) => c.list_models().await,
             Llm::Anthropic(_) => Ok(AnthropicClient::models()),
+            Llm::OpenAiCompat(c) => c.list_models().await,
         }
     }
 
@@ -331,7 +445,7 @@ impl Llm {
     pub async fn warm(&self, model: &str) -> Result<(), LlmError> {
         match self {
             Llm::Ollama(c) => c.warm(model).await,
-            Llm::Anthropic(_) => Ok(()),
+            Llm::Anthropic(_) | Llm::OpenAiCompat(_) => Ok(()),
         }
     }
 
@@ -344,6 +458,7 @@ impl Llm {
         match self {
             Llm::Ollama(c) => c.generate_stream(model, prompt, on_token).await,
             Llm::Anthropic(c) => c.generate_stream(model, prompt, on_token).await,
+            Llm::OpenAiCompat(c) => c.generate_stream(model, prompt, on_token).await,
         }
     }
 }
@@ -442,6 +557,23 @@ mod tests {
         assert_eq!(
             parse_anthropic_sse_line(r#"data: {"type":"message_start","message":{}}"#).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn parses_openai_content_deltas_and_models() {
+        assert_eq!(parse_openai_sse_line("data: [DONE]").unwrap(), None);
+        assert_eq!(
+            parse_openai_sse_line(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_openai_sse_line(r#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#).unwrap(),
+            Some("Hi".into())
+        );
+        assert_eq!(
+            parse_openai_models(r#"{"data":[{"id":"gpt-4o"},{"id":"o3"}]}"#).unwrap(),
+            vec!["gpt-4o", "o3"]
         );
     }
 

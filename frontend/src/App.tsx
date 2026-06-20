@@ -31,19 +31,28 @@ type Reader = { path: string; page: number | null };
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
 // doesn't surface (e.g. models_dir) are preserved on save.
+type ProviderCreds = { api_key: string; model: string };
 type Settings = {
   models_dir: string;
   artifacts_dir: string;
   ollama_host: string;
   ollama_model: string;
   llm_provider: string;
-  anthropic_api_key: string;
-  anthropic_model: string;
+  providers: Record<string, ProviderCreds>;
   hybrid_top_k: number;
   final_top_k: number;
 };
 
 const ANTHROPIC_MODELS = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-fable-5"];
+
+// Cloud providers (all API-key based; OpenAI-compatible except Anthropic).
+const CLOUD_PROVIDERS: { id: string; label: string; keyHint: string; modelHint: string }[] = [
+  { id: "anthropic", label: "Anthropic (Claude)", keyHint: "console.anthropic.com", modelHint: "claude-sonnet-4-6" },
+  { id: "openai", label: "OpenAI", keyHint: "platform.openai.com/api-keys", modelHint: "gpt-4o" },
+  { id: "gemini", label: "Google Gemini", keyHint: "aistudio.google.com/apikey", modelHint: "gemini-2.0-flash" },
+  { id: "fireworks", label: "Fireworks AI", keyHint: "fireworks.ai/account/api-keys", modelHint: "accounts/fireworks/models/…" },
+  { id: "ollama_cloud", label: "Ollama Cloud", keyHint: "ollama.com/settings/keys", modelHint: "gpt-oss:120b" },
+];
 
 // Mirrors ls_app::IndexEvent (serde tag = "kind", snake_case).
 type IndexEvent =
@@ -352,6 +361,14 @@ export default function App() {
     setSettings((s) => (s ? { ...s, [key]: value } : s));
   }
 
+  function editCreds(provider: string, field: keyof ProviderCreds, value: string) {
+    setSettings((s) => {
+      if (!s) return s;
+      const cur = s.providers[provider] ?? { api_key: "", model: "" };
+      return { ...s, providers: { ...s.providers, [provider]: { ...cur, [field]: value } } };
+    });
+  }
+
   async function pickArtifactsDir() {
     const dir = await pickFolder();
     if (dir) editSetting("artifacts_dir", dir);
@@ -567,34 +584,52 @@ export default function App() {
               <label>Synthesis provider</label>
               <select value={settings.llm_provider} onChange={(e) => editSetting("llm_provider", e.target.value)}>
                 <option value="ollama">Ollama (local)</option>
-                <option value="anthropic">Anthropic (cloud)</option>
+                {CLOUD_PROVIDERS.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label}
+                  </option>
+                ))}
               </select>
 
-              {settings.llm_provider === "anthropic" ? (
-                <>
-                  <label>Anthropic API key</label>
-                  <input
-                    type="password"
-                    placeholder="sk-ant-…"
-                    value={settings.anthropic_api_key}
-                    onChange={(e) => editSetting("anthropic_api_key", e.target.value)}
-                  />
-                  <label>Anthropic model</label>
-                  <select value={settings.anthropic_model} onChange={(e) => editSetting("anthropic_model", e.target.value)}>
-                    {ANTHROPIC_MODELS.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                  </select>
-                </>
-              ) : (
+              {settings.llm_provider === "ollama" ? (
                 <>
                   <label>Ollama host</label>
                   <input value={settings.ollama_host} onChange={(e) => editSetting("ollama_host", e.target.value)} />
                   <label>Default model</label>
                   <input value={settings.ollama_model} onChange={(e) => editSetting("ollama_model", e.target.value)} />
                 </>
+              ) : (
+                (() => {
+                  const p = CLOUD_PROVIDERS.find((x) => x.id === settings.llm_provider)!;
+                  const creds = settings.providers[p.id] ?? { api_key: "", model: "" };
+                  return (
+                    <>
+                      <label>API key</label>
+                      <input
+                        type="password"
+                        placeholder={`key from ${p.keyHint}`}
+                        value={creds.api_key}
+                        onChange={(e) => editCreds(p.id, "api_key", e.target.value)}
+                      />
+                      <label>Model</label>
+                      {p.id === "anthropic" ? (
+                        <select value={creds.model || ANTHROPIC_MODELS[1]} onChange={(e) => editCreds(p.id, "model", e.target.value)}>
+                          {ANTHROPIC_MODELS.map((m) => (
+                            <option key={m} value={m}>
+                              {m}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          placeholder={p.modelHint}
+                          value={creds.model}
+                          onChange={(e) => editCreds(p.id, "model", e.target.value)}
+                        />
+                      )}
+                    </>
+                  );
+                })()
               )}
 
               <label>Candidate pool (hybrid_top_k)</label>
@@ -632,8 +667,10 @@ export default function App() {
               )}
             </div>
             <div className="muted" style={{ marginTop: 6 }}>
-              Changes apply to the next question. The Anthropic key is stored locally in plaintext
-              (settings.toml) and used only to call the Messages API.
+              Changes apply to the next question. Cloud API keys are stored locally in plaintext
+              (settings.toml) and used only to call that provider. OpenAI, Gemini, Fireworks, and
+              Ollama Cloud share one OpenAI-compatible client; after saving, the model dropdown
+              lists the provider's models.
             </div>
           </div>
         )}

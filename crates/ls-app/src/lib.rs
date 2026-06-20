@@ -10,7 +10,7 @@ pub mod types;
 
 pub use discover::discover_books;
 pub use service::{IndexEvent, IndexStats, Service, ServiceError};
-pub use settings::{Settings, SettingsError};
+pub use settings::{ProviderCreds, Settings, SettingsError};
 pub use store::{Db, DbError};
 pub use types::{Citation, Collection, Conversation, Message, Role};
 

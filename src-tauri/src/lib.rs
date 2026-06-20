@@ -12,7 +12,9 @@ use ls_app::{
 use ls_artifacts::{ArtifactDoc, ArtifactRenderer, Markdown, Source};
 use ls_embed::{BgeTokenCounter, Embedder, Reranker};
 use ls_index::Store;
-use ls_llm::{build_prompt_with_history, AnthropicClient, HistoryTurn, Llm, OllamaClient};
+use ls_llm::{
+    build_prompt_with_history, AnthropicClient, HistoryTurn, Llm, OllamaClient, OpenAiCompatClient,
+};
 use ls_query::{search_multi, SearchResult};
 use tauri::{Emitter, Manager, State, WebviewWindow};
 use tokio::sync::Mutex;
@@ -67,12 +69,27 @@ impl AppState {
     }
 }
 
+/// OpenAI-compatible base URL for a cloud provider id, if it is one.
+fn openai_compat_base(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("https://api.openai.com/v1"),
+        // Gemini exposes an OpenAI-compatible surface.
+        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+        "fireworks" => Some("https://api.fireworks.ai/inference/v1"),
+        "ollama_cloud" => Some("https://ollama.com/v1"),
+        _ => None,
+    }
+}
+
 /// Build the synthesis client for the configured provider.
 fn build_llm(s: &ls_app::Settings) -> Llm {
-    if s.llm_provider == "anthropic" {
-        Llm::Anthropic(AnthropicClient::new(&s.anthropic_api_key))
-    } else {
-        Llm::Ollama(OllamaClient::new(&s.ollama_host))
+    match s.llm_provider.as_str() {
+        "anthropic" => Llm::Anthropic(AnthropicClient::new(&s.creds("anthropic").api_key)),
+        p if openai_compat_base(p).is_some() => Llm::OpenAiCompat(OpenAiCompatClient::new(
+            openai_compat_base(p).unwrap(),
+            &s.creds(p).api_key,
+        )),
+        _ => Llm::Ollama(OllamaClient::new(&s.ollama_host)),
     }
 }
 
@@ -224,17 +241,36 @@ struct LlmStatus {
 #[tauri::command]
 async fn check_llm(state: State<'_, AppState>, model: String) -> Result<LlmStatus, String> {
     let settings = state.settings();
-    if settings.llm_provider == "anthropic" {
-        let ok = !settings.anthropic_api_key.trim().is_empty();
-        return Ok(LlmStatus {
-            ok,
-            message: if ok {
-                "Anthropic API key set".into()
-            } else {
-                "No Anthropic API key — add one in Settings".into()
+    let provider = settings.llm_provider.clone();
+
+    // Cloud providers: a key is required first; then a /models probe confirms it.
+    if provider != "ollama" {
+        if settings.creds(&provider).api_key.trim().is_empty() {
+            return Ok(LlmStatus {
+                ok: false,
+                message: format!("No {provider} API key — add one in Settings"),
+            });
+        }
+        if provider == "anthropic" {
+            // No cheap unauthenticated probe; trust the key is present.
+            return Ok(LlmStatus {
+                ok: true,
+                message: "Anthropic key set".into(),
+            });
+        }
+        return Ok(match state.llm().list_models().await {
+            Ok(models) => LlmStatus {
+                ok: true,
+                message: format!("{provider} reachable · {} model(s)", models.len()),
+            },
+            Err(e) => LlmStatus {
+                ok: false,
+                message: format!("{provider} error: {e}"),
             },
         });
     }
+
+    // Local Ollama.
     match state.llm().list_models().await {
         Ok(models) => {
             let model = model.trim();
