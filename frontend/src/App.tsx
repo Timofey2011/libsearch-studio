@@ -66,6 +66,8 @@ export default function App() {
   const [convId, setConvId] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [savedByIdx, setSavedByIdx] = useState<Record<number, string>>({});
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState("");
 
   const [managing, setManaging] = useState(false);
   const [newName, setNewName] = useState("");
@@ -198,6 +200,25 @@ export default function App() {
     await invoke("delete_conversation", { conversationId: id });
     setConversations((prev) => prev.filter((c) => c.id !== id));
     if (convId === id) newChat();
+  }
+
+  function startRename(c: Conversation, e: React.MouseEvent) {
+    e.stopPropagation();
+    setEditingId(c.id);
+    setEditTitle(c.title);
+  }
+
+  async function commitRename() {
+    const id = editingId;
+    const title = editTitle.trim();
+    setEditingId(null);
+    if (!id || !title) return;
+    try {
+      await invoke("rename_conversation", { conversationId: id, title });
+      setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, title } : c)));
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   function openSource(s: Src) {
@@ -379,14 +400,36 @@ export default function App() {
         </div>
         <div className="conv-list">
           {conversations.length === 0 && <div className="muted" style={{ padding: "4px 10px" }}>No conversations yet.</div>}
-          {conversations.map((c) => (
-            <div key={c.id} className={"conv" + (c.id === convId ? " active" : "")} onClick={() => openConversation(c)}>
-              <span className="title">{c.title}</span>
-              <button className="ghost del" onClick={(e) => deleteConversation(c.id, e)} title="Delete conversation">
-                ✕
-              </button>
-            </div>
-          ))}
+          {conversations.map((c) =>
+            editingId === c.id ? (
+              <div key={c.id} className="conv">
+                <input
+                  autoFocus
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                  onBlur={commitRename}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitRename();
+                    else if (e.key === "Escape") setEditingId(null);
+                  }}
+                  style={{ flex: 1, minWidth: 0 }}
+                />
+              </div>
+            ) : (
+              <div
+                key={c.id}
+                className={"conv" + (c.id === convId ? " active" : "")}
+                onClick={() => openConversation(c)}
+                onDoubleClick={(e) => startRename(c, e)}
+                title="Double-click to rename"
+              >
+                <span className="title">{c.title}</span>
+                <button className="ghost del" onClick={(e) => deleteConversation(c.id, e)} title="Delete conversation">
+                  ✕
+                </button>
+              </div>
+            )
+          )}
         </div>
       </div>
 

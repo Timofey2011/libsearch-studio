@@ -231,6 +231,22 @@ async fn list_messages(
 }
 
 #[tauri::command]
+async fn rename_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    title: String,
+) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("title cannot be empty".into());
+    }
+    state
+        .db()?
+        .rename_conversation(&conversation_id, &title.chars().take(80).collect::<String>())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn delete_conversation(
     state: State<'_, AppState>,
     conversation_id: String,
@@ -479,6 +495,7 @@ pub fn run() {
             list_conversations,
             create_conversation,
             list_messages,
+            rename_conversation,
             delete_conversation,
             list_models,
             warm_model,

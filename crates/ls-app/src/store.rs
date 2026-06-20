@@ -154,6 +154,14 @@ impl Db {
         Ok(out)
     }
 
+    pub fn rename_conversation(&self, id: &str, title: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE conversations SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_conversation(&self, id: &str) -> Result<(), DbError> {
         self.conn
             .execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
@@ -338,6 +346,20 @@ mod tests {
         .unwrap();
         db.delete_conversation("c").unwrap();
         assert!(db.list_messages("c").unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_conversation_updates_title() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_conversation(&Conversation {
+            id: "c".into(),
+            title: "old".into(),
+            collection_ids: vec![],
+        })
+        .unwrap();
+        db.rename_conversation("c", "new title").unwrap();
+        let convs = db.list_conversations().unwrap();
+        assert_eq!(convs[0].title, "new title");
     }
 
     #[test]
