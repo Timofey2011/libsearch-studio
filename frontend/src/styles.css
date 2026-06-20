@@ -1,0 +1,385 @@
+/* LibSearch Studio — design system. Neutral, professional, light + dark. */
+
+:root {
+  --bg: #ffffff;
+  --panel: #f7f8fa;
+  --panel-2: #eef0f4;
+  --border: #e5e7eb;
+  --text: #1f2330;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-soft: #eff4ff;
+  --danger: #b00020;
+  --ok: #15803d;
+  --radius: 10px;
+  --radius-sm: 7px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --panel: #1d2027;
+    --panel-2: #262a33;
+    --border: #333845;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #5b8cff;
+    --accent-hover: #7aa2ff;
+    --accent-soft: #243049;
+    --danger: #ff6b6b;
+    --ok: #4ade80;
+    --shadow: none;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 5px 11px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+}
+button:hover:not(:disabled) {
+  background: var(--panel-2);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+button.ghost {
+  border: none;
+  background: none;
+  padding: 4px 6px;
+}
+button.ghost:hover:not(:disabled) {
+  background: var(--panel-2);
+}
+
+select,
+input,
+textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+}
+textarea {
+  resize: none;
+}
+input:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+a {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+/* ---- layout ---- */
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+.sidebar {
+  width: 230px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+}
+.sidebar-head {
+  padding: 12px 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.sidebar-head b {
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.conv-list {
+  overflow: auto;
+  flex: 1;
+  padding: 4px 8px;
+}
+.conv {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  align-items: center;
+}
+.conv:hover {
+  background: var(--panel-2);
+}
+.conv.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.conv .title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conv .del {
+  color: var(--muted);
+  opacity: 0;
+}
+.conv:hover .del {
+  opacity: 1;
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+}
+.toolbar .spacer {
+  flex: 1;
+}
+
+.panel {
+  margin: 12px 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.panel h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+.path-list {
+  margin: 4px 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.progress-track {
+  height: 6px;
+  background: var(--panel-2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+
+/* ---- transcript ---- */
+.transcript {
+  flex: 1;
+  overflow: auto;
+  padding: 18px 22px;
+}
+.empty {
+  color: var(--muted);
+  margin-top: 28px;
+  text-align: center;
+}
+.turn {
+  margin: 14px 0;
+  display: flex;
+  flex-direction: column;
+}
+.turn.user {
+  align-items: flex-end;
+}
+.bubble-user {
+  background: var(--accent-soft);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  max-width: 78%;
+  white-space: pre-wrap;
+}
+.card-assistant {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  max-width: 100%;
+}
+.card-assistant p {
+  margin: 0 0 10px;
+}
+.card-assistant p:last-child {
+  margin-bottom: 0;
+}
+.card-assistant ul,
+.card-assistant ol {
+  margin: 6px 0 10px;
+  padding-left: 22px;
+}
+.card-assistant li {
+  margin: 2px 0;
+}
+.card-assistant code {
+  background: var(--panel-2);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.9em;
+}
+.cite {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.actions {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.note-ok {
+  font-size: 12px;
+  color: var(--ok);
+}
+.note-err {
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.sources {
+  margin-top: 10px;
+}
+.sources b {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+.sources ol {
+  padding-left: 20px;
+  margin: 6px 0 0;
+}
+.sources li {
+  margin-bottom: 4px;
+}
+.src-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.src-link:hover {
+  text-decoration: underline;
+  background: none;
+}
+
+/* ---- composer ---- */
+.composer {
+  border-top: 1px solid var(--border);
+  padding: 12px 14px;
+  background: var(--bg);
+}
+.composer textarea {
+  width: 100%;
+}
+.composer .send-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+/* ---- reader ---- */
+.reader {
+  flex: 1.2;
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.reader-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.reader-head .name {
+  font-size: 13px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.reader iframe {
+  flex: 1;
+  border: none;
+  background: #fff;
+}

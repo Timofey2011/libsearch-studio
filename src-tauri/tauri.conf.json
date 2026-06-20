@@ -13,8 +13,10 @@
     "windows": [
       {
         "title": "LibSearch Studio",
-        "width": 800,
-        "height": 600,
+        "width": 1180,
+        "height": 780,
+        "minWidth": 880,
+        "minHeight": 560,
         "resizable": true,
         "fullscreen": false
       }
