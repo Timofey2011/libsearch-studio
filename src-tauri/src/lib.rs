@@ -46,14 +46,22 @@ struct Engine {
 struct AppState {
     data_dir: PathBuf,
     models_dir: PathBuf,
-    settings: ls_app::Settings,
-    llm: OllamaClient,
+    // Settings and the LLM client are editable at runtime (Settings UI), so both
+    // sit behind plain mutexes; values are cloned out before any await.
+    settings: std::sync::Mutex<ls_app::Settings>,
+    llm: std::sync::Mutex<OllamaClient>,
     engine: Mutex<Option<Engine>>,
 }
 
 impl AppState {
     fn db(&self) -> Result<Db, String> {
         Db::open(self.data_dir.join("app.db")).map_err(|e| e.to_string())
+    }
+    fn settings(&self) -> ls_app::Settings {
+        self.settings.lock().unwrap().clone()
+    }
+    fn llm(&self) -> OllamaClient {
+        self.llm.lock().unwrap().clone()
     }
 }
 
@@ -175,7 +183,7 @@ async fn index_collection(
 
 #[tauri::command]
 async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    state.llm.list_models().await.map_err(|e| e.to_string())
+    state.llm().list_models().await.map_err(|e| e.to_string())
 }
 
 /// Preload a model into Ollama so the next `ask` is warm. Called when the user
@@ -185,7 +193,35 @@ async fn warm_model(state: State<'_, AppState>, model: String) -> Result<(), Str
     if model.trim().is_empty() {
         return Ok(());
     }
-    let _ = state.llm.warm(&model).await;
+    let _ = state.llm().warm(&model).await;
+    Ok(())
+}
+
+/// Current persisted settings (for the Settings UI).
+#[tauri::command]
+async fn get_settings(state: State<'_, AppState>) -> Result<ls_app::Settings, String> {
+    Ok(state.settings())
+}
+
+/// Persist settings, update them in memory, and rebuild the Ollama client if the
+/// host changed.
+#[tauri::command]
+async fn save_settings(
+    state: State<'_, AppState>,
+    settings: ls_app::Settings,
+) -> Result<(), String> {
+    settings
+        .save(state.data_dir.join("settings.toml"))
+        .map_err(|e| e.to_string())?;
+    let host_changed = {
+        let mut g = state.settings.lock().unwrap();
+        let changed = g.ollama_host != settings.ollama_host;
+        *g = settings.clone();
+        changed
+    };
+    if host_changed {
+        *state.llm.lock().unwrap() = OllamaClient::new(&settings.ollama_host);
+    }
     Ok(())
 }
 
@@ -242,7 +278,10 @@ async fn rename_conversation(
     }
     state
         .db()?
-        .rename_conversation(&conversation_id, &title.chars().take(80).collect::<String>())
+        .rename_conversation(
+            &conversation_id,
+            &title.chars().take(80).collect::<String>(),
+        )
         .map_err(|e| e.to_string())
 }
 
@@ -306,6 +345,7 @@ async fn ask(
     }
     let engine = guard.as_mut().unwrap();
 
+    let settings = state.settings();
     let store = Store::open(&coll.db_path, "chunks")
         .await
         .map_err(|e| e.to_string())?;
@@ -314,8 +354,8 @@ async fn ask(
         &mut engine.embedder,
         &mut engine.reranker,
         &question,
-        state.settings.final_top_k,
-        state.settings.hybrid_top_k,
+        settings.final_top_k,
+        settings.hybrid_top_k,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -336,14 +376,14 @@ async fn ask(
     }
 
     let model = if model.trim().is_empty() {
-        state.settings.ollama_model.clone()
+        settings.ollama_model.clone()
     } else {
         model
     };
     let prompt = build_prompt_with_history(&question, &results, &history);
     let w = window.clone();
     let answer = state
-        .llm
+        .llm()
         .generate_stream(&model, &prompt, |tok| {
             let _ = w.emit("ask-token", tok.to_string());
         })
@@ -385,14 +425,15 @@ async fn save_artifact(
         .map(|c| c.name)
         .unwrap_or_else(|| "Library".to_string());
 
+    let settings = state.settings();
     let model = if model.trim().is_empty() {
-        state.settings.ollama_model.clone()
+        settings.ollama_model.clone()
     } else {
         model
     };
 
     // Resolve the artifacts dir: absolute as-is, else under the app data dir.
-    let configured = Path::new(&state.settings.artifacts_dir);
+    let configured = Path::new(&settings.artifacts_dir);
     let dir = if configured.is_absolute() {
         configured.to_path_buf()
     } else {
@@ -441,8 +482,8 @@ fn init_state() -> AppState {
     AppState {
         data_dir,
         models_dir,
-        settings,
-        llm,
+        settings: std::sync::Mutex::new(settings),
+        llm: std::sync::Mutex::new(llm),
         engine: Mutex::new(None),
     }
 }
@@ -499,6 +540,8 @@ pub fn run() {
             delete_conversation,
             list_models,
             warm_model,
+            get_settings,
+            save_settings,
             ask,
             save_artifact
         ])

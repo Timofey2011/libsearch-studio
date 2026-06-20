@@ -224,6 +224,21 @@ a:hover {
   flex-wrap: wrap;
 }
 
+.settings-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 12px;
+  align-items: center;
+  max-width: 620px;
+}
+.settings-grid label {
+  color: var(--muted);
+  font-size: 13px;
+}
+.settings-grid input[type="number"] {
+  width: 90px;
+}
+
 .progress-track {
   height: 6px;
   background: var(--panel-2);

@@ -29,6 +29,17 @@ type BackendMessage = { role: "user" | "assistant"; content: string; citations: 
 
 type Reader = { path: string; page: number | null };
 
+// Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
+// doesn't surface (e.g. models_dir) are preserved on save.
+type Settings = {
+  models_dir: string;
+  artifacts_dir: string;
+  ollama_host: string;
+  ollama_model: string;
+  hybrid_top_k: number;
+  final_top_k: number;
+};
+
 // Mirrors ls_app::IndexEvent (serde tag = "kind", snake_case).
 type IndexEvent =
   | { kind: "started"; total: number }
@@ -70,6 +81,9 @@ export default function App() {
   const [editTitle, setEditTitle] = useState("");
 
   const [managing, setManaging] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [settingsNote, setSettingsNote] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
   const [newPaths, setNewPaths] = useState<string[]>([]);
   const [indexing, setIndexing] = useState(false);
@@ -82,6 +96,7 @@ export default function App() {
   useEffect(() => {
     invoke<Collection[]>("list_collections").then(setCollections).catch(console.error);
     invoke<Conversation[]>("list_conversations").then(setConversations).catch(console.error);
+    invoke<Settings>("get_settings").then(setSettings).catch(console.error);
     invoke<string[]>("list_models")
       .then((m) => {
         setModels(m);
@@ -293,6 +308,28 @@ export default function App() {
     invoke("warm_model", { model: m }).catch(console.error);
   }
 
+  function editSetting<K extends keyof Settings>(key: K, value: Settings[K]) {
+    setSettings((s) => (s ? { ...s, [key]: value } : s));
+  }
+
+  async function pickArtifactsDir() {
+    const dir = await pickFolder();
+    if (dir) editSetting("artifacts_dir", dir);
+  }
+
+  async function saveSettings() {
+    if (!settings) return;
+    try {
+      await invoke("save_settings", { settings });
+      setSettingsNote("Saved.");
+      const m = await invoke<string[]>("list_models");
+      setModels(m);
+      setTimeout(() => setSettingsNote(null), 2000);
+    } catch (e) {
+      setSettingsNote("Error: " + String(e));
+    }
+  }
+
   // Render a [n] / [n, m] citation marker as links into the reader.
   function renderCitation(tok: string, sources: Src[], key: number) {
     const inner = tok.slice(1, -1);
@@ -456,7 +493,60 @@ export default function App() {
           <button onClick={() => setManaging((v) => !v)} title="Add folders and (re)index">
             {managing ? "Done" : "Manage…"}
           </button>
+          <button onClick={() => setShowSettings((v) => !v)} title="Settings">
+            {showSettings ? "Done" : "Settings"}
+          </button>
         </div>
+
+        {showSettings && settings && (
+          <div className="panel">
+            <h4>Settings</h4>
+            <div className="settings-grid">
+              <label>Ollama host</label>
+              <input value={settings.ollama_host} onChange={(e) => editSetting("ollama_host", e.target.value)} />
+
+              <label>Default model</label>
+              <input value={settings.ollama_model} onChange={(e) => editSetting("ollama_model", e.target.value)} />
+
+              <label>Candidate pool (hybrid_top_k)</label>
+              <input
+                type="number"
+                min={1}
+                value={settings.hybrid_top_k}
+                onChange={(e) => editSetting("hybrid_top_k", parseInt(e.target.value, 10) || 0)}
+              />
+
+              <label>Final results (final_top_k)</label>
+              <input
+                type="number"
+                min={1}
+                value={settings.final_top_k}
+                onChange={(e) => editSetting("final_top_k", parseInt(e.target.value, 10) || 0)}
+              />
+
+              <label>Artifacts folder</label>
+              <div className="row">
+                <input
+                  value={settings.artifacts_dir}
+                  onChange={(e) => editSetting("artifacts_dir", e.target.value)}
+                  style={{ flex: 1, minWidth: 0 }}
+                />
+                <button onClick={pickArtifactsDir}>Browse…</button>
+              </div>
+            </div>
+            <div className="row" style={{ marginTop: 10 }}>
+              <button className="primary" onClick={saveSettings}>
+                Save settings
+              </button>
+              {settingsNote && (
+                <span className={settingsNote.startsWith("Error") ? "note-err" : "note-ok"}>{settingsNote}</span>
+              )}
+            </div>
+            <div className="muted" style={{ marginTop: 6 }}>
+              Retrieval changes apply to the next question. Changing the host reconnects Ollama.
+            </div>
+          </div>
+        )}
 
         {managing && (
           <div className="panel">

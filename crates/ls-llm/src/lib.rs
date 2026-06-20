@@ -120,6 +120,7 @@ fn parse_tags(body: &str) -> Result<Vec<String>, LlmError> {
 const NUM_CTX: u32 = 8192;
 
 /// Local Ollama client.
+#[derive(Clone)]
 pub struct OllamaClient {
     base: String,
     http: reqwest::Client,
