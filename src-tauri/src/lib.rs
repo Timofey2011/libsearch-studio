@@ -6,9 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ls_app::{Collection, Db};
+use ls_app::{Collection, Db, IndexStats, Service};
 use ls_artifacts::{ArtifactDoc, ArtifactRenderer, Markdown, Source};
-use ls_embed::{Embedder, Reranker};
+use ls_embed::{BgeTokenCounter, Embedder, Reranker};
 use ls_index::Store;
 use ls_llm::{build_prompt, OllamaClient};
 use ls_query::{search, SearchResult};
@@ -76,6 +76,78 @@ async fn create_collection(
         .upsert_collection(&coll)
         .map_err(|e| e.to_string())?;
     Ok(coll)
+}
+
+/// Replace a collection's source paths (e.g. after the user adds folders).
+#[tauri::command]
+async fn set_collection_paths(
+    state: State<'_, AppState>,
+    collection_id: String,
+    source_paths: Vec<String>,
+) -> Result<Collection, String> {
+    let db = state.db()?;
+    let mut coll = db
+        .list_collections()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| format!("collection {collection_id} not found"))?;
+    coll.source_paths = source_paths;
+    db.upsert_collection(&coll).map_err(|e| e.to_string())?;
+    Ok(coll)
+}
+
+/// Index (or re-index) a collection's source paths, streaming progress to the UI
+/// via `index-progress` events. Incremental: unchanged files are skipped.
+#[tauri::command]
+async fn index_collection(
+    state: State<'_, AppState>,
+    window: WebviewWindow,
+    collection_id: String,
+) -> Result<IndexStats, String> {
+    let coll = state
+        .db()?
+        .list_collections()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| format!("collection {collection_id} not found"))?;
+
+    let files = ls_app::discover_books(&coll.source_paths);
+    if files.is_empty() {
+        return Err("no PDF files found under the collection's source paths".into());
+    }
+
+    let models_dir = state.models_dir.clone();
+    let data_dir = state.data_dir.clone();
+    let w = window.clone();
+
+    // Run the whole job on a blocking thread with its own runtime: the rusqlite
+    // connection and tokenizer aren't Send, so they must never cross an await on
+    // the main (multi-threaded) runtime. A dedicated embedder is loaded here
+    // rather than borrowing the shared one, so chat stays usable during indexing.
+    let stats = tauri::async_runtime::spawn_blocking(move || -> Result<IndexStats, String> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        rt.block_on(async move {
+            let mut embedder =
+                Embedder::load(models_dir.join("bge-m3")).map_err(|e| e.to_string())?;
+            let counter =
+                BgeTokenCounter::load(models_dir.join("bge-m3")).map_err(|e| e.to_string())?;
+            let svc = Service::new(&data_dir).map_err(|e| e.to_string())?;
+            svc.index_collection(&coll, &files, &mut embedder, &counter, |ev| {
+                let _ = w.emit("index-progress", ev);
+            })
+            .await
+            .map_err(|e| e.to_string())
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(stats)
 }
 
 #[tauri::command]
@@ -244,6 +316,7 @@ fn init_state() -> AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -283,6 +356,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_collections,
             create_collection,
+            set_collection_paths,
+            index_collection,
             list_models,
             warm_model,
             ask,

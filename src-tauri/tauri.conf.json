@@ -29,7 +29,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["app", "dmg", "appimage", "deb"],
+    "category": "Productivity",
+    "shortDescription": "Chat with your library, grounded in your books.",
+    "longDescription": "LibSearch Studio is a local-first desktop app for chatting with a local LLM grounded in your personal PDF library, with clickable citations that open the source at the cited page.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -37,6 +40,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    },
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }

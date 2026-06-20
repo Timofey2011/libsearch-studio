@@ -2,11 +2,13 @@
 //! and (later) indexing-job orchestration. This is the layer the Tauri bridge
 //! calls; it depends on the engine crates but contains no UI code.
 
+pub mod discover;
 pub mod service;
 pub mod settings;
 pub mod store;
 pub mod types;
 
+pub use discover::discover_books;
 pub use service::{IndexEvent, IndexStats, Service, ServiceError};
 pub use settings::{Settings, SettingsError};
 pub use store::{Db, DbError};

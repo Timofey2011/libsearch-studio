@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 type Collection = {
   id: string;
@@ -22,6 +23,22 @@ type SearchResult = {
 
 type Reader = { path: string; page: number | null };
 
+// Mirrors ls_app::IndexEvent (serde tag = "kind", snake_case).
+type IndexEvent =
+  | { kind: "started"; total: number }
+  | { kind: "indexed"; n: number; total: number; title: string; chunks: number }
+  | { kind: "unchanged"; n: number; total: number; title: string }
+  | { kind: "skipped"; n: number; total: number; path: string; reason: string }
+  | { kind: "finished"; stats: IndexStats };
+
+type IndexStats = {
+  books_indexed: number;
+  books_unchanged: number;
+  books_skipped: number;
+  books_failed: number;
+  chunks_written: number;
+};
+
 export default function App() {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [models, setModels] = useState<string[]>([]);
@@ -34,6 +51,14 @@ export default function App() {
   const [reader, setReader] = useState<Reader | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [asked, setAsked] = useState("");
+  const [managing, setManaging] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newPaths, setNewPaths] = useState<string[]>([]);
+  const [indexing, setIndexing] = useState(false);
+  const [progress, setProgress] = useState<{ n: number; total: number; label: string } | null>(null);
+  const [indexNote, setIndexNote] = useState<string | null>(null);
+
+  const currentColl = collections.find((c) => c.id === collId) || null;
 
   useEffect(() => {
     invoke<Collection[]>("list_collections").then(setCollections).catch(console.error);
@@ -46,11 +71,35 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (collections[0]) setCollId(collections[0].id);
+    // Initialize the selection once; don't clobber it when the list grows
+    // (e.g. after creating a new collection, which selects itself).
+    setCollId((cur) => cur || collections[0]?.id || "");
   }, [collections]);
 
   useEffect(() => {
     const un = listen<string>("ask-token", (e) => setAnswer((a) => a + e.payload));
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    const un = listen<IndexEvent>("index-progress", (e) => {
+      const ev = e.payload;
+      if (ev.kind === "started") setProgress({ n: 0, total: ev.total, label: "Starting…" });
+      else if (ev.kind === "indexed")
+        setProgress({ n: ev.n, total: ev.total, label: `Indexed ${ev.title} (${ev.chunks} chunks)` });
+      else if (ev.kind === "unchanged")
+        setProgress({ n: ev.n, total: ev.total, label: `Unchanged ${ev.title}` });
+      else if (ev.kind === "skipped")
+        setProgress({ n: ev.n, total: ev.total, label: `Skipped ${ev.path.split("/").pop()}: ${ev.reason}` });
+      else if (ev.kind === "finished") {
+        const s = ev.stats;
+        setIndexNote(
+          `Done — ${s.books_indexed} indexed, ${s.books_unchanged} unchanged, ${s.books_skipped + s.books_failed} skipped, ${s.chunks_written} chunks written.`
+        );
+      }
+    });
     return () => {
       un.then((f) => f());
     };
@@ -74,6 +123,54 @@ export default function App() {
 
   function openSource(s: SearchResult) {
     setReader({ path: s.source_path, page: s.page });
+  }
+
+  async function pickFolder(): Promise<string | null> {
+    const dir = await open({ directory: true, multiple: false, title: "Choose a folder of PDFs" });
+    return typeof dir === "string" ? dir : null;
+  }
+
+  async function addFolderToNew() {
+    const dir = await pickFolder();
+    if (dir && !newPaths.includes(dir)) setNewPaths((p) => [...p, dir]);
+  }
+
+  async function createCollection() {
+    if (!newName.trim() || newPaths.length === 0) return;
+    const coll = await invoke<Collection>("create_collection", {
+      name: newName.trim(),
+      sourcePaths: newPaths,
+    });
+    setCollections((cs) => [...cs, coll]);
+    setCollId(coll.id);
+    setNewName("");
+    setNewPaths([]);
+    setIndexNote(null);
+  }
+
+  async function addFolderToCurrent() {
+    if (!currentColl) return;
+    const dir = await pickFolder();
+    if (!dir || currentColl.source_paths.includes(dir)) return;
+    const updated = await invoke<Collection>("set_collection_paths", {
+      collectionId: currentColl.id,
+      sourcePaths: [...currentColl.source_paths, dir],
+    });
+    setCollections((cs) => cs.map((c) => (c.id === updated.id ? updated : c)));
+  }
+
+  async function runIndex() {
+    if (!currentColl || indexing) return;
+    setIndexing(true);
+    setIndexNote(null);
+    setProgress(null);
+    try {
+      await invoke<IndexStats>("index_collection", { collectionId: currentColl.id });
+    } catch (e) {
+      setIndexNote("Error: " + String(e));
+    }
+    setIndexing(false);
+    setProgress(null);
   }
 
   async function saveArtifact() {
@@ -165,7 +262,90 @@ export default function App() {
               </option>
             ))}
           </select>
+          <button onClick={() => setManaging((v) => !v)} title="Add folders and (re)index">
+            {managing ? "Done" : "Manage…"}
+          </button>
         </div>
+
+        {managing && (
+          <div style={{ marginBottom: 12, padding: 12, border: "1px solid #ddd", borderRadius: 8, background: "#fafafa" }}>
+            {currentColl && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                  {currentColl.name} — {currentColl.source_paths.length} folder(s)
+                </div>
+                {currentColl.source_paths.length > 0 ? (
+                  <ul style={{ margin: "4px 0", paddingLeft: 18, fontSize: 12, color: "#555" }}>
+                    {currentColl.source_paths.map((p) => (
+                      <li key={p}>{p}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <div style={{ fontSize: 12, color: "#888" }}>No folders yet — add one to index.</div>
+                )}
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 6 }}>
+                  <button onClick={addFolderToCurrent} disabled={indexing}>
+                    Add folder…
+                  </button>
+                  <button onClick={runIndex} disabled={indexing || currentColl.source_paths.length === 0}>
+                    {indexing ? "Indexing…" : "Index / Re-index"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {(progress || indexNote) && (
+              <div style={{ marginTop: 8 }}>
+                {progress && (
+                  <>
+                    <div style={{ height: 6, background: "#e3e3e3", borderRadius: 3, overflow: "hidden" }}>
+                      <div
+                        style={{
+                          height: "100%",
+                          width: `${progress.total ? (progress.n / progress.total) * 100 : 0}%`,
+                          background: "#0a58ca",
+                          transition: "width .2s",
+                        }}
+                      />
+                    </div>
+                    <div style={{ fontSize: 12, color: "#555", marginTop: 4 }}>
+                      {progress.n}/{progress.total} · {progress.label}
+                    </div>
+                  </>
+                )}
+                {indexNote && (
+                  <div style={{ fontSize: 12, marginTop: 4, color: indexNote.startsWith("Error") ? "#b00" : "#2a7" }}>
+                    {indexNote}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{ marginTop: 12, borderTop: "1px solid #e3e3e3", paddingTop: 10 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>New collection</div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <input
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  placeholder="Name (e.g. Distributed Systems)"
+                  style={{ flex: "1 1 200px", minWidth: 0 }}
+                />
+                <button onClick={addFolderToNew}>Add folder…</button>
+                <button onClick={createCollection} disabled={!newName.trim() || newPaths.length === 0}>
+                  Create
+                </button>
+              </div>
+              {newPaths.length > 0 && (
+                <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 12, color: "#555" }}>
+                  {newPaths.map((p) => (
+                    <li key={p}>{p}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+
         <textarea
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
