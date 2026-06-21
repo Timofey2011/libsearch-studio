@@ -418,13 +418,55 @@ a:hover {
   padding: 12px 14px;
   background: var(--bg);
 }
+.input-wrap {
+  position: relative;
+}
 .composer textarea {
   width: 100%;
+  padding-right: 46px;
+  border-radius: var(--radius);
 }
-.composer .send-row {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 8px;
+.send-icon {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+}
+.send-icon:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+.send-icon:disabled {
+  background: var(--panel-2);
+  color: var(--muted);
+  opacity: 1;
+  cursor: default;
+}
+.send-spin {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: send-spin 0.7s linear infinite;
+}
+@keyframes send-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.composer-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
 }
 
 /* ---- reader ---- */

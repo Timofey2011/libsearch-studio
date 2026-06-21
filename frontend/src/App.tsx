@@ -88,6 +88,9 @@ export default function App() {
   const [showCollPicker, setShowCollPicker] = useState(false);
   const [model, setModel] = useState("");
   const [question, setQuestion] = useState("");
+  const [history, setHistory] = useState<string[]>([]);
+  const [histIndex, setHistIndex] = useState<number | null>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
   const [busy, setBusy] = useState(false);
   const [reader, setReader] = useState<Reader | null>(null);
 
@@ -212,6 +215,8 @@ export default function App() {
     const q = question.trim();
     if (!collIds.length || !q || busy) return;
     setQuestion("");
+    setHistory((h) => (h[h.length - 1] === q ? h : [...h, q]));
+    setHistIndex(null);
     setBusy(true);
     setSavedByIdx({});
 
@@ -254,6 +259,58 @@ export default function App() {
     setMessages([]);
     setSavedByIdx({});
     setReader(null);
+  }
+
+  // Insert a newline at the caret (Alt/Shift+Enter), keeping the caret after it.
+  function insertNewline() {
+    const ta = taRef.current;
+    if (!ta) return;
+    const s = ta.selectionStart;
+    const e = ta.selectionEnd;
+    setQuestion(question.slice(0, s) + "\n" + question.slice(e));
+    requestAnimationFrame(() => {
+      if (taRef.current) taRef.current.selectionStart = taRef.current.selectionEnd = s + 1;
+    });
+  }
+
+  // Shell-style history recall through previously sent questions.
+  function recallPrev() {
+    if (!history.length) return;
+    const idx = histIndex === null ? history.length - 1 : Math.max(0, histIndex - 1);
+    setHistIndex(idx);
+    setQuestion(history[idx]);
+  }
+  function recallNext() {
+    if (histIndex === null) return;
+    const idx = histIndex + 1;
+    if (idx >= history.length) {
+      setHistIndex(null);
+      setQuestion("");
+    } else {
+      setHistIndex(idx);
+      setQuestion(history[idx]);
+    }
+  }
+
+  function onComposerKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter") {
+      if (e.altKey || e.shiftKey) {
+        e.preventDefault();
+        insertNewline();
+      } else {
+        e.preventDefault();
+        send();
+      }
+      return;
+    }
+    const ta = e.currentTarget;
+    if (e.key === "ArrowUp" && ta.selectionStart === 0 && history.length) {
+      e.preventDefault();
+      recallPrev();
+    } else if (e.key === "ArrowDown" && ta.selectionStart === ta.value.length && histIndex !== null) {
+      e.preventDefault();
+      recallNext();
+    }
   }
 
   async function openConversation(c: Conversation) {
@@ -810,23 +867,33 @@ export default function App() {
 
         {/* Composer */}
         <div className="composer">
-          <textarea
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                send();
-              }
-            }}
-            rows={2}
-            placeholder="Ask your library…  (Enter to send, Shift+Enter for newline)"
-          />
-          <div className="send-row">
-            <button className="primary" onClick={send} disabled={busy || !collIds.length || !question.trim()}>
-              {busy ? "Thinking…" : "Send"}
+          <div className="input-wrap">
+            <textarea
+              ref={taRef}
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              onKeyDown={onComposerKeyDown}
+              rows={2}
+              placeholder="Ask your library…"
+            />
+            <button
+              className="send-icon"
+              onClick={send}
+              disabled={busy || !collIds.length || !question.trim()}
+              title="Send (Enter)"
+              aria-label="Send"
+            >
+              {busy ? (
+                <span className="send-spin" />
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="9 10 4 15 9 20" />
+                  <path d="M20 4v7a4 4 0 0 1-4 4H4" />
+                </svg>
+              )}
             </button>
           </div>
+          <div className="composer-hint">Enter to send · ⌥Enter for newline · ↑/↓ for history</div>
         </div>
       </div>
 
