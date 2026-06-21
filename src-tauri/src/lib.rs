@@ -485,11 +485,19 @@ async fn ask(
     };
     let prompt = build_prompt_with_history(&question, &results, &history);
     let w = window.clone();
+    let wr = window.clone();
     let answer = state
         .llm()
-        .generate_stream(&model, &prompt, |tok| {
-            let _ = w.emit("ask-token", tok.to_string());
-        })
+        .generate_stream(
+            &model,
+            &prompt,
+            |tok| {
+                let _ = w.emit("ask-token", tok.to_string());
+            },
+            |think| {
+                let _ = wr.emit("ask-reasoning", think.to_string());
+            },
+        )
         .await
         .map_err(|e| e.to_string())?;
 

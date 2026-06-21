@@ -335,6 +335,40 @@ a:hover {
   max-width: 78%;
   white-space: pre-wrap;
 }
+.thinking {
+  margin-bottom: 6px;
+}
+.thinking-toggle {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  font-size: 12px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.thinking-toggle:hover {
+  background: none;
+  color: var(--text);
+}
+.thinking-toggle .caret {
+  font-size: 10px;
+}
+.thinking-body {
+  margin-top: 4px;
+  padding: 10px 12px;
+  border-left: 2px solid var(--border);
+  background: var(--panel);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 260px;
+  overflow: auto;
+}
+
 .card-assistant {
   background: var(--panel);
   border: 1px solid var(--border);

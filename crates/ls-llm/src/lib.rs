@@ -81,69 +81,233 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// One parsed streaming line: any answer content and/or reasoning ("thinking")
+/// deltas, plus whether the stream is done.
+#[derive(Debug, Default, PartialEq)]
+struct LineOut {
+    content: Option<String>,
+    reasoning: Option<String>,
+    done: bool,
+}
+
+/// Splits a content stream into answer text vs. inline `<think>…</think>`
+/// reasoning, tolerating tags split across chunk boundaries.
+#[derive(Default)]
+struct ThinkSplitter {
+    in_think: bool,
+    buf: String,
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Longest suffix of `s` that is a (proper) prefix of `tag` — bytes we must hold
+/// back in case the next chunk completes the tag.
+fn trailing_partial(s: &str, tag: &str) -> usize {
+    let max = tag.len().saturating_sub(1).min(s.len());
+    for k in (1..=max).rev() {
+        if tag.as_bytes().starts_with(&s.as_bytes()[s.len() - k..]) {
+            return k;
+        }
+    }
+    0
+}
+
+impl ThinkSplitter {
+    /// Feed a content chunk; returns `(answer_text, reasoning_text)` ready to emit.
+    fn feed(&mut self, s: &str) -> (String, String) {
+        self.buf.push_str(s);
+        let (mut content, mut reasoning) = (String::new(), String::new());
+        loop {
+            let (tag, out) = if self.in_think {
+                (THINK_CLOSE, &mut reasoning)
+            } else {
+                (THINK_OPEN, &mut content)
+            };
+            if let Some(i) = self.buf.find(tag) {
+                out.push_str(&self.buf[..i]);
+                self.buf.drain(..i + tag.len());
+                self.in_think = !self.in_think;
+            } else {
+                let keep = trailing_partial(&self.buf, tag);
+                let emit_to = self.buf.len() - keep;
+                out.push_str(&self.buf[..emit_to]);
+                self.buf.drain(..emit_to);
+                break;
+            }
+        }
+        (content, reasoning)
+    }
+
+    /// Flush whatever remains (stream ended mid-buffer).
+    fn finish(&mut self) -> (String, String) {
+        let rest = std::mem::take(&mut self.buf);
+        if self.in_think {
+            (String::new(), rest)
+        } else {
+            (rest, String::new())
+        }
+    }
+}
+
 /// Parse one NDJSON line from Ollama `/api/generate` (stream=true).
-/// Returns `(token_chunk, done)`; ignores blank lines (`None`).
-fn parse_generate_line(line: &str) -> Result<Option<(String, bool)>, LlmError> {
+fn parse_generate_line(line: &str) -> Result<LineOut, LlmError> {
     let line = line.trim();
     if line.is_empty() {
-        return Ok(None);
+        return Ok(LineOut::default());
     }
     let v: serde_json::Value =
         serde_json::from_str(line).map_err(|e| LlmError::Decode(e.to_string()))?;
-    let token = v
-        .get("response")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
-    let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
-    Ok(Some((token, done)))
+    Ok(LineOut {
+        content: str_field(&v, "response"),
+        reasoning: str_field(&v, "thinking"),
+        done: v.get("done").and_then(|d| d.as_bool()).unwrap_or(false),
+    })
 }
 
-/// Parse one SSE `data:` line from Anthropic's `/v1/messages` stream, returning
-/// any text delta. Non-data lines, non-text events, and `[DONE]` yield `None`.
-fn parse_anthropic_sse_line(line: &str) -> Result<Option<String>, LlmError> {
-    let line = line.trim_start();
-    let Some(rest) = line.strip_prefix("data:") else {
-        return Ok(None);
+/// Parse one SSE `data:` line from Anthropic's `/v1/messages` stream.
+fn parse_anthropic_sse_line(line: &str) -> Result<LineOut, LlmError> {
+    let Some(v) = sse_json(line)? else {
+        return Ok(LineOut::default());
     };
-    let rest = rest.trim();
-    if rest.is_empty() || rest == "[DONE]" {
-        return Ok(None);
-    }
-    let v: serde_json::Value =
-        serde_json::from_str(rest).map_err(|e| LlmError::Decode(e.to_string()))?;
     if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
-        if let Some(text) = v
-            .get("delta")
-            .and_then(|d| d.get("text"))
-            .and_then(|t| t.as_str())
-        {
-            return Ok(Some(text.to_string()));
-        }
+        let delta = v.get("delta");
+        return Ok(LineOut {
+            content: delta.and_then(|d| str_field(d, "text")),
+            reasoning: delta.and_then(|d| str_field(d, "thinking")),
+            done: false,
+        });
     }
-    Ok(None)
+    Ok(LineOut::default())
 }
 
-/// Parse one SSE `data:` line from an OpenAI-compatible `/chat/completions`
-/// stream, returning any content delta. `[DONE]` and non-content lines → `None`.
-fn parse_openai_sse_line(line: &str) -> Result<Option<String>, LlmError> {
+/// Parse one SSE `data:` line from an OpenAI-compatible `/chat/completions` stream.
+/// Reasoning models expose `delta.reasoning_content` (or `reasoning`).
+fn parse_openai_sse_line(line: &str) -> Result<LineOut, LlmError> {
     let line = line.trim_start();
-    let Some(rest) = line.strip_prefix("data:") else {
-        return Ok(None);
-    };
-    let rest = rest.trim();
-    if rest.is_empty() || rest == "[DONE]" {
-        return Ok(None);
+    if line.strip_prefix("data:").map(str::trim) == Some("[DONE]") {
+        return Ok(LineOut {
+            done: true,
+            ..Default::default()
+        });
     }
-    let v: serde_json::Value =
-        serde_json::from_str(rest).map_err(|e| LlmError::Decode(e.to_string()))?;
-    let text = v
+    let Some(v) = sse_json(line)? else {
+        return Ok(LineOut::default());
+    };
+    let delta = v
         .get("choices")
         .and_then(|c| c.get(0))
-        .and_then(|c| c.get("delta"))
-        .and_then(|d| d.get("content"))
-        .and_then(|t| t.as_str());
-    Ok(text.filter(|t| !t.is_empty()).map(String::from))
+        .and_then(|c| c.get("delta"));
+    Ok(LineOut {
+        content: delta.and_then(|d| str_field(d, "content")),
+        reasoning: delta
+            .and_then(|d| str_field(d, "reasoning_content").or(str_field(d, "reasoning"))),
+        done: false,
+    })
+}
+
+/// Extract a non-empty string field from a JSON object.
+fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+}
+
+/// Parse an SSE `data:` line into JSON (None for non-data / blank / `[DONE]`).
+fn sse_json(line: &str) -> Result<Option<serde_json::Value>, LlmError> {
+    let line = line.trim_start();
+    let Some(rest) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let rest = rest.trim();
+    if rest.is_empty() || rest == "[DONE]" {
+        return Ok(None);
+    }
+    serde_json::from_str(rest)
+        .map(Some)
+        .map_err(|e| LlmError::Decode(e.to_string()))
+}
+
+/// Route one parsed line to the callbacks, splitting inline `<think>` out of
+/// content. Returns whether the stream is done.
+fn emit_line(
+    lo: LineOut,
+    splitter: &mut ThinkSplitter,
+    full: &mut String,
+    on_token: &mut impl FnMut(&str),
+    on_reasoning: &mut impl FnMut(&str),
+) -> bool {
+    if let Some(r) = lo.reasoning {
+        if !r.is_empty() {
+            on_reasoning(&r);
+        }
+    }
+    if let Some(c) = lo.content {
+        let (text, reason) = splitter.feed(&c);
+        if !reason.is_empty() {
+            on_reasoning(&reason);
+        }
+        if !text.is_empty() {
+            on_token(&text);
+            full.push_str(&text);
+        }
+    }
+    lo.done
+}
+
+/// Drive a streaming response: parse each line, split inline `<think>` out of
+/// content, and emit answer text via `on_token` and reasoning via `on_reasoning`.
+/// Returns the accumulated answer text (reasoning is not included).
+async fn run_stream<P>(
+    resp: reqwest::Response,
+    mut parse_line: P,
+    mut on_token: impl FnMut(&str),
+    mut on_reasoning: impl FnMut(&str),
+) -> Result<String, LlmError>
+where
+    P: FnMut(&str) -> Result<LineOut, LlmError>,
+{
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut full = String::new();
+    let mut splitter = ThinkSplitter::default();
+
+    while let Some(chunk) = stream.next().await {
+        buf.push_str(&String::from_utf8_lossy(&chunk?));
+        while let Some(nl) = buf.find('\n') {
+            let line: String = buf.drain(..=nl).collect();
+            let lo = parse_line(&line)?;
+            if emit_line(
+                lo,
+                &mut splitter,
+                &mut full,
+                &mut on_token,
+                &mut on_reasoning,
+            ) {
+                let (t, _r) = splitter.finish();
+                if !t.is_empty() {
+                    on_token(&t);
+                    full.push_str(&t);
+                }
+                return Ok(full);
+            }
+        }
+    }
+    let lo = parse_line(&buf)?;
+    emit_line(
+        lo,
+        &mut splitter,
+        &mut full,
+        &mut on_token,
+        &mut on_reasoning,
+    );
+    let (t, _r) = splitter.finish();
+    if !t.is_empty() {
+        on_token(&t);
+        full.push_str(&t);
+    }
+    Ok(full)
 }
 
 /// Parse an OpenAI-compatible `/models` response (`{ "data": [{ "id": ... }] }`).
@@ -219,12 +383,14 @@ impl OllamaClient {
         parse_tags(&body)
     }
 
-    /// Stream a completion, invoking `on_token` per chunk; returns the full text.
+    /// Stream a completion; answer chunks go to `on_token`, reasoning to
+    /// `on_reasoning`. Returns the full answer text.
     pub async fn generate_stream(
         &self,
         model: &str,
         prompt: &str,
-        mut on_token: impl FnMut(&str),
+        on_token: impl FnMut(&str),
+        on_reasoning: impl FnMut(&str),
     ) -> Result<String, LlmError> {
         let resp = self
             .http
@@ -238,35 +404,7 @@ impl OllamaClient {
             .send()
             .await?
             .error_for_status()?;
-
-        let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
-        let mut full = String::new();
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk?;
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-            // Process complete newline-delimited JSON objects.
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
-                if let Some((token, done)) = parse_generate_line(&line)? {
-                    if !token.is_empty() {
-                        on_token(&token);
-                        full.push_str(&token);
-                    }
-                    if done {
-                        return Ok(full);
-                    }
-                }
-            }
-        }
-        // Flush any trailing partial line.
-        if let Some((token, _)) = parse_generate_line(&buf)? {
-            if !token.is_empty() {
-                on_token(&token);
-                full.push_str(&token);
-            }
-        }
-        Ok(full)
+        run_stream(resp, parse_generate_line, on_token, on_reasoning).await
     }
 }
 
@@ -304,7 +442,8 @@ impl AnthropicClient {
         &self,
         model: &str,
         prompt: &str,
-        mut on_token: impl FnMut(&str),
+        on_token: impl FnMut(&str),
+        on_reasoning: impl FnMut(&str),
     ) -> Result<String, LlmError> {
         if self.api_key.trim().is_empty() {
             return Err(LlmError::Decode(
@@ -325,25 +464,7 @@ impl AnthropicClient {
             .send()
             .await?
             .error_for_status()?;
-
-        let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
-        let mut full = String::new();
-        while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
-                if let Some(text) = parse_anthropic_sse_line(&line)? {
-                    on_token(&text);
-                    full.push_str(&text);
-                }
-            }
-        }
-        if let Some(text) = parse_anthropic_sse_line(&buf)? {
-            on_token(&text);
-            full.push_str(&text);
-        }
-        Ok(full)
+        run_stream(resp, parse_anthropic_sse_line, on_token, on_reasoning).await
     }
 }
 
@@ -382,7 +503,8 @@ impl OpenAiCompatClient {
         &self,
         model: &str,
         prompt: &str,
-        mut on_token: impl FnMut(&str),
+        on_token: impl FnMut(&str),
+        on_reasoning: impl FnMut(&str),
     ) -> Result<String, LlmError> {
         if self.api_key.trim().is_empty() {
             return Err(LlmError::Decode(
@@ -401,25 +523,7 @@ impl OpenAiCompatClient {
             .send()
             .await?
             .error_for_status()?;
-
-        let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
-        let mut full = String::new();
-        while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
-                if let Some(text) = parse_openai_sse_line(&line)? {
-                    on_token(&text);
-                    full.push_str(&text);
-                }
-            }
-        }
-        if let Some(text) = parse_openai_sse_line(&buf)? {
-            on_token(&text);
-            full.push_str(&text);
-        }
-        Ok(full)
+        run_stream(resp, parse_openai_sse_line, on_token, on_reasoning).await
     }
 }
 
@@ -454,11 +558,21 @@ impl Llm {
         model: &str,
         prompt: &str,
         on_token: impl FnMut(&str),
+        on_reasoning: impl FnMut(&str),
     ) -> Result<String, LlmError> {
         match self {
-            Llm::Ollama(c) => c.generate_stream(model, prompt, on_token).await,
-            Llm::Anthropic(c) => c.generate_stream(model, prompt, on_token).await,
-            Llm::OpenAiCompat(c) => c.generate_stream(model, prompt, on_token).await,
+            Llm::Ollama(c) => {
+                c.generate_stream(model, prompt, on_token, on_reasoning)
+                    .await
+            }
+            Llm::Anthropic(c) => {
+                c.generate_stream(model, prompt, on_token, on_reasoning)
+                    .await
+            }
+            Llm::OpenAiCompat(c) => {
+                c.generate_stream(model, prompt, on_token, on_reasoning)
+                    .await
+            }
         }
     }
 }
@@ -500,6 +614,31 @@ mod tests {
     }
 
     #[test]
+    fn think_splitter_extracts_reasoning_across_chunks() {
+        let mut sp = ThinkSplitter::default();
+        let (mut content, mut reasoning) = (String::new(), String::new());
+        // Feed the tags split across chunk boundaries.
+        for chunk in ["Hi <thi", "nk>plan", "ning</thi", "nk> done"] {
+            let (c, r) = sp.feed(chunk);
+            content.push_str(&c);
+            reasoning.push_str(&r);
+        }
+        let (c, r) = sp.finish();
+        content.push_str(&c);
+        reasoning.push_str(&r);
+        assert_eq!(content, "Hi  done");
+        assert_eq!(reasoning, "planning");
+    }
+
+    #[test]
+    fn think_splitter_passes_plain_text() {
+        let mut sp = ThinkSplitter::default();
+        let (c, r) = sp.feed("just an answer");
+        assert_eq!(c, "just an answer");
+        assert_eq!(r, "");
+    }
+
+    #[test]
     fn prompt_with_history_includes_recent_turns() {
         let history = vec![
             HistoryTurn {
@@ -524,16 +663,34 @@ mod tests {
         assert!(!build_prompt("q", &[]).contains("Conversation so far"));
     }
 
+    fn content(s: &str) -> LineOut {
+        LineOut {
+            content: Some(s.into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn parses_generate_stream_lines() {
-        assert_eq!(parse_generate_line("").unwrap(), None);
+        assert_eq!(parse_generate_line("").unwrap(), LineOut::default());
         assert_eq!(
             parse_generate_line(r#"{"response":"Hello","done":false}"#).unwrap(),
-            Some(("Hello".into(), false))
+            content("Hello")
         );
         assert_eq!(
             parse_generate_line(r#"{"response":"","done":true}"#).unwrap(),
-            Some(("".into(), true))
+            LineOut {
+                done: true,
+                ..Default::default()
+            }
+        );
+        // Ollama thinking field is captured as reasoning.
+        assert_eq!(
+            parse_generate_line(r#"{"thinking":"hmm","done":false}"#).unwrap(),
+            LineOut {
+                reasoning: Some("hmm".into()),
+                ..Default::default()
+            }
         );
         assert!(parse_generate_line("not json").is_err());
     }
@@ -542,34 +699,49 @@ mod tests {
     fn parses_anthropic_text_deltas() {
         assert_eq!(
             parse_anthropic_sse_line("event: content_block_delta").unwrap(),
-            None
+            LineOut::default()
         );
-        assert_eq!(parse_anthropic_sse_line("").unwrap(), None);
-        assert_eq!(parse_anthropic_sse_line("data: [DONE]").unwrap(), None);
+        assert_eq!(
+            parse_anthropic_sse_line("data: [DONE]").unwrap(),
+            LineOut::default()
+        );
         assert_eq!(
             parse_anthropic_sse_line(
                 r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#
             )
             .unwrap(),
-            Some("Hello".into())
+            content("Hello")
         );
-        // message_start / ping events carry no text delta.
         assert_eq!(
             parse_anthropic_sse_line(r#"data: {"type":"message_start","message":{}}"#).unwrap(),
-            None
+            LineOut::default()
         );
     }
 
     #[test]
-    fn parses_openai_content_deltas_and_models() {
-        assert_eq!(parse_openai_sse_line("data: [DONE]").unwrap(), None);
+    fn parses_openai_content_and_reasoning() {
+        assert_eq!(
+            parse_openai_sse_line("data: [DONE]").unwrap(),
+            LineOut {
+                done: true,
+                ..Default::default()
+            }
+        );
         assert_eq!(
             parse_openai_sse_line(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#).unwrap(),
-            None
+            LineOut::default()
         );
         assert_eq!(
             parse_openai_sse_line(r#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#).unwrap(),
-            Some("Hi".into())
+            content("Hi")
+        );
+        assert_eq!(
+            parse_openai_sse_line(r#"data: {"choices":[{"delta":{"reasoning_content":"think"}}]}"#)
+                .unwrap(),
+            LineOut {
+                reasoning: Some("think".into()),
+                ..Default::default()
+            }
         );
         assert_eq!(
             parse_openai_models(r#"{"data":[{"id":"gpt-4o"},{"id":"o3"}]}"#).unwrap(),

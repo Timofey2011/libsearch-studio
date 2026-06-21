@@ -23,7 +23,7 @@ type SearchResult = {
 
 // A cited source, in the shape shared by live results, stored citations, and artifacts.
 type Src = { rank: number; citation: string; source_path: string; page: number | null; text?: string };
-type ChatMessage = { role: "user" | "assistant"; content: string; sources: Src[] };
+type ChatMessage = { role: "user" | "assistant"; content: string; thinking: string; sources: Src[] };
 type Conversation = { id: string; title: string; collection_ids: string[] };
 type BackendMessage = { role: "user" | "assistant"; content: string; citations: Src[] };
 
@@ -98,6 +98,7 @@ export default function App() {
   const [convId, setConvId] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [savedByIdx, setSavedByIdx] = useState<Record<number, string>>({});
+  const [thinkOpen, setThinkOpen] = useState<Record<number, boolean>>({});
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
 
@@ -157,18 +158,20 @@ export default function App() {
 
   // Append streamed tokens to the in-flight assistant message (the last one).
   useEffect(() => {
-    const un = listen<string>("ask-token", (e) =>
+    const append = (field: "content" | "thinking") => (e: { payload: string }) =>
       setMessages((prev) => {
         if (!prev.length) return prev;
         const last = prev.length - 1;
         if (prev[last].role !== "assistant") return prev;
         const copy = [...prev];
-        copy[last] = { ...copy[last], content: copy[last].content + e.payload };
+        copy[last] = { ...copy[last], [field]: copy[last][field] + e.payload };
         return copy;
-      })
-    );
+      });
+    const unTok = listen<string>("ask-token", append("content"));
+    const unThink = listen<string>("ask-reasoning", append("thinking"));
     return () => {
-      un.then((f) => f());
+      unTok.then((f) => f());
+      unThink.then((f) => f());
     };
   }, []);
 
@@ -229,7 +232,11 @@ export default function App() {
         setConversations((prev) => [c, ...prev]);
       }
       // Optimistic: show the user turn + an empty assistant turn to stream into.
-      setMessages((prev) => [...prev, { role: "user", content: q, sources: [] }, { role: "assistant", content: "", sources: [] }]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: q, thinking: "", sources: [] },
+        { role: "assistant", content: "", thinking: "", sources: [] },
+      ]);
       const res = await invoke<SearchResult[]>("ask", {
         collectionIds: collIds,
         conversationId: cid,
@@ -318,7 +325,8 @@ export default function App() {
     setSavedByIdx({});
     if (c.collection_ids.length) setCollIds(c.collection_ids);
     const msgs = await invoke<BackendMessage[]>("list_messages", { conversationId: c.id });
-    setMessages(msgs.map((m) => ({ role: m.role, content: m.content, sources: m.citations })));
+    setMessages(msgs.map((m) => ({ role: m.role, content: m.content, thinking: "", sources: m.citations })));
+    setThinkOpen({});
   }
 
   async function deleteConversation(id: string, e: React.MouseEvent) {
@@ -831,8 +839,24 @@ export default function App() {
               </div>
             ) : (
               <div key={idx} className="turn">
+                {msg.thinking && (
+                  <div className="thinking">
+                    <button
+                      className="thinking-toggle"
+                      onClick={() => setThinkOpen((o) => ({ ...o, [idx]: !o[idx] }))}
+                    >
+                      <span className="caret">{thinkOpen[idx] ? "▾" : "▸"}</span> Thinking
+                      {!msg.content && <span className="muted"> · reasoning…</span>}
+                    </button>
+                    {thinkOpen[idx] && <div className="thinking-body">{msg.thinking}</div>}
+                  </div>
+                )}
                 <div className="card-assistant">
-                  {msg.content ? renderRich(msg.content, msg.sources) : <span className="muted">Thinking…</span>}
+                  {msg.content ? (
+                    renderRich(msg.content, msg.sources)
+                  ) : (
+                    <span className="muted">{msg.thinking ? "Reasoning…" : "Thinking…"}</span>
+                  )}
                 </div>
                 {msg.sources.length > 0 && (
                   <>

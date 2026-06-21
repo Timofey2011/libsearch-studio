@@ -277,7 +277,8 @@ impl Service {
             return Ok(results);
         }
         let prompt = build_prompt(question, &results);
-        llm.generate_stream(model, &prompt, on_token).await?;
+        llm.generate_stream(model, &prompt, on_token, |_| {})
+            .await?;
         Ok(results)
     }
 }

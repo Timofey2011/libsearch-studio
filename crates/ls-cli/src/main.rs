@@ -163,10 +163,19 @@ async fn run_ask(question: &str) -> Result<()> {
     let client = OllamaClient::new(&host);
     use std::io::Write;
     client
-        .generate_stream(&model, &prompt, |tok| {
-            print!("{tok}");
-            let _ = std::io::stdout().flush();
-        })
+        .generate_stream(
+            &model,
+            &prompt,
+            |tok| {
+                print!("{tok}");
+                let _ = std::io::stdout().flush();
+            },
+            |think| {
+                // Reasoning goes to stderr so stdout stays the clean answer.
+                eprint!("\x1b[2m{think}\x1b[0m");
+                let _ = std::io::stderr().flush();
+            },
+        )
         .await
         .context("ollama generate")?;
 
