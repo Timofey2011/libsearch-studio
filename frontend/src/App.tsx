@@ -122,18 +122,30 @@ export default function App() {
   useEffect(() => {
     invoke<Collection[]>("list_collections").then(setCollections).catch(console.error);
     invoke<Conversation[]>("list_conversations").then(setConversations).catch(console.error);
-    invoke<Settings>("get_settings").then(setSettings).catch(console.error);
-    invoke<string[]>("list_models")
-      .then((m) => {
-        setModels(m);
-        const first = m[0] ?? "";
-        if (first) setModel(first);
+    invoke<Settings>("get_settings")
+      .then((s) => {
+        setSettings(s);
+        refreshModels(s);
       })
       .catch(console.error);
     // Always probe the provider, even if list_models fails (Ollama down) — that
     // is exactly the state the status indicator needs to surface.
     checkLlm("");
   }, []);
+
+  // Populate the model dropdown. Model listing is best-effort: if a cloud
+  // provider doesn't expose /models, fall back to the model set in Settings.
+  async function refreshModels(s: Settings | null): Promise<string[]> {
+    let opts = await invoke<string[]>("list_models").catch(() => [] as string[]);
+    const prov = s?.llm_provider;
+    if (opts.length === 0 && s && prov && prov !== "ollama") {
+      const cm = s.providers[prov]?.model;
+      if (cm) opts = [cm];
+    }
+    setModels(opts);
+    setModel((cur) => (opts.includes(cur) ? cur : opts[0] ?? ""));
+    return opts;
+  }
 
   useEffect(() => {
     // Default to the first collection once; don't clobber an existing selection.
@@ -378,17 +390,16 @@ export default function App() {
     if (!settings) return;
     try {
       await invoke("save_settings", { settings });
-      setSettingsNote("Saved.");
-      const m = await invoke<string[]>("list_models");
-      setModels(m);
-      // Keep the toolbar model valid for the (possibly changed) provider.
-      const next = m.includes(model) ? model : m[0] ?? "";
-      setModel(next);
-      checkLlm(next);
-      setTimeout(() => setSettingsNote(null), 2000);
     } catch (e) {
       setSettingsNote("Error: " + String(e));
+      return;
     }
+    setSettingsNote("Saved.");
+    // Refresh the model list (best-effort) and re-check the provider. A failure
+    // to list models is not a save failure.
+    const opts = await refreshModels(settings);
+    checkLlm(opts[0] ?? "");
+    setTimeout(() => setSettingsNote(null), 2500);
   }
 
   // Render a [n] / [n, m] citation marker as links into the reader.

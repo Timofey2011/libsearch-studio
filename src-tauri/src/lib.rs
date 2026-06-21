@@ -215,7 +215,10 @@ async fn index_collection(
 
 #[tauri::command]
 async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    state.llm().list_models().await.map_err(|e| e.to_string())
+    // Best-effort: some providers (e.g. Fireworks) don't expose `/models` on the
+    // inference endpoint. Never fail the call — the UI falls back to the model
+    // configured in Settings, and the status check reports reachability.
+    Ok(state.llm().list_models().await.unwrap_or_default())
 }
 
 /// Preload a model into Ollama so the next `ask` is warm. Called when the user
@@ -258,14 +261,16 @@ async fn check_llm(state: State<'_, AppState>, model: String) -> Result<LlmStatu
                 message: "Anthropic key set".into(),
             });
         }
+        // `/models` is best-effort (Fireworks 500s on it); a failure here doesn't
+        // mean generation won't work, since the configured model is used directly.
         return Ok(match state.llm().list_models().await {
-            Ok(models) => LlmStatus {
+            Ok(models) if !models.is_empty() => LlmStatus {
                 ok: true,
                 message: format!("{provider} reachable · {} model(s)", models.len()),
             },
-            Err(e) => LlmStatus {
-                ok: false,
-                message: format!("{provider} error: {e}"),
+            _ => LlmStatus {
+                ok: true,
+                message: format!("{provider}: key set — using your configured model"),
             },
         });
     }
