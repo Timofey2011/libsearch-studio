@@ -47,7 +47,9 @@ pub fn clean_text(text: &str) -> String {
     text.trim().to_string()
 }
 
-fn stable_book_id(path: &Path) -> String {
+/// Stable id for a book, derived from its path (no file read). Lets callers
+/// check the incremental-index fingerprint before doing the costly extraction.
+pub fn stable_book_id(path: &Path) -> String {
     let mut h = DefaultHasher::new();
     path.to_string_lossy().hash(&mut h);
     format!("{:016x}", h.finish())

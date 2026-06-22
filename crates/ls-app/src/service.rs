@@ -91,6 +91,13 @@ pub enum IndexEvent {
     },
 }
 
+/// Display title from a path (used for skipped/unchanged files we don't extract).
+fn title_of(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Untitled".to_string())
+}
+
 /// `(path, size, mtime)` fingerprint — changes iff the file changes.
 fn file_fingerprint(path: &Path) -> String {
     match std::fs::metadata(path) {
@@ -152,6 +159,27 @@ impl Service {
         for (i, path) in paths.iter().enumerate() {
             let n = i + 1;
             let p = Path::new(path);
+
+            // Fast skip BEFORE the costly extract: the book id is derived from the
+            // path and the fingerprint from file metadata, so an unchanged file is
+            // recognized with just a stat. This makes re-index / resume cheap.
+            let book_id = ls_extract::stable_book_id(p);
+            let fp = file_fingerprint(p);
+            if self
+                .db
+                .book_fingerprint(&collection.id, &book_id)?
+                .as_deref()
+                == Some(fp.as_str())
+            {
+                stats.books_unchanged += 1;
+                on_event(IndexEvent::Unchanged {
+                    n,
+                    total,
+                    title: title_of(p),
+                });
+                continue;
+            }
+
             // Announce the file before the (potentially slow) extract so a large
             // or problematic PDF is visible instead of the bar looking frozen.
             on_event(IndexEvent::Working {
@@ -172,22 +200,6 @@ impl Service {
                     continue;
                 }
             };
-
-            let fp = file_fingerprint(p);
-            if self
-                .db
-                .book_fingerprint(&collection.id, &doc.book_id)?
-                .as_deref()
-                == Some(fp.as_str())
-            {
-                stats.books_unchanged += 1;
-                on_event(IndexEvent::Unchanged {
-                    n,
-                    total,
-                    title: doc.title.clone(),
-                });
-                continue;
-            }
 
             if doc.blocks.is_empty() {
                 stats.books_skipped += 1;
