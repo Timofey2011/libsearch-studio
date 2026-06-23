@@ -118,6 +118,12 @@ impl Db {
     pub fn delete_collection(&self, id: &str) -> Result<(), DbError> {
         self.conn
             .execute("DELETE FROM collections WHERE id = ?1", params![id])?;
+        // Drop the incremental-index fingerprints so re-creating the collection
+        // re-indexes cleanly.
+        self.conn.execute(
+            "DELETE FROM book_state WHERE collection_id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 

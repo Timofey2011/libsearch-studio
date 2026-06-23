@@ -405,16 +405,57 @@ export default function App() {
     setIndexNote(null);
   }
 
-  async function addFolderToCurrent() {
-    if (!currentColl) return;
-    const dir = await pickFolder();
-    if (!dir || currentColl.source_paths.includes(dir)) return;
+  async function setPaths(coll: Collection, sourcePaths: string[]) {
     const updated = await invoke<Collection>("set_collection_paths", {
-      collectionId: currentColl.id,
-      sourcePaths: [...currentColl.source_paths, dir],
+      collectionId: coll.id,
+      sourcePaths,
     });
     setCollections((cs) => cs.map((c) => (c.id === updated.id ? updated : c)));
   }
+
+  async function addFolderToColl(coll: Collection) {
+    const dir = await pickFolder();
+    if (!dir || coll.source_paths.includes(dir)) return;
+    await setPaths(coll, [...coll.source_paths, dir]);
+  }
+
+  async function removeFolderFromColl(coll: Collection, path: string) {
+    await setPaths(coll, coll.source_paths.filter((p) => p !== path));
+  }
+
+  async function deleteCollectionById(coll: Collection) {
+    if (!confirm(`Delete collection "${coll.name}"? This removes its index (not your files).`)) return;
+    await invoke("delete_collection", { collectionId: coll.id });
+    setCollections((cs) => cs.filter((c) => c.id !== coll.id));
+    setCollIds((ids) => ids.filter((id) => id !== coll.id));
+  }
+
+  async function chooseProvider(p: string) {
+    const next = settings ? { ...settings, llm_provider: p } : null;
+    if (next) setSettings(next);
+    try {
+      await invoke("set_provider", { provider: p });
+      const opts = await refreshModels(next);
+      checkLlm(opts[0] ?? "");
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  // Providers usable right now: local Ollama + any cloud provider with a key set
+  // (plus the current one, so it always appears).
+  function readyProviders(): string[] {
+    const ready = ["ollama"];
+    if (settings) {
+      for (const p of CLOUD_PROVIDERS) {
+        if (settings.providers[p.id]?.api_key?.trim()) ready.push(p.id);
+      }
+      if (!ready.includes(settings.llm_provider)) ready.push(settings.llm_provider);
+    }
+    return ready;
+  }
+  const providerLabel = (id: string) =>
+    id === "ollama" ? "Ollama" : CLOUD_PROVIDERS.find((p) => p.id === id)?.label ?? id;
 
   async function runIndex() {
     if (!currentColl || indexing) return;
@@ -666,6 +707,17 @@ export default function App() {
               </div>
             )}
           </div>
+          <select
+            value={settings?.llm_provider ?? "ollama"}
+            onChange={(e) => chooseProvider(e.target.value)}
+            title="Synthesis provider (configure keys in Settings)"
+          >
+            {readyProviders().map((id) => (
+              <option key={id} value={id}>
+                {providerLabel(id)}
+              </option>
+            ))}
+          </select>
           <select value={model} onChange={(e) => chooseModel(e.target.value)}>
             {models.length === 0 && <option value="">(no models)</option>}
             {models.map((m) => (
@@ -813,6 +865,36 @@ export default function App() {
               Ollama Cloud share one OpenAI-compatible client; after saving, the model dropdown
               lists the provider's models.
             </div>
+
+            <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+              <h4>Collections</h4>
+              {collections.length === 0 && <div className="muted">No collections.</div>}
+              {collections.map((c) => (
+                <div key={c.id} className="coll-row">
+                  <div className="row" style={{ justifyContent: "space-between" }}>
+                    <b style={{ fontSize: 13 }}>{c.name}</b>
+                    <span className="row">
+                      <button onClick={() => addFolderToColl(c)}>Add folder…</button>
+                      <button onClick={() => deleteCollectionById(c)}>Delete</button>
+                    </span>
+                  </div>
+                  {c.source_paths.length > 0 ? (
+                    <ul className="path-list">
+                      {c.source_paths.map((p) => (
+                        <li key={p}>
+                          <button className="ghost folder-x" onClick={() => removeFolderFromColl(c, p)} title="Remove folder">
+                            ✕
+                          </button>
+                          {p}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <div className="muted">No folders.</div>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
@@ -826,14 +908,24 @@ export default function App() {
                 {currentColl.source_paths.length > 0 ? (
                   <ul className="path-list">
                     {currentColl.source_paths.map((p) => (
-                      <li key={p}>{p}</li>
+                      <li key={p}>
+                        <button
+                          className="ghost folder-x"
+                          onClick={() => removeFolderFromColl(currentColl, p)}
+                          disabled={indexing}
+                          title="Remove this folder"
+                        >
+                          ✕
+                        </button>
+                        {p}
+                      </li>
                     ))}
                   </ul>
                 ) : (
                   <div className="muted">No folders yet — add one to index.</div>
                 )}
                 <div className="row" style={{ marginTop: 6 }}>
-                  <button onClick={addFolderToCurrent} disabled={indexing}>
+                  <button onClick={() => addFolderToColl(currentColl)} disabled={indexing}>
                     Add folder…
                   </button>
                   <button
@@ -852,6 +944,10 @@ export default function App() {
                       {indexing ? "Indexing…" : "Fast index (GPU)"}
                     </button>
                   )}
+                  <span className="spacer" />
+                  <button onClick={() => deleteCollectionById(currentColl)} disabled={indexing} title="Delete this collection">
+                    Delete collection
+                  </button>
                 </div>
               </div>
             )}

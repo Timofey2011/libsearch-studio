@@ -157,6 +157,43 @@ async fn set_collection_paths(
     Ok(coll)
 }
 
+/// Delete a collection: its DB row + fingerprints, and its LanceDB directory.
+#[tauri::command]
+async fn delete_collection(
+    state: State<'_, AppState>,
+    collection_id: String,
+) -> Result<(), String> {
+    let db = state.db()?;
+    let db_path = db
+        .list_collections()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .map(|c| c.db_path);
+    db.delete_collection(&collection_id)
+        .map_err(|e| e.to_string())?;
+    if let Some(p) = db_path {
+        let _ = std::fs::remove_dir_all(&p); // best-effort; index may not exist yet
+    }
+    Ok(())
+}
+
+/// Switch the active synthesis provider without opening full settings. Persists
+/// and rebuilds the client; the chosen provider must already have its key set
+/// (or be local Ollama).
+#[tauri::command]
+async fn set_provider(state: State<'_, AppState>, provider: String) -> Result<(), String> {
+    let s = {
+        let mut g = state.settings.lock().unwrap();
+        g.llm_provider = provider;
+        g.clone()
+    };
+    s.save(state.data_dir.join("settings.toml"))
+        .map_err(|e| e.to_string())?;
+    *state.llm.lock().unwrap() = build_llm(&s);
+    Ok(())
+}
+
 /// Index (or re-index) a collection's source paths, streaming progress to the UI
 /// via `index-progress` events. Incremental: unchanged files are skipped.
 #[tauri::command]
@@ -954,6 +991,8 @@ pub fn run() {
             list_collections,
             create_collection,
             set_collection_paths,
+            delete_collection,
+            set_provider,
             index_collection,
             fast_index_collection,
             setup_gpu_indexing,
