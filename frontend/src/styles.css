@@ -278,18 +278,27 @@ a:hover {
 .path-list li {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   margin: 2px 0;
 }
+.path-list .path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .folder-x {
-  color: var(--muted);
-  font-size: 11px;
-  padding: 0 4px;
+  color: var(--danger);
+  font-size: 11.5px;
+  padding: 2px 8px;
   flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
 }
 .folder-x:hover:not(:disabled) {
-  color: var(--danger);
-  background: none;
+  color: #fff;
+  background: var(--danger);
 }
 .coll-row {
   padding: 8px 0;

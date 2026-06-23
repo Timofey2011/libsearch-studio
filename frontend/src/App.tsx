@@ -737,10 +737,24 @@ export default function App() {
             </span>
           )}
           <span className="spacer" />
-          <button onClick={() => setManaging((v) => !v)} title="Add folders and (re)index">
+          <button
+            className={managing ? "primary" : ""}
+            onClick={() => {
+              setShowSettings(false);
+              setManaging((v) => !v);
+            }}
+            title="Add folders and (re)index"
+          >
             {managing ? "Done" : "Manage…"}
           </button>
-          <button onClick={() => setShowSettings((v) => !v)} title="Settings">
+          <button
+            className={showSettings ? "primary" : ""}
+            onClick={() => {
+              setManaging(false);
+              setShowSettings((v) => !v);
+            }}
+            title="Settings"
+          >
             {showSettings ? "Done" : "Settings"}
           </button>
         </div>
@@ -882,10 +896,10 @@ export default function App() {
                     <ul className="path-list">
                       {c.source_paths.map((p) => (
                         <li key={p}>
-                          <button className="ghost folder-x" onClick={() => removeFolderFromColl(c, p)} title="Remove folder">
-                            ✕
+                          <span className="path">{p}</span>
+                          <button className="ghost folder-x" onClick={() => removeFolderFromColl(c, p)} title="Remove this folder">
+                            Remove
                           </button>
-                          {p}
                         </li>
                       ))}
                     </ul>
@@ -909,15 +923,15 @@ export default function App() {
                   <ul className="path-list">
                     {currentColl.source_paths.map((p) => (
                       <li key={p}>
+                        <span className="path">{p}</span>
                         <button
                           className="ghost folder-x"
                           onClick={() => removeFolderFromColl(currentColl, p)}
                           disabled={indexing}
                           title="Remove this folder"
                         >
-                          ✕
+                          Remove
                         </button>
-                        {p}
                       </li>
                     ))}
                   </ul>
