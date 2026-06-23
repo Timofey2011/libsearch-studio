@@ -17,6 +17,7 @@ use ls_llm::{
 };
 use ls_query::{search_multi, SearchResult};
 use tauri::{Emitter, Manager, State, WebviewWindow};
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex;
 
 /// Monotonic-ish unique id from the wall clock (nanos, hex).
@@ -210,6 +211,177 @@ async fn index_collection(
     })
     .await
     .map_err(|e| e.to_string())??;
+    Ok(stats)
+}
+
+/// Parse one stderr progress line from `index_to_parquet.py` and emit it as an
+/// index-progress event. Returns `Some(true)` if a book was indexed, `Some(false)`
+/// if skipped, `None` if the line wasn't progress.
+fn emit_py_progress(line: &str, total: usize, window: &WebviewWindow) -> Option<bool> {
+    let l = line.trim();
+    let close = l.strip_prefix('[')?.find(']')? + 1;
+    let i: usize = l[1..close].split('/').next()?.trim().parse().ok()?;
+    let rest = l[close + 1..].trim();
+    if rest.starts_with("skip") {
+        let path = rest.rsplit(' ').next().unwrap_or(rest).to_string();
+        let _ = window.emit(
+            "index-progress",
+            IndexEvent::Skipped {
+                n: i,
+                total,
+                path,
+                reason: "no extractable text".into(),
+            },
+        );
+        Some(false)
+    } else {
+        // "<title>: <n> chunks"
+        let (title, chunks) = match rest.rfind(": ") {
+            Some(c) => {
+                let n = rest[c + 2..]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                (rest[..c].to_string(), n)
+            }
+            None => (rest.to_string(), 0),
+        };
+        let _ = window.emit(
+            "index-progress",
+            IndexEvent::Indexed {
+                n: i,
+                total,
+                title,
+                chunks,
+            },
+        );
+        Some(true)
+    }
+}
+
+/// Fast index a collection by offloading bulk embedding to the configured
+/// Python/MPS helper, then importing the resulting Parquet into the collection's
+/// LanceDB. Streams the helper's per-book progress as `index-progress` events.
+#[tauri::command]
+async fn fast_index_collection(
+    state: State<'_, AppState>,
+    window: WebviewWindow,
+    collection_id: String,
+) -> Result<IndexStats, String> {
+    let settings = state.settings();
+    let py = settings.python_bin.trim().to_string();
+    let script = settings.indexer_script.trim().to_string();
+    if py.is_empty() || script.is_empty() {
+        return Err(
+            "Set the Python interpreter and indexer script in Settings → Fast index (GPU).".into(),
+        );
+    }
+
+    let coll = state
+        .db()?
+        .list_collections()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| format!("collection {collection_id} not found"))?;
+    let files = ls_app::discover_books(&coll.source_paths);
+    if files.is_empty() {
+        return Err("no PDF files found under the collection's source paths".into());
+    }
+    let total = files.len();
+
+    let tmp_dir = state.data_dir.join("tmp");
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+    let parquet = tmp_dir.join(format!("fastindex-{collection_id}.parquet"));
+
+    let _ = window.emit("index-progress", IndexEvent::Loading);
+
+    // Spawn the Python indexer and stream its stderr progress.
+    let mut cmd = tokio::process::Command::new(&py);
+    cmd.arg(&script).arg("--out").arg(&parquet);
+    for f in &files {
+        cmd.arg(f);
+    }
+    // Unbuffered so per-book progress lines stream live (Python block-buffers a pipe).
+    cmd.env("PYTHONUNBUFFERED", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start Python helper: {e}"))?;
+
+    let stderr = child.stderr.take().ok_or("no stderr from helper")?;
+    let mut reader = tokio::io::BufReader::new(stderr).lines();
+    let _ = window.emit("index-progress", IndexEvent::Started { total });
+
+    let mut indexed = 0usize;
+    let mut skipped = 0usize;
+    let mut tail = String::new();
+    while let Ok(Some(line)) = reader.next_line().await {
+        if let Some(was_indexed) = emit_py_progress(&line, total, &window) {
+            if was_indexed {
+                indexed += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        // Keep a bounded tail of output for error reporting.
+        tail.push_str(&line);
+        tail.push('\n');
+        if tail.len() > 4000 {
+            let cut = tail.len() - 4000;
+            tail.drain(..cut);
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&parquet);
+        return Err(format!(
+            "Python helper failed (exit {}):\n{}",
+            status.code().unwrap_or(-1),
+            tail.trim_end()
+        ));
+    }
+
+    // Import the embedded chunks into the collection's index.
+    let store = Store::open_or_create(&coll.db_path, "chunks")
+        .await
+        .map_err(|e| e.to_string())?;
+    let chunks = store
+        .import_parquet(&parquet)
+        .await
+        .map_err(|e| e.to_string())?;
+    if chunks > 0 {
+        store.ensure_fts_index().await.map_err(|e| e.to_string())?;
+    }
+    let _ = std::fs::remove_file(&parquet);
+
+    // Record fingerprints so a later CPU re-index skips these files.
+    let db = state.db()?;
+    for f in &files {
+        let p = Path::new(f);
+        let _ = db.set_book_fingerprint(
+            &coll.id,
+            &ls_app::stable_book_id(p),
+            &ls_app::file_fingerprint(p),
+        );
+    }
+
+    let stats = IndexStats {
+        books_indexed: indexed,
+        books_unchanged: 0,
+        books_skipped: skipped,
+        books_failed: 0,
+        chunks_written: chunks,
+    };
+    let _ = window.emit(
+        "index-progress",
+        IndexEvent::Finished {
+            stats: stats.clone(),
+        },
+    );
     Ok(stats)
 }
 
@@ -649,6 +821,7 @@ pub fn run() {
             create_collection,
             set_collection_paths,
             index_collection,
+            fast_index_collection,
             list_conversations,
             create_conversation,
             list_messages,

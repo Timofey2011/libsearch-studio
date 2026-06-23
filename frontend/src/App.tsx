@@ -39,6 +39,8 @@ type Settings = {
   ollama_model: string;
   llm_provider: string;
   providers: Record<string, ProviderCreds>;
+  python_bin: string;
+  indexer_script: string;
   hybrid_top_k: number;
   final_top_k: number;
 };
@@ -404,6 +406,20 @@ export default function App() {
     setProgress(null);
   }
 
+  async function runFastIndex() {
+    if (!currentColl || indexing) return;
+    setIndexing(true);
+    setIndexNote(null);
+    setProgress(null);
+    try {
+      await invoke<IndexStats>("fast_index_collection", { collectionId: currentColl.id });
+    } catch (e) {
+      setIndexNote("Error: " + String(e));
+    }
+    setIndexing(false);
+    setProgress(null);
+  }
+
   async function saveArtifact(idx: number) {
     const a = messages[idx];
     const q = messages[idx - 1]?.content ?? "";
@@ -733,6 +749,19 @@ export default function App() {
                 />
                 <button onClick={pickArtifactsDir}>Browse…</button>
               </div>
+
+              <label>Fast index · Python</label>
+              <input
+                placeholder="/path/to/ebook-kb/.venv/bin/python"
+                value={settings.python_bin}
+                onChange={(e) => editSetting("python_bin", e.target.value)}
+              />
+              <label>Fast index · script</label>
+              <input
+                placeholder="/path/to/scripts/index_to_parquet.py"
+                value={settings.indexer_script}
+                onChange={(e) => editSetting("indexer_script", e.target.value)}
+              />
             </div>
             <div className="row" style={{ marginTop: 10 }}>
               <button className="primary" onClick={saveSettings}>
@@ -778,6 +807,15 @@ export default function App() {
                   >
                     {indexing ? "Indexing…" : "Index / Re-index"}
                   </button>
+                  {settings?.python_bin && settings?.indexer_script && (
+                    <button
+                      onClick={runFastIndex}
+                      disabled={indexing || currentColl.source_paths.length === 0}
+                      title="Embed on the GPU via the Python/MPS helper, then import"
+                    >
+                      {indexing ? "Indexing…" : "Fast index (GPU)"}
+                    </button>
+                  )}
                 </div>
               </div>
             )}

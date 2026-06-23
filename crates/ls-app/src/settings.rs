@@ -28,6 +28,11 @@ pub struct Settings {
     /// Per-cloud-provider credentials, keyed by provider id. API keys are stored
     /// in plaintext in settings.toml under the app data dir.
     pub providers: BTreeMap<String, ProviderCreds>,
+    /// Optional "Fast index (GPU)" helper: a Python interpreter and the
+    /// `index_to_parquet.py` script that embeds on Apple MPS. When both are set,
+    /// the app can offload bulk embedding to the GPU instead of the CPU path.
+    pub python_bin: String,
+    pub indexer_script: String,
     /// Retrieval breadth: hybrid candidate pool and final reranked count.
     pub hybrid_top_k: usize,
     pub final_top_k: usize,
@@ -42,6 +47,8 @@ impl Default for Settings {
             ollama_model: "gemma4:12b-mlx".to_string(),
             llm_provider: "ollama".to_string(),
             providers: BTreeMap::new(),
+            python_bin: String::new(),
+            indexer_script: String::new(),
             // Candidates reranked per query. The cross-encoder runs on CPU, so this
             // is the main per-query latency knob; 24 keeps recall high while being
             // ~2x faster than 50. (int8-quantizing the reranker is the next lever.)

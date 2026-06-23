@@ -99,7 +99,7 @@ fn title_of(path: &Path) -> String {
 }
 
 /// `(path, size, mtime)` fingerprint — changes iff the file changes.
-fn file_fingerprint(path: &Path) -> String {
+pub fn file_fingerprint(path: &Path) -> String {
     match std::fs::metadata(path) {
         Ok(m) => {
             let mtime = m

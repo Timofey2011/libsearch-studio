@@ -79,6 +79,18 @@ In-app indexing embeds on the **CPU** (~1 chunk/s fp32), so it suits small or in
 collections. For a large library, use the hybrid Python/MPS → Parquet → `ls-cli import` path
 above against the collection's `db_path`.
 
+### Fast index (GPU) from the app
+
+The app can drive the Python/MPS indexer directly: set **Settings → Fast index** to a Python
+interpreter and the path to `scripts/index_to_parquet.py`. The **Fast index (GPU)** button in
+Manage then spawns the helper for the collection's folders, streams its per-book progress into
+the bar, imports the resulting Parquet into the collection's LanceDB, and records fingerprints
+(so a later CPU re-index skips those files).
+
+> **Put the venv on local disk.** If the interpreter's virtualenv lives on a cloud-sync mount
+> (Dropbox/iCloud), importing torch/transformers stalls on file-provider I/O — model load can
+> take minutes with ~0% CPU before embedding even starts. A local venv loads in seconds.
+
 ## Run (engine CLI, before the GUI)
 
 The dev CLI searches an existing LanceDB index (e.g. one built by `ebook-kb`). Because the

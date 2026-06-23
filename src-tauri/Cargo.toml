@@ -24,7 +24,7 @@ log = "0.4"
 tauri = { version = "2.11.3", features = ["protocol-asset"] }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util"] }
 ls-app = { path = "../crates/ls-app" }
 ls-embed = { path = "../crates/ls-embed" }
 ls-llm = { path = "../crates/ls-llm" }
