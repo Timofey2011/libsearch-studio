@@ -786,7 +786,7 @@ async fn ask(
         );
     }
     let store_refs: Vec<&Store> = stores.iter().collect();
-    let results = search_multi(
+    let mut results = search_multi(
         &store_refs,
         &mut engine.embedder,
         &mut engine.reranker,
@@ -796,6 +796,13 @@ async fn ask(
     )
     .await
     .map_err(|e| e.to_string())?;
+
+    // Drop weak matches so a query with no real answer doesn't list irrelevant
+    // sources; renumber so the [n] citation labels stay contiguous.
+    results.retain(|r| r.score >= settings.min_relevance);
+    for (i, r) in results.iter_mut().enumerate() {
+        r.rank = i + 1;
+    }
 
     if results.is_empty() {
         let msg = "I couldn't find any matching passages in the selected collection(s).";

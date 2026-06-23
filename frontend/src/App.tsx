@@ -43,6 +43,7 @@ type Settings = {
   indexer_script: string;
   hybrid_top_k: number;
   final_top_k: number;
+  min_relevance: number;
 };
 
 const ANTHROPIC_MODELS = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-fable-5"];
@@ -828,6 +829,16 @@ export default function App() {
                 min={1}
                 value={settings.final_top_k}
                 onChange={(e) => editSetting("final_top_k", parseInt(e.target.value, 10) || 0)}
+              />
+
+              <label>Min relevance (0–1)</label>
+              <input
+                type="number"
+                min={0}
+                max={1}
+                step={0.05}
+                value={settings.min_relevance}
+                onChange={(e) => editSetting("min_relevance", parseFloat(e.target.value) || 0)}
               />
 
               <label>Artifacts folder</label>

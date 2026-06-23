@@ -36,6 +36,10 @@ pub struct Settings {
     /// Retrieval breadth: hybrid candidate pool and final reranked count.
     pub hybrid_top_k: usize,
     pub final_top_k: usize,
+    /// Minimum cross-encoder relevance (sigmoid, 0–1) for a passage to be used as
+    /// a source. Passages below this are dropped; if none qualify the answer is
+    /// "no matching passages" with no sources. Raise to be stricter.
+    pub min_relevance: f32,
 }
 
 impl Default for Settings {
@@ -54,6 +58,7 @@ impl Default for Settings {
             // ~2x faster than 50. (int8-quantizing the reranker is the next lever.)
             hybrid_top_k: 24,
             final_top_k: 8,
+            min_relevance: 0.15,
         }
     }
 }
