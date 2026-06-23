@@ -79,6 +79,17 @@ In-app indexing embeds on the **CPU** (~1 chunk/s fp32), so it suits small or in
 collections. For a large library, use the hybrid Python/MPS → Parquet → `ls-cli import` path
 above against the collection's `db_path`.
 
+### One-click setup (self-contained)
+
+**Settings → Fast index → "Set up GPU indexing (auto)"** provisions everything locally with no
+manual steps: it creates a venv under the app-data dir, `pip install`s the embedding deps
+(torch, sentence-transformers, …), writes a self-contained `gpu_embed.py`, and exports the
+ONNX models into `<app-data>/models` (downloading the base models from Hugging Face once). It
+then points settings at the new venv/script/models. Progress streams live in the panel; the
+first run downloads several GB and takes ~10–20 min. **Restart the app afterward** so it loads
+the freshly exported models. Keeping the venv in the app-data dir (local disk) avoids the
+cloud-sync I/O stall described below.
+
 ### Fast index (GPU) from the app
 
 The app can drive the Python/MPS indexer directly: set **Settings → Fast index** to a Python

@@ -385,6 +385,131 @@ async fn fast_index_collection(
     Ok(stats)
 }
 
+// Helper scripts embedded in the binary so a packaged app can self-provision its
+// own Python helper without shipping the repo.
+const GPU_EMBED_PY: &str = include_str!("../../scripts/gpu_embed.py");
+const EXPORT_ONNX_PY: &str = include_str!("../../scripts/export_onnx.py");
+
+/// Run a setup subprocess, streaming its stdout+stderr to the UI as `setup-log`.
+async fn stream_to_log(
+    window: &WebviewWindow,
+    label: &str,
+    mut cmd: tokio::process::Command,
+) -> Result<(), String> {
+    let _ = window.emit("setup-log", format!("• {label}…"));
+    cmd.env("PYTHONUNBUFFERED", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("{label}: {e}"))?;
+    let out = child.stdout.take().ok_or("no stdout")?;
+    let err = child.stderr.take().ok_or("no stderr")?;
+    let w1 = window.clone();
+    let w2 = window.clone();
+    let h1 = tokio::spawn(async move {
+        let mut l = tokio::io::BufReader::new(out).lines();
+        while let Ok(Some(line)) = l.next_line().await {
+            let _ = w1.emit("setup-log", line);
+        }
+    });
+    let h2 = tokio::spawn(async move {
+        let mut l = tokio::io::BufReader::new(err).lines();
+        while let Ok(Some(line)) = l.next_line().await {
+            let _ = w2.emit("setup-log", line);
+        }
+    });
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    let _ = tokio::join!(h1, h2);
+    if !status.success() {
+        return Err(format!(
+            "{label} failed (exit {})",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
+}
+
+/// One-click self-setup: create a local venv, install the embedding deps, export
+/// the ONNX models locally, and point settings at all of it. Streams progress as
+/// `setup-log` events. The dmg stays small; everything is provisioned on demand.
+#[tauri::command]
+async fn setup_gpu_indexing(
+    state: State<'_, AppState>,
+    window: WebviewWindow,
+) -> Result<(), String> {
+    let data_dir = state.data_dir.clone();
+    let venv = data_dir.join("venv");
+    let venv_py = venv.join("bin").join("python");
+    let scripts_dir = data_dir.join("scripts");
+    let models_dir = data_dir.join("models");
+
+    std::fs::create_dir_all(&scripts_dir).map_err(|e| e.to_string())?;
+    std::fs::write(scripts_dir.join("gpu_embed.py"), GPU_EMBED_PY).map_err(|e| e.to_string())?;
+    std::fs::write(scripts_dir.join("export_onnx.py"), EXPORT_ONNX_PY)
+        .map_err(|e| e.to_string())?;
+    let _ = window.emit("setup-log", "Wrote helper scripts.".to_string());
+
+    // System python3 (present via Command Line Tools) is a fine venv base.
+    let base = if Path::new("/usr/bin/python3").exists() {
+        "/usr/bin/python3"
+    } else {
+        "python3"
+    };
+
+    let mut c = tokio::process::Command::new(base);
+    c.arg("-m").arg("venv").arg(&venv);
+    stream_to_log(&window, "Creating virtual environment", c).await?;
+
+    let mut c = tokio::process::Command::new(&venv_py);
+    c.arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("-U")
+        .arg("pip")
+        .arg("torch")
+        .arg("sentence-transformers")
+        .arg("transformers")
+        .arg("onnx")
+        .arg("pyarrow")
+        .arg("pymupdf");
+    stream_to_log(
+        &window,
+        "Installing packages (torch, sentence-transformers, …)",
+        c,
+    )
+    .await?;
+
+    let mut c = tokio::process::Command::new(&venv_py);
+    c.arg(scripts_dir.join("export_onnx.py"))
+        .arg("--reranker")
+        .arg("--out-dir")
+        .arg(&models_dir);
+    stream_to_log(
+        &window,
+        "Exporting ONNX models (downloads base models once)",
+        c,
+    )
+    .await?;
+
+    // Point settings at the freshly provisioned venv + scripts + models.
+    {
+        let mut s = state.settings();
+        s.python_bin = venv_py.to_string_lossy().into_owned();
+        s.indexer_script = scripts_dir
+            .join("gpu_embed.py")
+            .to_string_lossy()
+            .into_owned();
+        s.models_dir = models_dir.to_string_lossy().into_owned();
+        s.save(data_dir.join("settings.toml"))
+            .map_err(|e| e.to_string())?;
+        *state.settings.lock().unwrap() = s;
+    }
+    let _ = window.emit(
+        "setup-log",
+        "✓ Setup complete. Restart the app to load the new models.".to_string(),
+    );
+    Ok(())
+}
+
 #[tauri::command]
 async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     // Best-effort: some providers (e.g. Fireworks) don't expose `/models` on the
@@ -748,9 +873,18 @@ fn init_state() -> AppState {
 
     let data_dir = ls_app::data_dir();
     let _ = std::fs::create_dir_all(&data_dir);
+    // Prefer models provisioned by the in-app setup (app-data/models); fall back
+    // to LS_MODELS_DIR or the dev repo's models/.
     let models_dir = std::env::var("LS_MODELS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(format!("{}/../models", env!("CARGO_MANIFEST_DIR"))));
+        .unwrap_or_else(|_| {
+            let app_models = data_dir.join("models");
+            if app_models.join("bge-m3").join("model.onnx").exists() {
+                app_models
+            } else {
+                PathBuf::from(format!("{}/../models", env!("CARGO_MANIFEST_DIR")))
+            }
+        });
     let settings = ls_app::Settings::load(data_dir.join("settings.toml")).unwrap_or_default();
 
     // Seed a default collection pointing at the dev index if none exists yet.
@@ -822,6 +956,7 @@ pub fn run() {
             set_collection_paths,
             index_collection,
             fast_index_collection,
+            setup_gpu_indexing,
             list_conversations,
             create_conversation,
             list_messages,

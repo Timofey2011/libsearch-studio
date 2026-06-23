@@ -296,6 +296,20 @@ a:hover {
   width: 90px;
 }
 
+.setup-log {
+  margin: 8px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  color: var(--muted);
+}
+
 .progress-track {
   height: 6px;
   background: var(--panel-2);

@@ -74,14 +74,16 @@ def export(model_id: str, out_dir: pathlib.Path, wrapper, output_name: str) -> N
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--reranker", action="store_true", help="also export the reranker")
+    ap.add_argument("--out-dir", default=str(MODELS), help="where to write model folders")
     args = ap.parse_args()
+    models = pathlib.Path(args.out_dir)
 
     embed = AutoModel.from_pretrained("BAAI/bge-m3")
-    export("BAAI/bge-m3", MODELS / "bge-m3", LastHidden(embed), "last_hidden_state")
+    export("BAAI/bge-m3", models / "bge-m3", LastHidden(embed), "last_hidden_state")
 
     if args.reranker:
         rr = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-v2-m3")
-        export("BAAI/bge-reranker-v2-m3", MODELS / "bge-reranker-v2-m3", Logits(rr), "logits")
+        export("BAAI/bge-reranker-v2-m3", models / "bge-reranker-v2-m3", Logits(rr), "logits")
 
 
 if __name__ == "__main__":

@@ -108,6 +108,8 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [settingsNote, setSettingsNote] = useState<string | null>(null);
+  const [settingUp, setSettingUp] = useState(false);
+  const [setupLog, setSetupLog] = useState<string[]>([]);
   const [newName, setNewName] = useState("");
   const [newPaths, setNewPaths] = useState<string[]>([]);
   const [indexing, setIndexing] = useState(false);
@@ -211,6 +213,28 @@ export default function App() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
+
+  // Stream setup output from the one-click GPU provisioning.
+  useEffect(() => {
+    const un = listen<string>("setup-log", (e) => setSetupLog((l) => [...l.slice(-400), e.payload]));
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+
+  async function runSetup() {
+    if (settingUp) return;
+    setSettingUp(true);
+    setSetupLog(["Starting setup… (this downloads several GB and can take 10–20 min)"]);
+    try {
+      await invoke("setup_gpu_indexing");
+      const s = await invoke<Settings>("get_settings");
+      setSettings(s);
+    } catch (e) {
+      setSetupLog((l) => [...l, "Error: " + String(e)]);
+    }
+    setSettingUp(false);
+  }
 
   function toggleColl(id: string) {
     setCollIds((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
@@ -762,6 +786,18 @@ export default function App() {
                 value={settings.indexer_script}
                 onChange={(e) => editSetting("indexer_script", e.target.value)}
               />
+            </div>
+
+            <div style={{ marginTop: 10 }}>
+              <button onClick={runSetup} disabled={settingUp} title="Create a local venv, install deps, and download/export the models">
+                {settingUp ? "Setting up…" : "Set up GPU indexing (auto)"}
+              </button>
+              <span className="muted" style={{ marginLeft: 10 }}>
+                One-click: local venv + models. Downloads several GB; restart after it finishes.
+              </span>
+              {setupLog.length > 0 && (
+                <pre className="setup-log">{setupLog.join("\n")}</pre>
+              )}
             </div>
             <div className="row" style={{ marginTop: 10 }}>
               <button className="primary" onClick={saveSettings}>
