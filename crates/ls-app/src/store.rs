@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS messages (
     role            TEXT NOT NULL,
     content         TEXT NOT NULL,
     citations       TEXT NOT NULL, -- JSON array
-    ord             INTEGER NOT NULL
+    ord             INTEGER NOT NULL,
+    in_tokens       INTEGER NOT NULL DEFAULT 0,
+    out_tokens      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, ord);
 -- Incremental-ingest manifest: book fingerprint per collection.
@@ -57,6 +59,16 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        // Migrate older DBs created before token columns existed (ignore "duplicate
+        // column" errors when they already exist).
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN in_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN out_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Self { conn })
     }
 
@@ -183,15 +195,17 @@ impl Db {
             |r| r.get(0),
         )?;
         self.conn.execute(
-            "INSERT INTO messages (id, conversation_id, role, content, citations, ord)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages (id, conversation_id, role, content, citations, ord, in_tokens, out_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 m.id,
                 m.conversation_id,
                 m.role.as_str(),
                 m.content,
                 serde_json::to_string(&m.citations)?,
-                ord
+                ord,
+                m.in_tokens,
+                m.out_tokens
             ],
         )?;
         Ok(())
@@ -199,7 +213,7 @@ impl Db {
 
     pub fn list_messages(&self, conversation_id: &str) -> Result<Vec<Message>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, conversation_id, role, content, citations
+            "SELECT id, conversation_id, role, content, citations, in_tokens, out_tokens
              FROM messages WHERE conversation_id = ?1 ORDER BY ord",
         )?;
         let rows = stmt.query_map(params![conversation_id], |r| {
@@ -209,11 +223,13 @@ impl Db {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, u32>(5)?,
+                r.get::<_, u32>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, conversation_id, role, content, cites) = row?;
+            let (id, conversation_id, role, content, cites, in_tokens, out_tokens) = row?;
             let citations: Vec<Citation> = serde_json::from_str(&cites)?;
             out.push(Message {
                 id,
@@ -222,6 +238,8 @@ impl Db {
                     .ok_or_else(|| DbError::NotFound(format!("bad role {role}")))?,
                 content,
                 citations,
+                in_tokens,
+                out_tokens,
             });
         }
         Ok(out)
@@ -309,6 +327,8 @@ mod tests {
             role: Role::User,
             content: "hello?".into(),
             citations: vec![],
+            in_tokens: 0,
+            out_tokens: 0,
         })
         .unwrap();
         db.add_message(&Message {
@@ -323,6 +343,8 @@ mod tests {
                 page: Some(5),
                 text: "cited".into(),
             }],
+            in_tokens: 12,
+            out_tokens: 34,
         })
         .unwrap();
 
@@ -331,6 +353,7 @@ mod tests {
         assert_eq!(msgs[0].role, Role::User); // ordering preserved
         assert_eq!(msgs[1].citations.len(), 1);
         assert_eq!(msgs[1].citations[0].page, Some(5));
+        assert_eq!((msgs[1].in_tokens, msgs[1].out_tokens), (12, 34));
     }
 
     #[test]
@@ -348,6 +371,8 @@ mod tests {
             role: Role::User,
             content: "hi".into(),
             citations: vec![],
+            in_tokens: 0,
+            out_tokens: 0,
         })
         .unwrap();
         db.delete_conversation("c").unwrap();

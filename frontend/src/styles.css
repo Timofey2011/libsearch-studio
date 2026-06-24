@@ -550,6 +550,42 @@ a:hover {
   color: var(--muted);
 }
 
+/* Claude-Code-style control footer under the input */
+.composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+}
+.composer-bar .bar-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.composer-bar select,
+.composer-bar button {
+  font-size: 12px;
+  padding: 3px 8px;
+}
+.composer-bar select {
+  max-width: 200px;
+}
+.tokens {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  padding-right: 2px;
+}
+/* The collection picker opens upward from the footer. */
+.coll-menu.up {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+
 /* ---- reader ---- */
 .reader {
   flex: 1.2;

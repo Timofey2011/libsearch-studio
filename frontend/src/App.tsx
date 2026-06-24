@@ -25,7 +25,7 @@ type SearchResult = {
 type Src = { rank: number; citation: string; source_path: string; page: number | null; text?: string };
 type ChatMessage = { role: "user" | "assistant"; content: string; thinking: string; sources: Src[] };
 type Conversation = { id: string; title: string; collection_ids: string[] };
-type BackendMessage = { role: "user" | "assistant"; content: string; citations: Src[] };
+type BackendMessage = { role: "user" | "assistant"; content: string; citations: Src[]; in_tokens: number; out_tokens: number };
 
 type Reader = { path: string; page: number | null };
 
@@ -102,6 +102,7 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [savedByIdx, setSavedByIdx] = useState<Record<number, string>>({});
   const [thinkOpen, setThinkOpen] = useState<Record<number, boolean>>({});
+  const [tokens, setTokens] = useState({ in: 0, out: 0 });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
 
@@ -174,9 +175,13 @@ export default function App() {
       });
     const unTok = listen<string>("ask-token", append("content"));
     const unThink = listen<string>("ask-reasoning", append("thinking"));
+    const unUsage = listen<{ in_tokens: number; out_tokens: number }>("ask-usage", (e) =>
+      setTokens((t) => ({ in: t.in + e.payload.in_tokens, out: t.out + e.payload.out_tokens }))
+    );
     return () => {
       unTok.then((f) => f());
       unThink.then((f) => f());
+      unUsage.then((f) => f());
     };
   }, []);
 
@@ -293,6 +298,7 @@ export default function App() {
     setMessages([]);
     setSavedByIdx({});
     setReader(null);
+    setTokens({ in: 0, out: 0 });
   }
 
   // Insert a newline at the caret (Alt/Shift+Enter), keeping the caret after it.
@@ -354,6 +360,10 @@ export default function App() {
     const msgs = await invoke<BackendMessage[]>("list_messages", { conversationId: c.id });
     setMessages(msgs.map((m) => ({ role: m.role, content: m.content, thinking: "", sources: m.citations })));
     setThinkOpen({});
+    setTokens({
+      in: msgs.reduce((s, m) => s + (m.in_tokens || 0), 0),
+      out: msgs.reduce((s, m) => s + (m.out_tokens || 0), 0),
+    });
   }
 
   async function deleteConversation(id: string, e: React.MouseEvent) {
@@ -691,75 +701,6 @@ export default function App() {
 
       {/* Chat column */}
       <div className="main">
-        <div className="toolbar">
-          <div className="coll-picker">
-            <button onClick={() => setShowCollPicker((v) => !v)} title="Choose one or more collections to search">
-              {collLabel} ▾
-            </button>
-            {showCollPicker && (
-              <div className="coll-menu" onMouseLeave={() => setShowCollPicker(false)}>
-                {collections.length === 0 && <div className="muted" style={{ padding: 6 }}>No collections.</div>}
-                {collections.map((c) => (
-                  <label key={c.id} className="coll-opt">
-                    <input type="checkbox" checked={collIds.includes(c.id)} onChange={() => toggleColl(c.id)} />
-                    {c.name}
-                  </label>
-                ))}
-              </div>
-            )}
-          </div>
-          <select
-            value={settings?.llm_provider ?? "ollama"}
-            onChange={(e) => chooseProvider(e.target.value)}
-            title="Synthesis provider (configure keys in Settings)"
-          >
-            {readyProviders().map((id) => (
-              <option key={id} value={id}>
-                {providerLabel(id)}
-              </option>
-            ))}
-          </select>
-          <select value={model} onChange={(e) => chooseModel(e.target.value)}>
-            {models.length === 0 && <option value="">(no models)</option>}
-            {models.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </select>
-          {llmStatus && (
-            <span
-              className="llm-status"
-              title={llmStatus.message}
-              onClick={() => checkLlm(model)}
-            >
-              <span className={"dot " + (llmStatus.ok ? "ok" : "bad")} />
-              <span className="muted">{llmStatus.message}</span>
-            </span>
-          )}
-          <span className="spacer" />
-          <button
-            className={managing ? "primary" : ""}
-            onClick={() => {
-              setShowSettings(false);
-              setManaging((v) => !v);
-            }}
-            title="Add folders and (re)index"
-          >
-            {managing ? "Done" : "Manage…"}
-          </button>
-          <button
-            className={showSettings ? "primary" : ""}
-            onClick={() => {
-              setManaging(false);
-              setShowSettings((v) => !v);
-            }}
-            title="Settings"
-          >
-            {showSettings ? "Done" : "Settings"}
-          </button>
-        </div>
-
         {showSettings && settings && (
           <div className="panel">
             <h4>Settings</h4>
@@ -1112,7 +1053,78 @@ export default function App() {
               )}
             </button>
           </div>
-          <div className="composer-hint">Enter to send · ⌥Enter for newline · ↑/↓ for history</div>
+          <div className="composer-bar">
+            {/* Left: which library/collections to search */}
+            <div className="bar-left">
+              <div className="coll-picker">
+                <button onClick={() => setShowCollPicker((v) => !v)} title="Choose one or more collections to search">
+                  📚 {collLabel} ▴
+                </button>
+                {showCollPicker && (
+                  <div className="coll-menu up" onMouseLeave={() => setShowCollPicker(false)}>
+                    {collections.length === 0 && <div className="muted" style={{ padding: 6 }}>No collections.</div>}
+                    {collections.map((c) => (
+                      <label key={c.id} className="coll-opt">
+                        <input type="checkbox" checked={collIds.includes(c.id)} onChange={() => toggleColl(c.id)} />
+                        {c.name}
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Right: provider, model, status, tokens, panels */}
+            <div className="bar-right">
+              <span className="tokens" title="Tokens this conversation · input / output">
+                ↑ {tokens.in.toLocaleString()} · ↓ {tokens.out.toLocaleString()}
+              </span>
+              <select
+                value={settings?.llm_provider ?? "ollama"}
+                onChange={(e) => chooseProvider(e.target.value)}
+                title="Synthesis provider (configure keys in Settings)"
+              >
+                {readyProviders().map((id) => (
+                  <option key={id} value={id}>
+                    {providerLabel(id)}
+                  </option>
+                ))}
+              </select>
+              <select value={model} onChange={(e) => chooseModel(e.target.value)}>
+                {models.length === 0 && <option value="">(no models)</option>}
+                {models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+              {llmStatus && (
+                <span className="llm-status" title={llmStatus.message} onClick={() => checkLlm(model)}>
+                  <span className={"dot " + (llmStatus.ok ? "ok" : "bad")} />
+                </span>
+              )}
+              <button
+                className={managing ? "primary" : ""}
+                onClick={() => {
+                  setShowSettings(false);
+                  setManaging((v) => !v);
+                }}
+                title="Add folders and (re)index"
+              >
+                {managing ? "Done" : "Manage…"}
+              </button>
+              <button
+                className={showSettings ? "primary" : ""}
+                onClick={() => {
+                  setManaging(false);
+                  setShowSettings((v) => !v);
+                }}
+                title="Settings"
+              >
+                {showSettings ? "Done" : "Settings"}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 

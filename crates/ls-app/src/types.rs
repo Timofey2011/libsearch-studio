@@ -52,7 +52,8 @@ pub struct Citation {
     pub text: String,
 }
 
-/// A chat message. Assistant turns carry the citations used to ground them.
+/// A chat message. Assistant turns carry the citations used to ground them and
+/// the token usage of the generation (prompt vs. completion).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
@@ -60,6 +61,10 @@ pub struct Message {
     pub role: Role,
     pub content: String,
     pub citations: Vec<Citation>,
+    #[serde(default)]
+    pub in_tokens: u32,
+    #[serde(default)]
+    pub out_tokens: u32,
 }
 
 /// A conversation targeting one or more collections.

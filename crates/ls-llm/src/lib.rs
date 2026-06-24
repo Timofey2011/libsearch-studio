@@ -81,12 +81,21 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Token usage for one generation (prompt vs. completion).
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct Usage {
+    pub in_tokens: u32,
+    pub out_tokens: u32,
+}
+
 /// One parsed streaming line: any answer content and/or reasoning ("thinking")
-/// deltas, plus whether the stream is done.
+/// deltas, token-usage updates, plus whether the stream is done.
 #[derive(Debug, Default, PartialEq)]
 struct LineOut {
     content: Option<String>,
     reasoning: Option<String>,
+    in_tokens: Option<u32>,
+    out_tokens: Option<u32>,
     done: bool,
 }
 
@@ -161,6 +170,9 @@ fn parse_generate_line(line: &str) -> Result<LineOut, LlmError> {
     Ok(LineOut {
         content: str_field(&v, "response"),
         reasoning: str_field(&v, "thinking"),
+        // Final `done` line carries the token totals.
+        in_tokens: u32_field(&v, "prompt_eval_count"),
+        out_tokens: u32_field(&v, "eval_count"),
         done: v.get("done").and_then(|d| d.as_bool()).unwrap_or(false),
     })
 }
@@ -170,15 +182,28 @@ fn parse_anthropic_sse_line(line: &str) -> Result<LineOut, LlmError> {
     let Some(v) = sse_json(line)? else {
         return Ok(LineOut::default());
     };
-    if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
-        let delta = v.get("delta");
-        return Ok(LineOut {
-            content: delta.and_then(|d| str_field(d, "text")),
-            reasoning: delta.and_then(|d| str_field(d, "thinking")),
-            done: false,
-        });
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("content_block_delta") => {
+            let delta = v.get("delta");
+            Ok(LineOut {
+                content: delta.and_then(|d| str_field(d, "text")),
+                reasoning: delta.and_then(|d| str_field(d, "thinking")),
+                ..Default::default()
+            })
+        }
+        // `message_start` carries input tokens; `message_delta` the (cumulative) output.
+        Some("message_start") => Ok(LineOut {
+            in_tokens: v
+                .get("message")
+                .and_then(|m| u32_field(m.get("usage")?, "input_tokens")),
+            ..Default::default()
+        }),
+        Some("message_delta") => Ok(LineOut {
+            out_tokens: v.get("usage").and_then(|u| u32_field(u, "output_tokens")),
+            ..Default::default()
+        }),
+        _ => Ok(LineOut::default()),
     }
-    Ok(LineOut::default())
 }
 
 /// Parse one SSE `data:` line from an OpenAI-compatible `/chat/completions` stream.
@@ -198,10 +223,14 @@ fn parse_openai_sse_line(line: &str) -> Result<LineOut, LlmError> {
         .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("delta"));
+    // The final chunk (with stream_options.include_usage) carries `usage`.
+    let usage = v.get("usage");
     Ok(LineOut {
         content: delta.and_then(|d| str_field(d, "content")),
         reasoning: delta
             .and_then(|d| str_field(d, "reasoning_content").or(str_field(d, "reasoning"))),
+        in_tokens: usage.and_then(|u| u32_field(u, "prompt_tokens")),
+        out_tokens: usage.and_then(|u| u32_field(u, "completion_tokens")),
         done: false,
     })
 }
@@ -212,6 +241,11 @@ fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
         .and_then(|t| t.as_str())
         .filter(|t| !t.is_empty())
         .map(String::from)
+}
+
+/// Extract a `u32` field from a JSON object.
+fn u32_field(v: &serde_json::Value, key: &str) -> Option<u32> {
+    v.get(key).and_then(|n| n.as_u64()).map(|n| n as u32)
 }
 
 /// Parse an SSE `data:` line into JSON (None for non-data / blank / `[DONE]`).
@@ -257,14 +291,14 @@ fn emit_line(
 }
 
 /// Drive a streaming response: parse each line, split inline `<think>` out of
-/// content, and emit answer text via `on_token` and reasoning via `on_reasoning`.
-/// Returns the accumulated answer text (reasoning is not included).
+/// content, emit answer text via `on_token` and reasoning via `on_reasoning`,
+/// and accumulate token usage. Returns the answer text + final usage.
 async fn run_stream<P>(
     resp: reqwest::Response,
     mut parse_line: P,
     mut on_token: impl FnMut(&str),
     mut on_reasoning: impl FnMut(&str),
-) -> Result<String, LlmError>
+) -> Result<(String, Usage), LlmError>
 where
     P: FnMut(&str) -> Result<LineOut, LlmError>,
 {
@@ -272,12 +306,19 @@ where
     let mut buf = String::new();
     let mut full = String::new();
     let mut splitter = ThinkSplitter::default();
+    let mut usage = Usage::default();
 
     while let Some(chunk) = stream.next().await {
         buf.push_str(&String::from_utf8_lossy(&chunk?));
         while let Some(nl) = buf.find('\n') {
             let line: String = buf.drain(..=nl).collect();
             let lo = parse_line(&line)?;
+            if let Some(i) = lo.in_tokens {
+                usage.in_tokens = i;
+            }
+            if let Some(o) = lo.out_tokens {
+                usage.out_tokens = o;
+            }
             if emit_line(
                 lo,
                 &mut splitter,
@@ -290,11 +331,17 @@ where
                     on_token(&t);
                     full.push_str(&t);
                 }
-                return Ok(full);
+                return Ok((full, usage));
             }
         }
     }
     let lo = parse_line(&buf)?;
+    if let Some(i) = lo.in_tokens {
+        usage.in_tokens = i;
+    }
+    if let Some(o) = lo.out_tokens {
+        usage.out_tokens = o;
+    }
     emit_line(
         lo,
         &mut splitter,
@@ -307,7 +354,7 @@ where
         on_token(&t);
         full.push_str(&t);
     }
-    Ok(full)
+    Ok((full, usage))
 }
 
 /// Parse an OpenAI-compatible `/models` response (`{ "data": [{ "id": ... }] }`).
@@ -391,7 +438,7 @@ impl OllamaClient {
         prompt: &str,
         on_token: impl FnMut(&str),
         on_reasoning: impl FnMut(&str),
-    ) -> Result<String, LlmError> {
+    ) -> Result<(String, Usage), LlmError> {
         let resp = self
             .http
             .post(format!("{}/api/generate", self.base))
@@ -444,7 +491,7 @@ impl AnthropicClient {
         prompt: &str,
         on_token: impl FnMut(&str),
         on_reasoning: impl FnMut(&str),
-    ) -> Result<String, LlmError> {
+    ) -> Result<(String, Usage), LlmError> {
         if self.api_key.trim().is_empty() {
             return Err(LlmError::Decode(
                 "no Anthropic API key set (add one in Settings)".into(),
@@ -505,7 +552,7 @@ impl OpenAiCompatClient {
         prompt: &str,
         on_token: impl FnMut(&str),
         on_reasoning: impl FnMut(&str),
-    ) -> Result<String, LlmError> {
+    ) -> Result<(String, Usage), LlmError> {
         if self.api_key.trim().is_empty() {
             return Err(LlmError::Decode(
                 "no API key set (add one in Settings)".into(),
@@ -518,6 +565,7 @@ impl OpenAiCompatClient {
             .json(&serde_json::json!({
                 "model": model,
                 "stream": true,
+                "stream_options": { "include_usage": true },
                 "messages": [{ "role": "user", "content": prompt }],
             }))
             .send()
@@ -559,7 +607,7 @@ impl Llm {
         prompt: &str,
         on_token: impl FnMut(&str),
         on_reasoning: impl FnMut(&str),
-    ) -> Result<String, LlmError> {
+    ) -> Result<(String, Usage), LlmError> {
         match self {
             Llm::Ollama(c) => {
                 c.generate_stream(model, prompt, on_token, on_reasoning)

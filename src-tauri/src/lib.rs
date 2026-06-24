@@ -762,6 +762,8 @@ async fn ask(
         role: Role::User,
         content: question.clone(),
         citations: vec![],
+        in_tokens: 0,
+        out_tokens: 0,
     })
     .map_err(|e| e.to_string())?;
 
@@ -812,6 +814,8 @@ async fn ask(
             role: Role::Assistant,
             content: msg.into(),
             citations: vec![],
+            in_tokens: 0,
+            out_tokens: 0,
         })
         .map_err(|e| e.to_string())?;
         let _ = window.emit("ask-token", msg.to_string());
@@ -827,7 +831,7 @@ async fn ask(
     let prompt = build_prompt_with_history(&question, &results, &history);
     let w = window.clone();
     let wr = window.clone();
-    let answer = state
+    let (answer, usage) = state
         .llm()
         .generate_stream(
             &model,
@@ -842,16 +846,19 @@ async fn ask(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Persist the assistant turn with its grounding citations.
+    // Persist the assistant turn with its grounding citations + token usage.
     db.add_message(&Message {
         id: new_id(),
         conversation_id: conversation_id.clone(),
         role: Role::Assistant,
         content: answer,
         citations: results.iter().map(to_citation).collect(),
+        in_tokens: usage.in_tokens,
+        out_tokens: usage.out_tokens,
     })
     .map_err(|e| e.to_string())?;
 
+    let _ = window.emit("ask-usage", usage);
     let _ = window.emit("ask-done", ());
     Ok(results)
 }
