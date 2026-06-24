@@ -990,7 +990,7 @@ export default function App() {
               {toolsTab !== "collections" && (
                 <div className="tools-foot">
                   <button className="primary" onClick={saveSettings}>
-                    Save settings
+                    Save
                   </button>
                   {settingsNote && (
                     <span className={settingsNote.startsWith("Error") ? "note-err" : "note-ok"}>{settingsNote}</span>
