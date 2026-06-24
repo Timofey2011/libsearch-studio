@@ -878,9 +878,9 @@ export default function App() {
           <button onClick={runSetup} disabled={settingUp} title="Create a local venv, install deps, and download/export the models">
             {settingUp ? "Setting up…" : "Set up GPU indexing (auto)"}
           </button>
-          <span className="muted" style={{ marginLeft: 10 }}>
+          <div className="muted" style={{ marginTop: 6 }}>
             One-click: local venv + models. Downloads several GB; restart after it finishes.
-          </span>
+          </div>
           {setupLog.length > 0 && <pre className="setup-log">{setupLog.join("\n")}</pre>}
         </div>
       </div>
