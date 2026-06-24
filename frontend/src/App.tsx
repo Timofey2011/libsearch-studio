@@ -560,12 +560,12 @@ export default function App() {
       setSettingsNote("Error: " + String(e));
       return;
     }
-    setSettingsNote("Saved.");
+    setSettingsNote(null);
+    setToolsOpen(false);
     // Refresh the model list (best-effort) and re-check the provider. A failure
     // to list models is not a save failure.
     const opts = await refreshModels(settings);
     checkLlm(opts[0] ?? "");
-    setTimeout(() => setSettingsNote(null), 2500);
   }
 
   // Render a [n] / [n, m] citation marker as links into the reader.
