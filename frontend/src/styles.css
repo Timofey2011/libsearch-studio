@@ -149,6 +149,30 @@ a:hover {
   flex: 1;
   padding: 4px 8px;
 }
+/* Lower-left gear that opens the Tools modal */
+.sidebar-foot {
+  border-top: 1px solid var(--border);
+  padding: 8px;
+}
+.sidebar-foot .gear {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  justify-content: flex-start;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+}
+.sidebar-foot .gear:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+.sidebar-foot .gear svg {
+  flex-shrink: 0;
+}
 .conv {
   padding: 8px 10px;
   border-radius: var(--radius-sm);
@@ -312,6 +336,90 @@ a:hover {
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+/* ---- Tools modal (unified Manage + Settings) ---- */
+.tools-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(15, 18, 28, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.tools-modal {
+  width: min(760px, 92vw);
+  height: min(560px, 86vh);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.tools-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.tools-head b {
+  font-size: 14px;
+}
+.tools-cols {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+.tools-nav {
+  width: 160px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--panel);
+}
+.tools-nav button {
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.tools-nav button:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+.tools-nav button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.tools-body {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 18px;
+}
+.tools-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+.tools-note {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  line-height: 1.5;
 }
 
 .settings-grid {

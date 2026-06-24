@@ -27,6 +27,15 @@ type ChatMessage = { role: "user" | "assistant"; content: string; thinking: stri
 type Conversation = { id: string; title: string; collection_ids: string[] };
 type BackendMessage = { role: "user" | "assistant"; content: string; citations: Src[]; in_tokens: number; out_tokens: number };
 
+type ToolsTab = "collections" | "synthesis" | "retrieval" | "indexing" | "general";
+const TOOLS_TABS: [ToolsTab, string][] = [
+  ["collections", "Collections"],
+  ["synthesis", "Synthesis"],
+  ["retrieval", "Retrieval"],
+  ["indexing", "Indexing"],
+  ["general", "General"],
+];
+
 type Reader = { path: string; page: number | null };
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
@@ -106,8 +115,8 @@ export default function App() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
 
-  const [managing, setManaging] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [toolsTab, setToolsTab] = useState<ToolsTab>("collections");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [settingsNote, setSettingsNote] = useState<string | null>(null);
   const [settingUp, setSettingUp] = useState(false);
@@ -654,6 +663,249 @@ export default function App() {
   // WKWebView honors the #page fragment to jump to a page.
   const readerSrc = reader ? convertFileSrc(reader.path) + (reader.page ? `#page=${reader.page}` : "") : "";
 
+  // ---- Tools modal tabs (rendered as plain calls so inputs keep focus) ----
+
+  function renderCollectionsTab() {
+    return (
+      <div>
+        {currentColl && (
+          <div style={{ marginBottom: 12 }}>
+            <h4>
+              {currentColl.name} — {currentColl.source_paths.length} folder(s)
+            </h4>
+            {currentColl.source_paths.length > 0 ? (
+              <ul className="path-list">
+                {currentColl.source_paths.map((p) => (
+                  <li key={p}>
+                    <span className="path">{p}</span>
+                    <button
+                      className="ghost folder-x"
+                      onClick={() => removeFolderFromColl(currentColl, p)}
+                      disabled={indexing}
+                      title="Remove this folder"
+                    >
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="muted">No folders yet — add one to index.</div>
+            )}
+            <div className="row" style={{ marginTop: 6 }}>
+              <button onClick={() => addFolderToColl(currentColl)} disabled={indexing}>
+                Add folder…
+              </button>
+              <button className="primary" onClick={runIndex} disabled={indexing || currentColl.source_paths.length === 0}>
+                {indexing ? "Indexing…" : "Index / Re-index"}
+              </button>
+              {settings?.python_bin && settings?.indexer_script && (
+                <button
+                  onClick={runFastIndex}
+                  disabled={indexing || currentColl.source_paths.length === 0}
+                  title="Embed on the GPU via the Python/MPS helper, then import"
+                >
+                  {indexing ? "Indexing…" : "Fast index (GPU)"}
+                </button>
+              )}
+              <span className="spacer" />
+              <button onClick={() => deleteCollectionById(currentColl)} disabled={indexing} title="Delete this collection">
+                Delete collection
+              </button>
+            </div>
+          </div>
+        )}
+
+        {(progress || indexNote) && (
+          <div style={{ marginTop: 8 }}>
+            {progress && (
+              <>
+                <div className="progress-track">
+                  <div className="progress-bar" style={{ width: `${Math.min(100, progress.pct)}%` }} />
+                </div>
+                <div className="muted" style={{ marginTop: 4 }}>
+                  {progress.label}
+                </div>
+              </>
+            )}
+            {indexNote && (
+              <div className={indexNote.startsWith("Error") ? "note-err" : "note-ok"} style={{ marginTop: 4 }}>
+                {indexNote}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+          <h4>New collection</h4>
+          <div className="row">
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="Name (e.g. Distributed Systems)"
+              style={{ flex: "1 1 200px", minWidth: 0 }}
+            />
+            <button onClick={addFolderToNew}>Add folder…</button>
+            <button className="primary" onClick={createCollection} disabled={!newName.trim() || newPaths.length === 0}>
+              Create
+            </button>
+          </div>
+          {newPaths.length > 0 && (
+            <ul className="path-list" style={{ marginTop: 6 }}>
+              {newPaths.map((p) => (
+                <li key={p}>{p}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  function renderSynthesisTab() {
+    if (!settings) return null;
+    return (
+      <div className="settings-grid">
+        <label>Synthesis provider</label>
+        <select value={settings.llm_provider} onChange={(e) => editSetting("llm_provider", e.target.value)}>
+          <option value="ollama">Ollama (local)</option>
+          {CLOUD_PROVIDERS.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+
+        {settings.llm_provider === "ollama" ? (
+          <>
+            <label>Ollama host</label>
+            <input value={settings.ollama_host} onChange={(e) => editSetting("ollama_host", e.target.value)} />
+            <label>Default model</label>
+            <input value={settings.ollama_model} onChange={(e) => editSetting("ollama_model", e.target.value)} />
+          </>
+        ) : (
+          (() => {
+            const p = CLOUD_PROVIDERS.find((x) => x.id === settings.llm_provider)!;
+            const creds = settings.providers[p.id] ?? { api_key: "", model: "" };
+            return (
+              <>
+                <label>API key</label>
+                <input
+                  type="password"
+                  placeholder={`key from ${p.keyHint}`}
+                  value={creds.api_key}
+                  onChange={(e) => editCreds(p.id, "api_key", e.target.value)}
+                />
+                <label>Model</label>
+                {p.id === "anthropic" ? (
+                  <select value={creds.model || ANTHROPIC_MODELS[1]} onChange={(e) => editCreds(p.id, "model", e.target.value)}>
+                    {ANTHROPIC_MODELS.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input placeholder={p.modelHint} value={creds.model} onChange={(e) => editCreds(p.id, "model", e.target.value)} />
+                )}
+              </>
+            );
+          })()
+        )}
+        <div className="tools-note muted">
+          Cloud API keys are stored locally in plaintext (settings.toml) and used only to call that provider. OpenAI,
+          Gemini, Fireworks, and Ollama Cloud share one OpenAI-compatible client; after saving, the model dropdown lists
+          the provider's models.
+        </div>
+      </div>
+    );
+  }
+
+  function renderRetrievalTab() {
+    if (!settings) return null;
+    return (
+      <div className="settings-grid">
+        <label>Candidate pool (hybrid_top_k)</label>
+        <input
+          type="number"
+          min={1}
+          value={settings.hybrid_top_k}
+          onChange={(e) => editSetting("hybrid_top_k", parseInt(e.target.value, 10) || 0)}
+        />
+        <label>Final results (final_top_k)</label>
+        <input
+          type="number"
+          min={1}
+          value={settings.final_top_k}
+          onChange={(e) => editSetting("final_top_k", parseInt(e.target.value, 10) || 0)}
+        />
+        <label>Min relevance (0–1)</label>
+        <input
+          type="number"
+          min={0}
+          max={1}
+          step={0.05}
+          value={settings.min_relevance}
+          onChange={(e) => editSetting("min_relevance", parseFloat(e.target.value) || 0)}
+        />
+        <div className="tools-note muted">
+          Min relevance drops weak passages from the sources; a query with no passage above it answers "no matching
+          passages" with no sources. Raise to be stricter.
+        </div>
+      </div>
+    );
+  }
+
+  function renderIndexingTab() {
+    if (!settings) return null;
+    return (
+      <div>
+        <div className="settings-grid">
+          <label>Fast index · Python</label>
+          <input
+            placeholder="/path/to/ebook-kb/.venv/bin/python"
+            value={settings.python_bin}
+            onChange={(e) => editSetting("python_bin", e.target.value)}
+          />
+          <label>Fast index · script</label>
+          <input
+            placeholder="/path/to/scripts/index_to_parquet.py"
+            value={settings.indexer_script}
+            onChange={(e) => editSetting("indexer_script", e.target.value)}
+          />
+        </div>
+        <div style={{ marginTop: 10 }}>
+          <button onClick={runSetup} disabled={settingUp} title="Create a local venv, install deps, and download/export the models">
+            {settingUp ? "Setting up…" : "Set up GPU indexing (auto)"}
+          </button>
+          <span className="muted" style={{ marginLeft: 10 }}>
+            One-click: local venv + models. Downloads several GB; restart after it finishes.
+          </span>
+          {setupLog.length > 0 && <pre className="setup-log">{setupLog.join("\n")}</pre>}
+        </div>
+      </div>
+    );
+  }
+
+  function renderGeneralTab() {
+    if (!settings) return null;
+    return (
+      <div className="settings-grid">
+        <label>Artifacts folder</label>
+        <div className="row">
+          <input
+            value={settings.artifacts_dir}
+            onChange={(e) => editSetting("artifacts_dir", e.target.value)}
+            style={{ flex: 1, minWidth: 0 }}
+          />
+          <button onClick={pickArtifactsDir}>Browse…</button>
+        </div>
+        <label>Models folder</label>
+        <input value={settings.models_dir} onChange={(e) => editSetting("models_dir", e.target.value)} />
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       {/* Conversation sidebar */}
@@ -697,272 +949,60 @@ export default function App() {
             )
           )}
         </div>
+        <div className="sidebar-foot">
+          <button className="gear" onClick={() => setToolsOpen(true)} title="Tools — collections, providers, settings">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+            Tools
+          </button>
+        </div>
       </div>
 
       {/* Chat column */}
       <div className="main">
-        {showSettings && settings && (
-          <div className="panel">
-            <h4>Settings</h4>
-            <div className="settings-grid">
-              <label>Synthesis provider</label>
-              <select value={settings.llm_provider} onChange={(e) => editSetting("llm_provider", e.target.value)}>
-                <option value="ollama">Ollama (local)</option>
-                {CLOUD_PROVIDERS.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label}
-                  </option>
-                ))}
-              </select>
-
-              {settings.llm_provider === "ollama" ? (
-                <>
-                  <label>Ollama host</label>
-                  <input value={settings.ollama_host} onChange={(e) => editSetting("ollama_host", e.target.value)} />
-                  <label>Default model</label>
-                  <input value={settings.ollama_model} onChange={(e) => editSetting("ollama_model", e.target.value)} />
-                </>
-              ) : (
-                (() => {
-                  const p = CLOUD_PROVIDERS.find((x) => x.id === settings.llm_provider)!;
-                  const creds = settings.providers[p.id] ?? { api_key: "", model: "" };
-                  return (
-                    <>
-                      <label>API key</label>
-                      <input
-                        type="password"
-                        placeholder={`key from ${p.keyHint}`}
-                        value={creds.api_key}
-                        onChange={(e) => editCreds(p.id, "api_key", e.target.value)}
-                      />
-                      <label>Model</label>
-                      {p.id === "anthropic" ? (
-                        <select value={creds.model || ANTHROPIC_MODELS[1]} onChange={(e) => editCreds(p.id, "model", e.target.value)}>
-                          {ANTHROPIC_MODELS.map((m) => (
-                            <option key={m} value={m}>
-                              {m}
-                            </option>
-                          ))}
-                        </select>
-                      ) : (
-                        <input
-                          placeholder={p.modelHint}
-                          value={creds.model}
-                          onChange={(e) => editCreds(p.id, "model", e.target.value)}
-                        />
-                      )}
-                    </>
-                  );
-                })()
-              )}
-
-              <label>Candidate pool (hybrid_top_k)</label>
-              <input
-                type="number"
-                min={1}
-                value={settings.hybrid_top_k}
-                onChange={(e) => editSetting("hybrid_top_k", parseInt(e.target.value, 10) || 0)}
-              />
-
-              <label>Final results (final_top_k)</label>
-              <input
-                type="number"
-                min={1}
-                value={settings.final_top_k}
-                onChange={(e) => editSetting("final_top_k", parseInt(e.target.value, 10) || 0)}
-              />
-
-              <label>Min relevance (0–1)</label>
-              <input
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
-                value={settings.min_relevance}
-                onChange={(e) => editSetting("min_relevance", parseFloat(e.target.value) || 0)}
-              />
-
-              <label>Artifacts folder</label>
-              <div className="row">
-                <input
-                  value={settings.artifacts_dir}
-                  onChange={(e) => editSetting("artifacts_dir", e.target.value)}
-                  style={{ flex: 1, minWidth: 0 }}
-                />
-                <button onClick={pickArtifactsDir}>Browse…</button>
-              </div>
-
-              <label>Fast index · Python</label>
-              <input
-                placeholder="/path/to/ebook-kb/.venv/bin/python"
-                value={settings.python_bin}
-                onChange={(e) => editSetting("python_bin", e.target.value)}
-              />
-              <label>Fast index · script</label>
-              <input
-                placeholder="/path/to/scripts/index_to_parquet.py"
-                value={settings.indexer_script}
-                onChange={(e) => editSetting("indexer_script", e.target.value)}
-              />
-            </div>
-
-            <div style={{ marginTop: 10 }}>
-              <button onClick={runSetup} disabled={settingUp} title="Create a local venv, install deps, and download/export the models">
-                {settingUp ? "Setting up…" : "Set up GPU indexing (auto)"}
-              </button>
-              <span className="muted" style={{ marginLeft: 10 }}>
-                One-click: local venv + models. Downloads several GB; restart after it finishes.
-              </span>
-              {setupLog.length > 0 && (
-                <pre className="setup-log">{setupLog.join("\n")}</pre>
-              )}
-            </div>
-            <div className="row" style={{ marginTop: 10 }}>
-              <button className="primary" onClick={saveSettings}>
-                Save settings
-              </button>
-              {settingsNote && (
-                <span className={settingsNote.startsWith("Error") ? "note-err" : "note-ok"}>{settingsNote}</span>
-              )}
-            </div>
-            <div className="muted" style={{ marginTop: 6 }}>
-              Changes apply to the next question. Cloud API keys are stored locally in plaintext
-              (settings.toml) and used only to call that provider. OpenAI, Gemini, Fireworks, and
-              Ollama Cloud share one OpenAI-compatible client; after saving, the model dropdown
-              lists the provider's models.
-            </div>
-
-            <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
-              <h4>Collections</h4>
-              {collections.length === 0 && <div className="muted">No collections.</div>}
-              {collections.map((c) => (
-                <div key={c.id} className="coll-row">
-                  <div className="row" style={{ justifyContent: "space-between" }}>
-                    <b style={{ fontSize: 13 }}>{c.name}</b>
-                    <span className="row">
-                      <button onClick={() => addFolderToColl(c)}>Add folder…</button>
-                      <button onClick={() => deleteCollectionById(c)}>Delete</button>
-                    </span>
-                  </div>
-                  {c.source_paths.length > 0 ? (
-                    <ul className="path-list">
-                      {c.source_paths.map((p) => (
-                        <li key={p}>
-                          <span className="path">{p}</span>
-                          <button className="ghost folder-x" onClick={() => removeFolderFromColl(c, p)} title="Remove this folder">
-                            Remove
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <div className="muted">No folders.</div>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {managing && (
-          <div className="panel">
-            {currentColl && (
-              <div style={{ marginBottom: 12 }}>
-                <h4>
-                  {currentColl.name} — {currentColl.source_paths.length} folder(s)
-                </h4>
-                {currentColl.source_paths.length > 0 ? (
-                  <ul className="path-list">
-                    {currentColl.source_paths.map((p) => (
-                      <li key={p}>
-                        <span className="path">{p}</span>
-                        <button
-                          className="ghost folder-x"
-                          onClick={() => removeFolderFromColl(currentColl, p)}
-                          disabled={indexing}
-                          title="Remove this folder"
-                        >
-                          Remove
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <div className="muted">No folders yet — add one to index.</div>
-                )}
-                <div className="row" style={{ marginTop: 6 }}>
-                  <button onClick={() => addFolderToColl(currentColl)} disabled={indexing}>
-                    Add folder…
-                  </button>
-                  <button
-                    className="primary"
-                    onClick={runIndex}
-                    disabled={indexing || currentColl.source_paths.length === 0}
-                  >
-                    {indexing ? "Indexing…" : "Index / Re-index"}
-                  </button>
-                  {settings?.python_bin && settings?.indexer_script && (
-                    <button
-                      onClick={runFastIndex}
-                      disabled={indexing || currentColl.source_paths.length === 0}
-                      title="Embed on the GPU via the Python/MPS helper, then import"
-                    >
-                      {indexing ? "Indexing…" : "Fast index (GPU)"}
-                    </button>
-                  )}
-                  <span className="spacer" />
-                  <button onClick={() => deleteCollectionById(currentColl)} disabled={indexing} title="Delete this collection">
-                    Delete collection
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {(progress || indexNote) && (
-              <div style={{ marginTop: 8 }}>
-                {progress && (
-                  <>
-                    <div className="progress-track">
-                      <div className="progress-bar" style={{ width: `${Math.min(100, progress.pct)}%` }} />
-                    </div>
-                    <div className="muted" style={{ marginTop: 4 }}>
-                      {progress.label}
-                    </div>
-                  </>
-                )}
-                {indexNote && (
-                  <div className={indexNote.startsWith("Error") ? "note-err" : "note-ok"} style={{ marginTop: 4 }}>
-                    {indexNote}
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div style={{ marginTop: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
-              <h4>New collection</h4>
-              <div className="row">
-                <input
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  placeholder="Name (e.g. Distributed Systems)"
-                  style={{ flex: "1 1 200px", minWidth: 0 }}
-                />
-                <button onClick={addFolderToNew}>Add folder…</button>
-                <button className="primary" onClick={createCollection} disabled={!newName.trim() || newPaths.length === 0}>
-                  Create
+        {toolsOpen && settings && (
+          <div className="tools-overlay" onClick={() => setToolsOpen(false)}>
+            <div className="tools-modal" onClick={(e) => e.stopPropagation()}>
+              <div className="tools-head">
+                <b>Tools</b>
+                <button className="ghost" onClick={() => setToolsOpen(false)} title="Close">
+                  ✕
                 </button>
               </div>
-              {newPaths.length > 0 && (
-                <ul className="path-list" style={{ marginTop: 6 }}>
-                  {newPaths.map((p) => (
-                    <li key={p}>{p}</li>
+              <div className="tools-cols">
+                <nav className="tools-nav">
+                  {TOOLS_TABS.map(([id, label]) => (
+                    <button key={id} className={toolsTab === id ? "active" : ""} onClick={() => setToolsTab(id)}>
+                      {label}
+                    </button>
                   ))}
-                </ul>
+                </nav>
+                <div className="tools-body">
+                  {toolsTab === "collections" && renderCollectionsTab()}
+                  {toolsTab === "synthesis" && renderSynthesisTab()}
+                  {toolsTab === "retrieval" && renderRetrievalTab()}
+                  {toolsTab === "indexing" && renderIndexingTab()}
+                  {toolsTab === "general" && renderGeneralTab()}
+                </div>
+              </div>
+              {toolsTab !== "collections" && (
+                <div className="tools-foot">
+                  <button className="primary" onClick={saveSettings}>
+                    Save settings
+                  </button>
+                  {settingsNote && (
+                    <span className={settingsNote.startsWith("Error") ? "note-err" : "note-ok"}>{settingsNote}</span>
+                  )}
+                  <span className="muted" style={{ marginLeft: "auto", fontSize: 11 }}>
+                    Changes apply to the next question.
+                  </span>
+                </div>
               )}
             </div>
           </div>
         )}
-
         {/* Transcript */}
         <div ref={scrollRef} className="transcript">
           {messages.length === 0 && (
@@ -1103,26 +1143,6 @@ export default function App() {
                   <span className={"dot " + (llmStatus.ok ? "ok" : "bad")} />
                 </span>
               )}
-              <button
-                className={managing ? "primary" : ""}
-                onClick={() => {
-                  setShowSettings(false);
-                  setManaging((v) => !v);
-                }}
-                title="Add folders and (re)index"
-              >
-                {managing ? "Done" : "Manage…"}
-              </button>
-              <button
-                className={showSettings ? "primary" : ""}
-                onClick={() => {
-                  setManaging(false);
-                  setShowSettings((v) => !v);
-                }}
-                title="Settings"
-              >
-                {showSettings ? "Done" : "Settings"}
-              </button>
             </div>
           </div>
         </div>
