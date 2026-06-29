@@ -638,6 +638,13 @@ async fn get_settings(state: State<'_, AppState>) -> Result<ls_app::Settings, St
     Ok(state.settings())
 }
 
+/// Whether a cited source file still exists on disk. Used by the reader to warn
+/// when a book has been moved/renamed since it was indexed.
+#[tauri::command]
+async fn source_exists(path: String) -> Result<bool, String> {
+    Ok(std::path::Path::new(&path).is_file())
+}
+
 /// Persist settings, update them in memory, and rebuild the Ollama client if the
 /// host changed.
 #[tauri::command]
@@ -1020,6 +1027,7 @@ pub fn run() {
             check_llm,
             get_settings,
             save_settings,
+            source_exists,
             ask,
             save_artifact
         ])

@@ -36,7 +36,7 @@ const TOOLS_TABS: [ToolsTab, string][] = [
   ["general", "General"],
 ];
 
-type Reader = { path: string; page: number | null };
+type Reader = { path: string; page: number | null; missing: boolean };
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
 // doesn't surface (e.g. models_dir) are preserved on save.
@@ -401,8 +401,16 @@ export default function App() {
     }
   }
 
-  function openSource(s: Src) {
-    setReader({ path: s.source_path, page: s.page });
+  async function openSource(s: Src) {
+    setReader({ path: s.source_path, page: s.page, missing: false });
+    // The book may have been moved/renamed since indexing — warn instead of
+    // showing a silently-blank reader.
+    try {
+      const ok = await invoke<boolean>("source_exists", { path: s.source_path });
+      setReader((r) => (r && r.path === s.source_path ? { ...r, missing: !ok } : r));
+    } catch {
+      /* leave as-is; the iframe will render whatever it can */
+    }
   }
 
   async function pickFolder(): Promise<string | null> {
@@ -1160,7 +1168,31 @@ export default function App() {
               ✕
             </button>
           </div>
-          <iframe key={readerSrc} title="source" src={readerSrc} />
+          {reader.missing ? (
+            <div className="reader-missing">
+              <h3>Source not found</h3>
+              <p>
+                This book isn't where it was when it was indexed — it was likely moved or renamed:
+              </p>
+              <code className="missing-path">{reader.path}</code>
+              <p>
+                Point the collection at the book's new location: open <b>Settings → Collections</b>,
+                add the new folder (and remove the old one), then re-index so citations resolve again.
+              </p>
+              <button
+                className="primary"
+                onClick={() => {
+                  setReader(null);
+                  setToolsTab("collections");
+                  setToolsOpen(true);
+                }}
+              >
+                Open Settings → Collections
+              </button>
+            </div>
+          ) : (
+            <iframe key={readerSrc} title="source" src={readerSrc} />
+          )}
         </div>
       )}
     </div>
