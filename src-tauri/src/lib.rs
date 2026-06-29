@@ -326,18 +326,83 @@ async fn fast_index_collection(
     if files.is_empty() {
         return Err("no PDF files found under the collection's source paths".into());
     }
-    let total = files.len();
+
+    let _ = window.emit("index-progress", IndexEvent::Loading);
+
+    // Embed only genuinely new/changed files: skip unchanged ones, re-point moved
+    // ones, and skip any already present in the index (mirrors the CPU path). The
+    // DB handle (rusqlite, !Send) is confined to blocks that don't cross `.await`.
+    let store = Store::open_or_create(&coll.db_path, "chunks")
+        .await
+        .map_err(|e| e.to_string())?;
+    let indexed = store.indexed_book_ids().await.unwrap_or_default();
+    let mut to_embed: Vec<String> = Vec::new();
+    let mut preskipped = 0usize;
+    let mut remaps: Vec<(String, String, String)> = Vec::new();
+    {
+        let db = state.db()?;
+        for f in &files {
+            let p = Path::new(f);
+            let book_id = ls_app::stable_book_id(p);
+            let fp = ls_app::file_fingerprint(p);
+            if db
+                .book_fingerprint(&coll.id, &book_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(fp.as_str())
+            {
+                preskipped += 1;
+                continue;
+            }
+            if let Some(old) = db.book_id_for_fingerprint(&coll.id, &fp).ok().flatten() {
+                if old != book_id {
+                    let _ = db.delete_book_state(&coll.id, &old);
+                    let _ = db.set_book_fingerprint(&coll.id, &book_id, &fp);
+                    remaps.push((old, book_id, f.clone()));
+                    preskipped += 1;
+                    continue;
+                }
+            }
+            if indexed.contains(&book_id) {
+                let _ = db.set_book_fingerprint(&coll.id, &book_id, &fp);
+                preskipped += 1;
+                continue;
+            }
+            to_embed.push(f.clone());
+        }
+    }
+    // Apply any path re-points now that the DB handle is dropped.
+    for (old, new, path) in &remaps {
+        store.remap_book(old, new, path).await.ok();
+    }
+
+    if to_embed.is_empty() {
+        let stats = IndexStats {
+            books_indexed: 0,
+            books_unchanged: preskipped,
+            books_skipped: 0,
+            books_failed: 0,
+            chunks_written: 0,
+        };
+        let _ = window.emit(
+            "index-progress",
+            IndexEvent::Finished {
+                stats: stats.clone(),
+            },
+        );
+        return Ok(stats);
+    }
+    let total = to_embed.len();
 
     let tmp_dir = state.data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
     let parquet = tmp_dir.join(format!("fastindex-{collection_id}.parquet"));
 
-    let _ = window.emit("index-progress", IndexEvent::Loading);
-
     // Spawn the Python indexer and stream its stderr progress.
     let mut cmd = tokio::process::Command::new(&py);
     cmd.arg(&script).arg("--out").arg(&parquet);
-    for f in &files {
+    for f in &to_embed {
         cmd.arg(f);
     }
     // Unbuffered so per-book progress lines stream live (Python block-buffers a pipe).
@@ -382,10 +447,7 @@ async fn fast_index_collection(
         ));
     }
 
-    // Import the embedded chunks into the collection's index.
-    let store = Store::open_or_create(&coll.db_path, "chunks")
-        .await
-        .map_err(|e| e.to_string())?;
+    // Import the embedded chunks into the collection's index (reusing the store).
     let chunks = store
         .import_parquet(&parquet)
         .await
@@ -395,20 +457,22 @@ async fn fast_index_collection(
     }
     let _ = std::fs::remove_file(&parquet);
 
-    // Record fingerprints so a later CPU re-index skips these files.
-    let db = state.db()?;
-    for f in &files {
-        let p = Path::new(f);
-        let _ = db.set_book_fingerprint(
-            &coll.id,
-            &ls_app::stable_book_id(p),
-            &ls_app::file_fingerprint(p),
-        );
+    // Record fingerprints so a later re-index skips these files.
+    {
+        let db = state.db()?;
+        for f in &to_embed {
+            let p = Path::new(f);
+            let _ = db.set_book_fingerprint(
+                &coll.id,
+                &ls_app::stable_book_id(p),
+                &ls_app::file_fingerprint(p),
+            );
+        }
     }
 
     let stats = IndexStats {
         books_indexed: indexed,
-        books_unchanged: 0,
+        books_unchanged: preskipped,
         books_skipped: skipped,
         books_failed: 0,
         chunks_written: chunks,

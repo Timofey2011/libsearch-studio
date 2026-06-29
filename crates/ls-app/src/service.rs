@@ -155,6 +155,11 @@ impl Service {
         let total = paths.len();
         on_event(IndexEvent::Started { total });
 
+        // Books already embedded in the index, so a re-index can skip them even
+        // when the fingerprint manifest is empty (index built before the manifest
+        // existed, or via Parquet import). One scan up front, then O(1) lookups.
+        let indexed = store.indexed_book_ids().await.unwrap_or_default();
+
         let mut wrote = false;
         for (i, path) in paths.iter().enumerate() {
             let n = i + 1;
@@ -171,6 +176,40 @@ impl Service {
                 .as_deref()
                 == Some(fp.as_str())
             {
+                stats.books_unchanged += 1;
+                on_event(IndexEvent::Unchanged {
+                    n,
+                    total,
+                    title: title_of(p),
+                });
+                continue;
+            }
+
+            // Same content under a new path (the folder was moved/renamed): the
+            // fingerprint is path-independent, so an already-indexed book matches.
+            // Re-point its chunks to the new id + path instead of re-embedding.
+            if let Some(old_id) = self.db.book_id_for_fingerprint(&collection.id, &fp)? {
+                if old_id != book_id {
+                    store.remap_book(&old_id, &book_id, path).await.ok();
+                    self.db.delete_book_state(&collection.id, &old_id)?;
+                    self.db
+                        .set_book_fingerprint(&collection.id, &book_id, &fp)?;
+                    stats.books_unchanged += 1;
+                    on_event(IndexEvent::Unchanged {
+                        n,
+                        total,
+                        title: title_of(p),
+                    });
+                    continue;
+                }
+            }
+
+            // Already embedded in a prior run but not yet in the manifest: record
+            // the fingerprint and skip re-embedding. (An edit made between that
+            // run and now is picked up on the next re-index via the fp check.)
+            if indexed.contains(&book_id) {
+                self.db
+                    .set_book_fingerprint(&collection.id, &book_id, &fp)?;
                 stats.books_unchanged += 1;
                 on_event(IndexEvent::Unchanged {
                     n,

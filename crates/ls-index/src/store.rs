@@ -15,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::index::Index;
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::{Connection, Table};
 use ls_core::{Chunk, Format};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -215,8 +215,53 @@ impl Store {
         Ok(())
     }
 
+    /// Re-point a book's chunks to a new id + source path without re-embedding.
+    /// Used when a file moved on disk but its content is unchanged: the vectors
+    /// and text stay; only the identity/location columns are rewritten.
+    pub async fn remap_book(
+        &self,
+        old_book_id: &str,
+        new_book_id: &str,
+        new_source_path: &str,
+    ) -> Result<(), StoreError> {
+        let old = old_book_id.replace('\'', "''");
+        let nb = new_book_id.replace('\'', "''");
+        let np = new_source_path.replace('\'', "''");
+        self.table
+            .update()
+            .only_if(format!("book_id = '{old}'"))
+            .column("book_id", format!("'{nb}'"))
+            .column("source_path", format!("'{np}'"))
+            .execute()
+            .await?;
+        Ok(())
+    }
+
     pub async fn count(&self) -> Result<usize, StoreError> {
         Ok(self.table.count_rows(None).await?)
+    }
+
+    /// All distinct book ids currently present in the index. Lets re-index skip
+    /// books already embedded by a prior run even when the fingerprint manifest
+    /// is empty (e.g. an index built before the manifest, or via Parquet import).
+    pub async fn indexed_book_ids(&self) -> Result<std::collections::HashSet<String>, StoreError> {
+        let mut stream = self
+            .table
+            .query()
+            .select(Select::columns(&["book_id".to_string()]))
+            .execute()
+            .await?;
+        let mut ids = std::collections::HashSet::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| StoreError::Stream(e.to_string()))?;
+            let col = str_col(&batch, "book_id")?;
+            for i in 0..col.len() {
+                if col.is_valid(i) {
+                    ids.insert(col.value(i).to_string());
+                }
+            }
+        }
+        Ok(ids)
     }
 
     /// Nearest-neighbour search by embedding vector.

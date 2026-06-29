@@ -124,6 +124,7 @@ export default function App() {
   const [newName, setNewName] = useState("");
   const [newPaths, setNewPaths] = useState<string[]>([]);
   const [indexing, setIndexing] = useState(false);
+  const [indexKind, setIndexKind] = useState<"cpu" | "gpu" | null>(null);
   const [progress, setProgress] = useState<{ pct: number; label: string } | null>(null);
   const [indexNote, setIndexNote] = useState<string | null>(null);
   const [llmStatus, setLlmStatus] = useState<{ ok: boolean; message: string } | null>(null);
@@ -488,6 +489,7 @@ export default function App() {
   async function runIndex() {
     if (!currentColl || indexing) return;
     setIndexing(true);
+    setIndexKind("cpu");
     setIndexNote(null);
     setProgress(null);
     try {
@@ -496,12 +498,14 @@ export default function App() {
       setIndexNote("Error: " + String(e));
     }
     setIndexing(false);
+    setIndexKind(null);
     setProgress(null);
   }
 
   async function runFastIndex() {
     if (!currentColl || indexing) return;
     setIndexing(true);
+    setIndexKind("gpu");
     setIndexNote(null);
     setProgress(null);
     try {
@@ -510,6 +514,7 @@ export default function App() {
       setIndexNote("Error: " + String(e));
     }
     setIndexing(false);
+    setIndexKind(null);
     setProgress(null);
   }
 
@@ -705,7 +710,7 @@ export default function App() {
                 Add folder…
               </button>
               <button className="primary" onClick={runIndex} disabled={indexing || currentColl.source_paths.length === 0}>
-                {indexing ? "Indexing…" : "Index / Re-index"}
+                {indexKind === "cpu" ? "Indexing…" : "Index / Re-index"}
               </button>
               {settings?.python_bin && settings?.indexer_script && (
                 <button
@@ -713,7 +718,7 @@ export default function App() {
                   disabled={indexing || currentColl.source_paths.length === 0}
                   title="Embed on the GPU via the Python/MPS helper, then import"
                 >
-                  {indexing ? "Indexing…" : "Fast index (GPU)"}
+                  {indexKind === "gpu" ? "Indexing…" : "Fast index (GPU)"}
                 </button>
               )}
               <span className="spacer" />

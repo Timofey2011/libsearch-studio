@@ -264,6 +264,37 @@ impl Db {
         }
     }
 
+    /// Find an already-indexed book in this collection whose stored fingerprint
+    /// matches. Because the fingerprint is path-independent (`size:mtime`), this
+    /// recognizes a file that moved to a new path so we can re-point its chunks
+    /// instead of re-embedding them.
+    pub fn book_id_for_fingerprint(
+        &self,
+        collection_id: &str,
+        fingerprint: &str,
+    ) -> Result<Option<String>, DbError> {
+        let r = self.conn.query_row(
+            "SELECT book_id FROM book_state WHERE collection_id = ?1 AND fingerprint = ?2 LIMIT 1",
+            params![collection_id, fingerprint],
+            |r| r.get::<_, String>(0),
+        );
+        match r {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Drop one book's fingerprint row (used after re-pointing a moved book to a
+    /// new id).
+    pub fn delete_book_state(&self, collection_id: &str, book_id: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM book_state WHERE collection_id = ?1 AND book_id = ?2",
+            params![collection_id, book_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_book_fingerprint(
         &self,
         collection_id: &str,
