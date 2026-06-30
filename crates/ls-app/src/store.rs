@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS book_state (
     collection_id TEXT NOT NULL,
     book_id       TEXT NOT NULL,
     fingerprint   TEXT NOT NULL,
+    content_sig   TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (collection_id, book_id)
 );
 "#;
@@ -67,6 +68,11 @@ impl Db {
         );
         let _ = conn.execute(
             "ALTER TABLE messages ADD COLUMN out_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Content signature for timestamp-independent dedup (added later).
+        let _ = conn.execute(
+            "ALTER TABLE book_state ADD COLUMN content_sig TEXT NOT NULL DEFAULT ''",
             [],
         );
         Ok(Self { conn })
@@ -285,6 +291,47 @@ impl Db {
         }
     }
 
+    /// Find an already-indexed book in this collection by content signature
+    /// (timestamp-independent). Recognizes the same content even if its mtime
+    /// changed or it was duplicated. Empty signatures never match.
+    pub fn book_id_for_content(
+        &self,
+        collection_id: &str,
+        content_sig: &str,
+    ) -> Result<Option<String>, DbError> {
+        if content_sig.is_empty() {
+            return Ok(None);
+        }
+        let r = self.conn.query_row(
+            "SELECT book_id FROM book_state WHERE collection_id = ?1 AND content_sig = ?2 LIMIT 1",
+            params![collection_id, content_sig],
+            |r| r.get::<_, String>(0),
+        );
+        match r {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Record both the metadata fingerprint and the content signature for a book.
+    pub fn set_book_state(
+        &self,
+        collection_id: &str,
+        book_id: &str,
+        fingerprint: &str,
+        content_sig: &str,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO book_state (collection_id, book_id, fingerprint, content_sig)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(collection_id, book_id)
+             DO UPDATE SET fingerprint=excluded.fingerprint, content_sig=excluded.content_sig",
+            params![collection_id, book_id, fingerprint, content_sig],
+        )?;
+        Ok(())
+    }
+
     /// Drop one book's fingerprint row (used after re-pointing a moved book to a
     /// new id).
     pub fn delete_book_state(&self, collection_id: &str, book_id: &str) -> Result<(), DbError> {
@@ -432,5 +479,26 @@ mod tests {
         assert_eq!(db.book_fingerprint("c1", "b1").unwrap(), Some("fp1".into()));
         db.set_book_fingerprint("c1", "b1", "fp2").unwrap();
         assert_eq!(db.book_fingerprint("c1", "b1").unwrap(), Some("fp2".into()));
+    }
+
+    #[test]
+    fn content_sig_finds_moved_book() {
+        let db = Db::open_in_memory().unwrap();
+        // An empty signature must never match.
+        assert_eq!(db.book_id_for_content("c1", "").unwrap(), None);
+        // Record a book under its old id with a content signature.
+        db.set_book_state("c1", "old", "fp-old", "sig-xyz").unwrap();
+        assert_eq!(
+            db.book_id_for_content("c1", "sig-xyz").unwrap(),
+            Some("old".into())
+        );
+        // Scoped per collection.
+        assert_eq!(db.book_id_for_content("c2", "sig-xyz").unwrap(), None);
+        // set_book_fingerprint must preserve the existing content signature.
+        db.set_book_fingerprint("c1", "old", "fp-new").unwrap();
+        assert_eq!(
+            db.book_id_for_content("c1", "sig-xyz").unwrap(),
+            Some("old".into())
+        );
     }
 }

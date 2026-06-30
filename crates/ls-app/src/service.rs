@@ -98,6 +98,47 @@ fn title_of(path: &Path) -> String {
         .unwrap_or_else(|| "Untitled".to_string())
 }
 
+/// A cheap content signature for dedup that survives timestamp changes: the file
+/// size plus a hash of its first and last 256 KiB. Two files with identical
+/// content share a signature even if moved, re-synced, or re-timestamped — so an
+/// already-embedded book is recognized regardless of `mtime` or path. Reads at
+/// most ~512 KiB (cheap next to embedding), not the whole file.
+pub fn content_signature(path: &Path) -> String {
+    use std::hash::Hasher;
+    use std::io::{Read, Seek, SeekFrom};
+
+    const SAMPLE: u64 = 256 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return "missing".to_string();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u64(len);
+
+    fn hash_n(f: &mut std::fs::File, h: &mut impl Hasher, max: u64) {
+        let mut remaining = max;
+        let mut buf = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            match f.read(&mut buf[..want]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    h.write(&buf[..n]);
+                    remaining -= n as u64;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    hash_n(&mut f, &mut h, SAMPLE);
+    // Hash the tail too (only meaningfully distinct for files > 2 samples).
+    if len > 2 * SAMPLE && f.seek(SeekFrom::End(-(SAMPLE as i64))).is_ok() {
+        hash_n(&mut f, &mut h, SAMPLE);
+    }
+    format!("{len:x}:{:016x}", h.finish())
+}
+
 /// `(path, size, mtime)` fingerprint — changes iff the file changes.
 pub fn file_fingerprint(path: &Path) -> String {
     match std::fs::metadata(path) {
@@ -225,6 +266,26 @@ impl Service {
                 continue;
             }
 
+            // Content-checksum dedup: the same bytes under a new path or a changed
+            // timestamp (re-sync, copy, duplicate) — caught even when (size, mtime)
+            // differs. Re-point the existing chunks instead of re-embedding.
+            let csig = content_signature(p);
+            if let Some(old_id) = self.db.book_id_for_content(&collection.id, &csig)? {
+                if old_id != book_id {
+                    store.remap_book(&old_id, &book_id, path).await.ok();
+                    self.db.delete_book_state(&collection.id, &old_id)?;
+                    self.db
+                        .set_book_state(&collection.id, &book_id, &fp, &csig)?;
+                    stats.books_unchanged += 1;
+                    on_event(IndexEvent::Unchanged {
+                        n,
+                        total,
+                        title: title_of(p),
+                    });
+                    continue;
+                }
+            }
+
             // Announce the file before the (potentially slow) extract so a large
             // or problematic PDF is visible instead of the bar looking frozen.
             on_event(IndexEvent::Working {
@@ -249,7 +310,7 @@ impl Service {
             if doc.blocks.is_empty() {
                 stats.books_skipped += 1;
                 self.db
-                    .set_book_fingerprint(&collection.id, &doc.book_id, &fp)?;
+                    .set_book_state(&collection.id, &doc.book_id, &fp, &csig)?;
                 on_event(IndexEvent::Skipped {
                     n,
                     total,
@@ -293,7 +354,7 @@ impl Service {
             stats.books_indexed += 1;
             wrote = true;
             self.db
-                .set_book_fingerprint(&collection.id, &doc.book_id, &fp)?;
+                .set_book_state(&collection.id, &doc.book_id, &fp, &csig)?;
             on_event(IndexEvent::Indexed {
                 n,
                 total,
@@ -373,5 +434,22 @@ mod tests {
         std::fs::write(&f, "hello world longer").unwrap();
         let fp2 = file_fingerprint(&f);
         assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn content_signature_is_path_and_time_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pdf");
+        let b = dir.path().join("sub/b.pdf"); // different path/name
+        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+        std::fs::write(&a, b"the same bytes in both files").unwrap();
+        std::fs::write(&b, b"the same bytes in both files").unwrap();
+        // Identical content -> identical signature regardless of path/mtime.
+        assert_eq!(content_signature(&a), content_signature(&b));
+        // Different content -> different signature.
+        std::fs::write(&b, b"different bytes entirely here").unwrap();
+        assert_ne!(content_signature(&a), content_signature(&b));
+        // Missing file is handled.
+        assert_eq!(content_signature(&dir.path().join("nope.pdf")), "missing");
     }
 }

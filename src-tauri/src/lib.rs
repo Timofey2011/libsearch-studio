@@ -365,6 +365,10 @@ async fn fast_index_collection(
     let mut remaps: Vec<(String, String, String)> = Vec::new();
     {
         let db = state.db()?;
+        // Content signatures queued this run, so duplicate files in the same batch
+        // are embedded only once.
+        let mut seen_content: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for f in &files {
             let p = Path::new(f);
             let book_id = ls_app::stable_book_id(p);
@@ -393,6 +397,23 @@ async fn fast_index_collection(
                 preskipped += 1;
                 continue;
             }
+            // Content-checksum dedup: same bytes under a new path / changed mtime,
+            // or a duplicate already queued this run — skip re-embedding.
+            let csig = ls_app::content_signature(p);
+            if seen_content.contains_key(&csig) {
+                preskipped += 1;
+                continue;
+            }
+            if let Some(old) = db.book_id_for_content(&coll.id, &csig).ok().flatten() {
+                if old != book_id {
+                    let _ = db.delete_book_state(&coll.id, &old);
+                    let _ = db.set_book_state(&coll.id, &book_id, &fp, &csig);
+                    remaps.push((old, book_id, f.clone()));
+                    preskipped += 1;
+                    continue;
+                }
+            }
+            seen_content.insert(csig, book_id);
             to_embed.push(f.clone());
         }
     }
@@ -529,15 +550,17 @@ async fn fast_index_collection(
     }
     let _ = std::fs::remove_file(&parquet);
 
-    // Record fingerprints so a later re-index skips these files.
+    // Record fingerprint + content signature so a later re-index skips these
+    // files (and recognizes them again if they move or get a new timestamp).
     {
         let db = state.db()?;
         for f in &to_embed {
             let p = Path::new(f);
-            let _ = db.set_book_fingerprint(
+            let _ = db.set_book_state(
                 &coll.id,
                 &ls_app::stable_book_id(p),
                 &ls_app::file_fingerprint(p),
+                &ls_app::content_signature(p),
             );
         }
     }
