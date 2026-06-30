@@ -10,6 +10,7 @@ name = "ls-cli"
 path = "src/main.rs"
 
 [dependencies]
+ls-app = { workspace = true }
 ls-index = { workspace = true }
 ls-embed = { workspace = true }
 ls-extract = { workspace = true }

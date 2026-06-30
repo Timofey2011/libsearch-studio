@@ -28,6 +28,7 @@ ls-extract = { path = "crates/ls-extract" }
 ls-query = { path = "crates/ls-query" }
 ls-llm = { path = "crates/ls-llm" }
 ls-artifacts = { path = "crates/ls-artifacts" }
+ls-app = { path = "crates/ls-app" }
 serde = { version = "1", features = ["derive"] }
 regex = "1"
 thiserror = "2"

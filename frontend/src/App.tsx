@@ -543,6 +543,15 @@ export default function App() {
     setProgress(null);
   }
 
+  // GPU helper is "ready" once Settings has a Python interpreter + indexer script.
+  const gpuReady = !!(settings?.python_bin?.trim() && settings?.indexer_script?.trim());
+
+  // One Index button: use the GPU helper when it's set up, else the CPU engine.
+  function runAutoIndex() {
+    if (gpuReady) runFastIndex();
+    else runIndex();
+  }
+
   async function stopIndex() {
     try {
       await invoke("cancel_indexing");
@@ -757,18 +766,24 @@ export default function App() {
               <button onClick={() => addFolderToColl(currentColl)} disabled={indexing}>
                 Add folder…
               </button>
-              <button className="primary" onClick={runIndex} disabled={indexing || currentColl.source_paths.length === 0}>
-                {indexKind === "cpu" ? "Indexing…" : "Index / Re-index"}
+              <button
+                className="primary"
+                onClick={runAutoIndex}
+                disabled={indexing || currentColl.source_paths.length === 0}
+                title={gpuReady ? "Embed on the GPU (resumable)" : "Embed on the CPU — set up GPU in Settings → Indexing for ~10x faster"}
+              >
+                {indexing ? "Indexing…" : "Index / Re-index"}
               </button>
-              {settings?.python_bin && settings?.indexer_script && (
-                <button
-                  onClick={runFastIndex}
-                  disabled={indexing || currentColl.source_paths.length === 0}
-                  title="Embed on the GPU via the Python/MPS helper, then import"
-                >
-                  {indexKind === "gpu" ? "Indexing…" : "Fast index (GPU)"}
-                </button>
-              )}
+              {!indexing &&
+                (gpuReady ? (
+                  <span className="muted" style={{ fontSize: 11.5 }} title="Using the GPU helper">
+                    GPU
+                  </span>
+                ) : (
+                  <span className="muted" style={{ fontSize: 11.5 }}>
+                    CPU · <a onClick={() => setToolsTab("indexing")} style={{ cursor: "pointer" }}>set up GPU</a> for ~10× faster
+                  </span>
+                ))}
               {indexing && (
                 <button className="stop-btn" onClick={stopIndex} title="Stop indexing (keeps books already indexed)">
                   ■ Stop

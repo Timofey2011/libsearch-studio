@@ -30,7 +30,7 @@ from transformers import AutoTokenizer
 MODEL = "BAAI/bge-m3"
 TARGET_TOKENS = 400
 OVERLAP_TOKENS = 80
-EMBED_BATCH = 64
+EMBED_BATCH = 128
 
 SCHEMA = pa.schema([
     ("id", pa.string()),
@@ -82,6 +82,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--batch", type=int, default=EMBED_BATCH)
+    ap.add_argument("--fp32", action="store_true", help="disable fp16 (slower, exact)")
     ap.add_argument("paths", nargs="+")
     args = ap.parse_args()
 
@@ -91,9 +93,19 @@ def main() -> None:
     t_load = time.perf_counter()
     model = SentenceTransformer(MODEL, device=args.device)
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    # Half precision ~2x throughput on MPS/CUDA at a sub-1% cosine cost (vectors
+    # are L2-normalized; the cross-encoder reranks anyway). CPU stays fp32.
+    fp16 = not args.fp32 and args.device in ("mps", "cuda")
+    if fp16:
+        try:
+            model = model.half()
+        except Exception as e:  # noqa: BLE001
+            print(f"fp16 unavailable, using fp32: {e}", file=sys.stderr, flush=True)
+            fp16 = False
     dev = getattr(model, "device", args.device)
-    print(f"model ready on {dev} in {time.perf_counter() - t_load:.1f}s — "
-          f"embedding {n} file(s)", file=sys.stderr, flush=True)
+    print(f"model ready on {dev} ({'fp16' if fp16 else 'fp32'}, batch {args.batch}) "
+          f"in {time.perf_counter() - t_load:.1f}s — embedding {n} file(s)",
+          file=sys.stderr, flush=True)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -117,7 +129,7 @@ def main() -> None:
             texts = [t for _, t in pieces]
             t_book = time.perf_counter()
             vectors = model.encode(
-                texts, batch_size=EMBED_BATCH, normalize_embeddings=True,
+                texts, batch_size=args.batch, normalize_embeddings=True,
                 show_progress_bar=False,
             )
             dt = time.perf_counter() - t_book

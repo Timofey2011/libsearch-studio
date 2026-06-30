@@ -47,7 +47,15 @@ async fn main() -> Result<()> {
             }
             run_import(&parquet).await
         }
-        _ => bail!("usage: ls-cli <search|ingest|import|ask> ..."),
+        Some("backfill-state") => {
+            let app_dir = args.next().unwrap_or_default();
+            if app_dir.is_empty() {
+                bail!("usage: ls-cli backfill-state <app-data-dir> [collection_id]");
+            }
+            let coll = args.next().unwrap_or_else(|| "default".into());
+            run_backfill_state(&app_dir, &coll).await
+        }
+        _ => bail!("usage: ls-cli <search|ingest|import|backfill-state|ask> ..."),
     }
 }
 
@@ -138,6 +146,44 @@ async fn run_import(parquet: &str) -> Result<()> {
         "imported {n} chunks; index now has {} rows",
         store.count().await?
     );
+    Ok(())
+}
+
+/// Backfill the fingerprint manifest (`book_state`) for a collection's index, so
+/// books loaded via `import` are recognized by the dedup and not re-embedded on a
+/// later re-index. For each `(book_id, source_path)` in the index it records the
+/// file fingerprint + content signature (computed from the file on disk).
+async fn run_backfill_state(app_dir: &str, collection_id: &str) -> Result<()> {
+    let app_dir = PathBuf::from(app_dir);
+    let db = ls_app::Db::open(app_dir.join("app.db")).context("open app.db")?;
+    let coll = db
+        .list_collections()
+        .context("list collections")?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .with_context(|| format!("collection {collection_id} not found"))?;
+    let store = Store::open(&coll.db_path, "chunks")
+        .await
+        .context("open index")?;
+    let pairs = store.book_paths().await.context("read book paths")?;
+    eprintln!(
+        "backfilling {} books for collection '{}'",
+        pairs.len(),
+        coll.name
+    );
+    let (mut ok, mut missing) = (0usize, 0usize);
+    for (book_id, source_path) in &pairs {
+        let p = Path::new(source_path);
+        let fp = ls_app::file_fingerprint(p);
+        let csig = ls_app::content_signature(p);
+        if csig == "missing" {
+            missing += 1;
+        }
+        db.set_book_state(&coll.id, book_id, &fp, &csig)
+            .context("write book_state")?;
+        ok += 1;
+    }
+    eprintln!("done: {ok} recorded ({missing} files missing on disk)");
     Ok(())
 }
 

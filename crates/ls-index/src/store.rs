@@ -241,6 +241,33 @@ impl Store {
         Ok(self.table.count_rows(None).await?)
     }
 
+    /// Distinct `(book_id, source_path)` pairs in the index — used to backfill the
+    /// fingerprint manifest for an imported index so future re-indexes dedup it.
+    pub async fn book_paths(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut stream = self
+            .table
+            .query()
+            .select(Select::columns(&[
+                "book_id".to_string(),
+                "source_path".to_string(),
+            ]))
+            .execute()
+            .await?;
+        let mut map = std::collections::HashMap::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| StoreError::Stream(e.to_string()))?;
+            let bid = str_col(&batch, "book_id")?;
+            let sp = str_col(&batch, "source_path")?;
+            for i in 0..bid.len() {
+                if bid.is_valid(i) && sp.is_valid(i) {
+                    map.entry(bid.value(i).to_string())
+                        .or_insert_with(|| sp.value(i).to_string());
+                }
+            }
+        }
+        Ok(map.into_iter().collect())
+    }
+
     /// All distinct book ids currently present in the index. Lets re-index skip
     /// books already embedded by a prior run even when the fingerprint manifest
     /// is empty (e.g. an index built before the manifest, or via Parquet import).

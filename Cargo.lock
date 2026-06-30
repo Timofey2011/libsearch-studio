@@ -4852,6 +4852,7 @@ name = "ls-cli"
 version = "0.4.2"
 dependencies = [
  "anyhow",
+ "ls-app",
  "ls-embed",
  "ls-extract",
  "ls-index",

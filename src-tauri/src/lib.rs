@@ -273,50 +273,141 @@ async fn cancel_indexing(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse one stderr progress line from `index_to_parquet.py` and emit it as an
-/// index-progress event. Returns `Some(true)` if a book was indexed, `Some(false)`
-/// if skipped, `None` if the line wasn't progress.
-fn emit_py_progress(line: &str, total: usize, window: &WebviewWindow) -> Option<bool> {
+/// One parsed per-book line from the Python helper's stderr.
+enum PyProgress {
+    Book { title: String, chunks: usize },
+    Skip { path: String, reason: String },
+    Other,
+}
+
+/// Parse a `[i/n] …` progress line. The helper's own `i/n` is per-batch, so the
+/// caller numbers books globally; we only need the title/chunks (or skip).
+fn parse_py_progress(line: &str) -> PyProgress {
     let l = line.trim();
-    let close = l.strip_prefix('[')?.find(']')? + 1;
-    let i: usize = l[1..close].split('/').next()?.trim().parse().ok()?;
-    let rest = l[close + 1..].trim();
+    let Some(rest) = l
+        .strip_prefix('[')
+        .and_then(|s| s.find(']').map(|i| &s[i + 1..]))
+    else {
+        return PyProgress::Other;
+    };
+    let rest = rest.trim();
     if rest.starts_with("skip") {
         let path = rest.rsplit(' ').next().unwrap_or(rest).to_string();
-        let _ = window.emit(
-            "index-progress",
-            IndexEvent::Skipped {
-                n: i,
-                total,
-                path,
-                reason: "no extractable text".into(),
-            },
-        );
-        Some(false)
-    } else {
-        // "<title>: <n> chunks"
-        let (title, chunks) = match rest.rfind(": ") {
-            Some(c) => {
-                let n = rest[c + 2..]
-                    .split_whitespace()
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                (rest[..c].to_string(), n)
-            }
-            None => (rest.to_string(), 0),
+        return PyProgress::Skip {
+            path,
+            reason: "no extractable text".into(),
         };
-        let _ = window.emit(
-            "index-progress",
-            IndexEvent::Indexed {
-                n: i,
-                total,
-                title,
-                chunks,
-            },
-        );
-        Some(true)
     }
+    // "<title>: <n> chunks …"
+    let (title, chunks) = match rest.rfind(": ") {
+        Some(c) => {
+            let n = rest[c + 2..]
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            (rest[..c].to_string(), n)
+        }
+        None => (rest.to_string(), 0),
+    };
+    PyProgress::Book { title, chunks }
+}
+
+/// Run the Python helper over one batch of files and import the resulting Parquet
+/// into `store`. Streams per-book progress (numbered from `*gi`) and the raw log,
+/// and reacts to cancellation by killing the helper. Returns `(chunks, indexed,
+/// skipped)`, or `Ok(None)` if the user cancelled mid-batch.
+#[allow(clippy::too_many_arguments)]
+async fn run_py_batch(
+    window: &WebviewWindow,
+    cancel: &AtomicBool,
+    store: &Store,
+    py: &str,
+    script: &str,
+    parquet: &Path,
+    batch: &[String],
+    gi: &mut usize,
+    total: usize,
+) -> Result<Option<(usize, usize, usize)>, String> {
+    let mut cmd = tokio::process::Command::new(py);
+    cmd.arg(script).arg("--out").arg(parquet);
+    for f in batch {
+        cmd.arg(f);
+    }
+    cmd.env("PYTHONUNBUFFERED", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start Python helper: {e}"))?;
+
+    let stderr = child.stderr.take().ok_or("no stderr from helper")?;
+    let mut reader = tokio::io::BufReader::new(stderr).lines();
+    if let Some(stdout) = child.stdout.take() {
+        let w = window.clone();
+        tokio::spawn(async move {
+            let mut l = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = l.next_line().await {
+                let _ = w.emit("index-log", line);
+            }
+        });
+    }
+
+    let mut indexed = 0usize;
+    let mut skipped = 0usize;
+    let mut tail = String::new();
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            maybe = reader.next_line() => {
+                let line = match maybe { Ok(Some(l)) => l, _ => break };
+                let _ = window.emit("index-log", line.clone());
+                match parse_py_progress(&line) {
+                    PyProgress::Book { title, chunks } => {
+                        *gi += 1;
+                        indexed += 1;
+                        let _ = window.emit("index-progress", IndexEvent::Indexed { n: *gi, total, title, chunks });
+                    }
+                    PyProgress::Skip { path, reason } => {
+                        *gi += 1;
+                        skipped += 1;
+                        let _ = window.emit("index-progress", IndexEvent::Skipped { n: *gi, total, path, reason });
+                    }
+                    PyProgress::Other => {}
+                }
+                tail.push_str(&line);
+                tail.push('\n');
+                if tail.len() > 4000 { let cut = tail.len() - 4000; tail.drain(..cut); }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    let _ = child.start_kill();
+                    cancelled = true;
+                    break;
+                }
+            }
+        }
+    }
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+
+    if cancelled {
+        let _ = std::fs::remove_file(parquet);
+        return Ok(None);
+    }
+    if !status.success() {
+        let _ = std::fs::remove_file(parquet);
+        return Err(format!(
+            "Python helper failed (exit {}):\n{}",
+            status.code().unwrap_or(-1),
+            tail.trim_end()
+        ));
+    }
+    let chunks = store
+        .import_parquet(parquet)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(parquet);
+    Ok(Some((chunks, indexed, skipped)))
 }
 
 /// Fast index a collection by offloading bulk embedding to the configured
@@ -442,127 +533,68 @@ async fn fast_index_collection(
 
     let tmp_dir = state.data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
-    let parquet = tmp_dir.join(format!("fastindex-{collection_id}.parquet"));
 
-    // Spawn the Python indexer and stream its stderr progress.
-    let mut cmd = tokio::process::Command::new(&py);
-    cmd.arg(&script).arg("--out").arg(&parquet);
-    for f in &to_embed {
-        cmd.arg(f);
-    }
-    // Unbuffered so per-book progress lines stream live (Python block-buffers a pipe).
-    cmd.env("PYTHONUNBUFFERED", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to start Python helper: {e}"))?;
-
-    let stderr = child.stderr.take().ok_or("no stderr from helper")?;
-    let mut reader = tokio::io::BufReader::new(stderr).lines();
-    // Forward the helper's stdout (final summary, warnings) to the live log too.
-    if let Some(stdout) = child.stdout.take() {
-        let w = window.clone();
-        tokio::spawn(async move {
-            let mut l = tokio::io::BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = l.next_line().await {
-                let _ = w.emit("index-log", line);
-            }
-        });
-    }
     let _ = window.emit("index-progress", IndexEvent::Started { total });
     let _ = window.emit(
         "index-log",
         format!("Embedding {total} new/changed file(s) on the GPU helper…"),
     );
 
+    // Checkpoint every CHECKPOINT_N books: embed a batch, import it, and commit
+    // its fingerprints. A Stop/crash then loses only the current batch — the rest
+    // stays in the index and the dedup resumes from there on the next run.
+    const CHECKPOINT_N: usize = 40;
+    let mut gi = 0usize; // global book counter for progress numbering
     let mut indexed = 0usize;
     let mut skipped = 0usize;
-    let mut tail = String::new();
+    let mut chunks_written = 0usize;
     let mut cancelled = false;
-    loop {
-        tokio::select! {
-            maybe = reader.next_line() => {
-                let line = match maybe {
-                    Ok(Some(l)) => l,
-                    _ => break, // EOF or read error: helper finished
-                };
-                // Stream every helper line to the UI log, then parse it for the bar.
-                let _ = window.emit("index-log", line.clone());
-                if let Some(was_indexed) = emit_py_progress(&line, total, &window) {
-                    if was_indexed { indexed += 1; } else { skipped += 1; }
-                }
-                tail.push_str(&line);
-                tail.push('\n');
-                if tail.len() > 4000 {
-                    let cut = tail.len() - 4000;
-                    tail.drain(..cut);
-                }
+    for (bi, batch) in to_embed.chunks(CHECKPOINT_N).enumerate() {
+        if state.cancel.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
+        let parquet = tmp_dir.join(format!("fastindex-{collection_id}-{bi}.parquet"));
+        match run_py_batch(
+            &window,
+            &state.cancel,
+            &store,
+            &py,
+            &script,
+            &parquet,
+            batch,
+            &mut gi,
+            total,
+        )
+        .await?
+        {
+            None => {
+                cancelled = true;
+                break;
             }
-            // Poll the cancel flag so Stop reacts within ~250ms, even mid-book.
-            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
-                if state.cancel.load(Ordering::SeqCst) {
-                    let _ = child.start_kill();
-                    cancelled = true;
-                    break;
+            Some((chunks, idx, skip)) => {
+                chunks_written += chunks;
+                indexed += idx;
+                skipped += skip;
+                // Commit this batch's fingerprints so it's not re-embedded on resume.
+                let db = state.db()?;
+                for f in batch {
+                    let p = Path::new(f);
+                    let _ = db.set_book_state(
+                        &coll.id,
+                        &ls_app::stable_book_id(p),
+                        &ls_app::file_fingerprint(p),
+                        &ls_app::content_signature(p),
+                    );
                 }
             }
         }
     }
 
-    let status = child.wait().await.map_err(|e| e.to_string())?;
-
-    // Stopped by the user: drop the partial Parquet and report a clean stop.
-    if cancelled {
-        let _ = std::fs::remove_file(&parquet);
-        let stats = IndexStats {
-            books_indexed: 0,
-            books_unchanged: preskipped,
-            books_skipped: skipped,
-            books_failed: 0,
-            chunks_written: 0,
-        };
-        let _ = window.emit(
-            "index-progress",
-            IndexEvent::Finished {
-                stats: stats.clone(),
-            },
-        );
-        return Ok(stats);
-    }
-
-    if !status.success() {
-        let _ = std::fs::remove_file(&parquet);
-        return Err(format!(
-            "Python helper failed (exit {}):\n{}",
-            status.code().unwrap_or(-1),
-            tail.trim_end()
-        ));
-    }
-
-    // Import the embedded chunks into the collection's index (reusing the store).
-    let chunks = store
-        .import_parquet(&parquet)
-        .await
-        .map_err(|e| e.to_string())?;
-    if chunks > 0 {
+    // Build the FTS index once the run settles (cheap to rebuild; skipped on a
+    // cancel — it's rebuilt when a later run completes).
+    if chunks_written > 0 && !cancelled {
         store.ensure_fts_index().await.map_err(|e| e.to_string())?;
-    }
-    let _ = std::fs::remove_file(&parquet);
-
-    // Record fingerprint + content signature so a later re-index skips these
-    // files (and recognizes them again if they move or get a new timestamp).
-    {
-        let db = state.db()?;
-        for f in &to_embed {
-            let p = Path::new(f);
-            let _ = db.set_book_state(
-                &coll.id,
-                &ls_app::stable_book_id(p),
-                &ls_app::file_fingerprint(p),
-                &ls_app::content_signature(p),
-            );
-        }
     }
 
     let stats = IndexStats {
@@ -570,7 +602,7 @@ async fn fast_index_collection(
         books_unchanged: preskipped,
         books_skipped: skipped,
         books_failed: 0,
-        chunks_written: chunks,
+        chunks_written,
     };
     let _ = window.emit(
         "index-progress",
