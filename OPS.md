@@ -68,39 +68,60 @@ sets but is slow for large libraries.
 
 ## In-app indexing (GUI)
 
-The app can index folders directly: open **Manage…**, create a collection (name + one or more
-folders via the native folder picker) or add folders to the selected one, then **Index /
-Re-index**. A progress bar shows per-file events (`index-progress`); indexing is incremental
-(unchanged files are skipped via the `(path, size, mtime)` fingerprint) and rebuilds the FTS
-index at the end. Each new collection gets its own LanceDB under
-`~/.local/share/libsearch-studio/collections/<id>/`.
+Open **Settings** (the gear, lower-left) → **Collections**, create a collection (name + folders
+via the native picker) or add folders, then click **Index / Re-index**. A progress bar shows
+per-file events (`index-progress`) plus elapsed time, books/chunks counts, throughput and ETA;
+a **Stop** button cancels (keeping whatever finished). Each collection gets its own LanceDB under
+`~/.local/share/libsearch-studio/collections/<id>/` (the default "My Library" uses `lancedb/`).
 
-In-app indexing embeds on the **CPU** (~1 chunk/s fp32), so it suits small or incremental
-collections. For a large library, use the hybrid Python/MPS → Parquet → `ls-cli import` path
-above against the collection's `db_path`.
+**One button, two engines.** Index auto-routes to the **GPU** helper when it's configured
+(Settings → Indexing), else the pure-Rust **CPU** engine (~1 chunk/s; always available, no setup).
+A small `GPU`/`CPU` hint by the button shows which will run.
 
-### One-click setup (self-contained)
+**Incremental + dedup.** Indexing only embeds genuinely new/changed files. Unchanged files are
+skipped via a `(size, mtime)` fingerprint; a file that **moved/was renamed** is recognized by a
+**content signature** (size + head/tail hash, timestamp-independent) and re-pointed instead of
+re-embedded; books already present in the index are skipped even if the manifest is empty.
 
-**Settings → Fast index → "Set up GPU indexing (auto)"** provisions everything locally with no
-manual steps: it creates a venv under the app-data dir, `pip install`s the embedding deps
-(torch, sentence-transformers, …), writes a self-contained `gpu_embed.py`, and exports the
-ONNX models into `<app-data>/models` (downloading the base models from Hugging Face once). It
-then points settings at the new venv/script/models. Progress streams live in the panel; the
-first run downloads several GB and takes ~10–20 min. **Restart the app afterward** so it loads
-the freshly exported models. Keeping the venv in the app-data dir (local disk) avoids the
-cloud-sync I/O stall described below.
+### One-click GPU setup (self-contained)
 
-### Fast index (GPU) from the app
+**Settings → Indexing → "Set up GPU indexing (auto)"** provisions everything locally: it creates a
+venv under the app-data dir, `pip install`s the embedding deps (torch, sentence-transformers, …),
+writes a self-contained `scripts/gpu_embed.py`, and exports the ONNX models into `<app-data>/models`
+(downloading base models from Hugging Face once), then points settings at the new venv/script/
+models. Progress streams live; the first run downloads several GB (~10–20 min). **Restart the app
+afterward** to load the freshly exported models.
 
-The app can drive the Python/MPS indexer directly: set **Settings → Fast index** to a Python
-interpreter and the path to `scripts/index_to_parquet.py`. The **Fast index (GPU)** button in
-Manage then spawns the helper for the collection's folders, streams its per-book progress into
-the bar, imports the resulting Parquet into the collection's LanceDB, and records fingerprints
-(so a later CPU re-index skips those files).
+### Fast index (GPU) details
 
-> **Put the venv on local disk.** If the interpreter's virtualenv lives on a cloud-sync mount
-> (Dropbox/iCloud), importing torch/transformers stalls on file-provider I/O — model load can
-> take minutes with ~0% CPU before embedding even starts. A local venv loads in seconds.
+The GPU path (`scripts/gpu_embed.py`) embeds on Apple **MPS** / **CUDA** in **fp16, batched**
+(`--fp32` to disable; fp16 is a modest ~15% gain on MPS, not the ~2× CUDA gives). It runs in
+**checkpointed batches of 40 books**: each batch is embedded, imported into LanceDB, and its
+fingerprints committed — so a **Stop**/crash loses only the current batch and a re-run **resumes**
+via the dedup. The helper's stdout/stderr stream into a collapsible **Log** panel (device, model
+load, per-book timing).
+
+> **Put the venv on local disk.** If the venv lives on a cloud-sync mount (Dropbox/iCloud),
+> importing torch/transformers stalls on file-provider I/O — model load can take minutes at ~0%
+> CPU before embedding even starts. A local venv loads in seconds.
+
+### Reusing an existing index (skip re-embedding)
+
+Because the Rust query embedder is **parity-identical** to Python bge-m3, any index with the same
+chunk schema can be loaded verbatim — no re-embedding:
+
+```bash
+# 1. Export the other index to a Parquet matching ls-index::chunk_schema (12 cols, vector(1024)).
+#    (remap source_path to the books' current location if they moved)
+# 2. Import into the target collection's LanceDB.
+LS_DB_PATH="$HOME/.local/share/libsearch-studio/lancedb" \
+  cargo run -p ls-cli --release -- import books.parquet
+# 3. Make the imported index dedup-aware so a later re-index only embeds new files.
+cargo run -p ls-cli --release -- backfill-state "$HOME/.local/share/libsearch-studio" default
+```
+
+`backfill-state` records each book's fingerprint + content signature from the file on disk, so the
+in-app **Index** then skips everything already present and embeds only genuinely new books.
 
 ## Run (engine CLI, before the GUI)
 

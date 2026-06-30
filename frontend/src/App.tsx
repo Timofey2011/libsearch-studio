@@ -37,13 +37,14 @@ function fmtDur(sec: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(ss)}` : `${m}:${pad(ss)}`;
 }
 
-type ToolsTab = "collections" | "synthesis" | "retrieval" | "indexing" | "general";
+type ToolsTab = "collections" | "synthesis" | "retrieval" | "indexing" | "general" | "help";
 const TOOLS_TABS: [ToolsTab, string][] = [
   ["collections", "Collections"],
   ["synthesis", "Synthesis"],
   ["retrieval", "Retrieval"],
   ["indexing", "Indexing"],
   ["general", "General"],
+  ["help", "Help"],
 ];
 
 type Reader = { path: string; page: number | null; missing: boolean };
@@ -1012,6 +1013,110 @@ export default function App() {
     );
   }
 
+  function renderHelpTab() {
+    const stages: { n: number; t: [string, string]; solid: boolean }[] = [
+      { n: 1, t: ["Your", "question"], solid: false },
+      { n: 2, t: ["Search your", "library"], solid: false },
+      { n: 3, t: ["Re-rank", "best matches"], solid: false },
+      { n: 4, t: ["LLM reads", "+ writes"], solid: true },
+      { n: 5, t: ["Answer +", "citations"], solid: false },
+    ];
+    const BW = 96, BH = 54, GAP = 18, Y = 60;
+    const xs = stages.map((_, i) => 6 + i * (BW + GAP));
+    const cx = (i: number) => xs[i] + BW / 2;
+    return (
+      <div className="help">
+        <h3>How LibSearch answers from your library</h3>
+        <p>
+          A large language model (LLM) is great at writing, but on its own it has never read
+          <i> your</i> books, it can't cite where an answer came from, and it will confidently make
+          things up. LibSearch fixes that with <b>RAG — Retrieval-Augmented Generation</b>: before the
+          model answers, it finds the most relevant passages in your own library and hands them over
+          as evidence. The model then answers <i>only</i> from those passages and cites them.
+        </p>
+
+        <div className="help-cols">
+          <div className="help-card bad">
+            <div className="hc-title">✗ Plain LLM</div>
+            <ul>
+              <li>Doesn't know your books</li>
+              <li>Can invent facts (hallucinate)</li>
+              <li>No sources to verify</li>
+              <li>Frozen at its training cutoff</li>
+            </ul>
+          </div>
+          <div className="help-card good">
+            <div className="hc-title">✓ LibSearch (RAG)</div>
+            <ul>
+              <li>Answers from your library</li>
+              <li>Grounded in real passages</li>
+              <li>Clickable page-level citations</li>
+              <li>Re-index to add new books anytime</li>
+            </ul>
+          </div>
+        </div>
+
+        <h4>What happens when you ask</h4>
+        <svg viewBox="0 0 580 230" className="help-diagram" role="img" aria-label="RAG pipeline diagram">
+          <defs>
+            <marker id="ha" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+              <path d="M0,0 L6,3 L0,6 Z" fill="var(--muted)" />
+            </marker>
+          </defs>
+          {xs.slice(0, -1).map((x, i) => (
+            <line key={i} x1={x + BW} y1={Y + BH / 2} x2={xs[i + 1] - 2} y2={Y + BH / 2}
+              stroke="var(--muted)" strokeWidth="1.5" markerEnd="url(#ha)" />
+          ))}
+          {/* library feeding step 2 */}
+          <g>
+            <ellipse cx={cx(1)} cy={158} rx={BW / 2} ry="8" fill="var(--panel-2)" stroke="var(--border)" />
+            <rect x={xs[1]} y={158} width={BW} height="34" fill="var(--panel-2)" stroke="var(--border)" />
+            <ellipse cx={cx(1)} cy={192} rx={BW / 2} ry="8" fill="var(--panel-2)" stroke="var(--border)" />
+            <text x={cx(1)} y={181} textAnchor="middle" fontSize="10.5" fill="var(--muted)">your books</text>
+            <line x1={cx(1)} y1={156} x2={cx(1)} y2={Y + BH + 2} stroke="var(--muted)" strokeWidth="1.5" markerEnd="url(#ha)" />
+          </g>
+          {stages.map((s, i) => (
+            <g key={s.n}>
+              <rect x={xs[i]} y={Y} width={BW} height={BH} rx="9"
+                fill={s.solid ? "var(--accent)" : "var(--accent-soft)"} stroke="var(--accent)" />
+              <circle cx={xs[i] + 13} cy={Y + 13} r="8" fill={s.solid ? "#fff" : "var(--accent)"} />
+              <text x={xs[i] + 13} y={Y + 16.5} textAnchor="middle" fontSize="10" fontWeight="700"
+                fill={s.solid ? "var(--accent)" : "#fff"}>{s.n}</text>
+              <text x={cx(i)} y={Y + BH / 2 - 1} textAnchor="middle" fontSize="11"
+                fill={s.solid ? "#fff" : "var(--text)"}>
+                <tspan x={cx(i)} dy="0">{s.t[0]}</tspan>
+                <tspan x={cx(i)} dy="13">{s.t[1]}</tspan>
+              </text>
+            </g>
+          ))}
+        </svg>
+
+        <ol className="help-steps">
+          <li><b>Your question</b> is turned into a numeric “embedding” — a point in meaning-space.</li>
+          <li><b>Search your library</b> finds passages nearby in meaning <i>and</i> by keyword (hybrid search), so both “what you meant” and “the exact words” match.</li>
+          <li><b>Re-rank</b> scores those candidates with a precise cross-encoder and keeps the best few.</li>
+          <li><b>The LLM</b> (local Ollama or a cloud provider you choose) gets your question <i>plus</i> those passages and writes an answer using only them.</li>
+          <li><b>The answer</b> comes back with <span className="cite">[1]</span> markers; click one to open the source PDF at the exact page.</li>
+        </ol>
+
+        <h4>Why the results are better &amp; more tuned</h4>
+        <ul className="help-why">
+          <li><b>Grounded</b> — answers come from your sources, so far less hallucination.</li>
+          <li><b>Verifiable</b> — every claim links to the page it came from.</li>
+          <li><b>Private</b> — retrieval and embeddings run locally; only the final wording is sent to your chosen LLM (and with Ollama, nothing leaves your machine).</li>
+          <li><b>Yours</b> — it reasons over <i>your</i> library, including books no public model has seen.</li>
+        </ul>
+
+        <h4>Getting started</h4>
+        <ol className="help-steps">
+          <li><b>Collections</b> tab → add the folder(s) of PDFs you want to search, then <b>Index</b>.</li>
+          <li><b>Synthesis</b> tab → pick a provider (local <i>Ollama</i> needs no key; cloud providers need an API key).</li>
+          <li>Pick which library to search in the bar under the chat box, then ask away — and click the citations.</li>
+        </ol>
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       {/* Conversation sidebar */}
@@ -1091,9 +1196,10 @@ export default function App() {
                   {toolsTab === "retrieval" && renderRetrievalTab()}
                   {toolsTab === "indexing" && renderIndexingTab()}
                   {toolsTab === "general" && renderGeneralTab()}
+                  {toolsTab === "help" && renderHelpTab()}
                 </div>
               </div>
-              {toolsTab !== "collections" && (
+              {toolsTab !== "collections" && toolsTab !== "help" && (
                 <div className="tools-foot">
                   <button className="primary" onClick={saveSettings}>
                     Save
