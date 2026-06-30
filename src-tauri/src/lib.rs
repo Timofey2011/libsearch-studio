@@ -439,7 +439,21 @@ async fn fast_index_collection(
 
     let stderr = child.stderr.take().ok_or("no stderr from helper")?;
     let mut reader = tokio::io::BufReader::new(stderr).lines();
+    // Forward the helper's stdout (final summary, warnings) to the live log too.
+    if let Some(stdout) = child.stdout.take() {
+        let w = window.clone();
+        tokio::spawn(async move {
+            let mut l = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = l.next_line().await {
+                let _ = w.emit("index-log", line);
+            }
+        });
+    }
     let _ = window.emit("index-progress", IndexEvent::Started { total });
+    let _ = window.emit(
+        "index-log",
+        format!("Embedding {total} new/changed file(s) on the GPU helper…"),
+    );
 
     let mut indexed = 0usize;
     let mut skipped = 0usize;
@@ -452,6 +466,8 @@ async fn fast_index_collection(
                     Ok(Some(l)) => l,
                     _ => break, // EOF or read error: helper finished
                 };
+                // Stream every helper line to the UI log, then parse it for the bar.
+                let _ = window.emit("index-log", line.clone());
                 if let Some(was_indexed) = emit_py_progress(&line, total, &window) {
                     if was_indexed { indexed += 1; } else { skipped += 1; }
                 }

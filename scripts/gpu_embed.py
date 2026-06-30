@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import pathlib
 import sys
+import time
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -84,14 +85,21 @@ def main() -> None:
     ap.add_argument("paths", nargs="+")
     args = ap.parse_args()
 
+    n = len(args.paths)
+    print(f"loading bge-m3 on {args.device} (first run downloads ~2GB)…",
+          file=sys.stderr, flush=True)
+    t_load = time.perf_counter()
     model = SentenceTransformer(MODEL, device=args.device)
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    dev = getattr(model, "device", args.device)
+    print(f"model ready on {dev} in {time.perf_counter() - t_load:.1f}s — "
+          f"embedding {n} file(s)", file=sys.stderr, flush=True)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     writer = pq.ParquetWriter(out, SCHEMA)
     total_chunks = 0
-    n = len(args.paths)
+    t_run = time.perf_counter()
     try:
         for i, p in enumerate(args.paths, 1):
             path = pathlib.Path(p)
@@ -107,10 +115,12 @@ def main() -> None:
                 continue
 
             texts = [t for _, t in pieces]
+            t_book = time.perf_counter()
             vectors = model.encode(
                 texts, batch_size=EMBED_BATCH, normalize_embeddings=True,
                 show_progress_bar=False,
             )
+            dt = time.perf_counter() - t_book
             rows = []
             for j, ((page_no, text), vec) in enumerate(zip(pieces, vectors)):
                 rows.append({
@@ -129,10 +139,16 @@ def main() -> None:
                 })
             writer.write_table(pa.Table.from_pylist(rows, schema=SCHEMA))
             total_chunks += len(rows)
-            print(f"[{i}/{n}] {title}: {len(rows)} chunks", file=sys.stderr)
+            rate = len(rows) / dt if dt > 0 else 0.0
+            elapsed = time.perf_counter() - t_run
+            print(
+                f"[{i}/{n}] {title}: {len(rows)} chunks in {dt:.1f}s "
+                f"({rate:.0f} ch/s) · {total_chunks} total · {elapsed:.0f}s elapsed",
+                file=sys.stderr,
+            )
     finally:
         writer.close()
-    print(f"wrote {total_chunks} chunks -> {out}")
+    print(f"wrote {total_chunks} chunks in {time.perf_counter() - t_run:.0f}s -> {out}")
 
 
 if __name__ == "__main__":

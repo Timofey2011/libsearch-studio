@@ -27,6 +27,16 @@ type ChatMessage = { role: "user" | "assistant"; content: string; thinking: stri
 type Conversation = { id: string; title: string; collection_ids: string[] };
 type BackendMessage = { role: "user" | "assistant"; content: string; citations: Src[]; in_tokens: number; out_tokens: number };
 
+// mm:ss (or h:mm:ss) from a duration in seconds.
+function fmtDur(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(ss)}` : `${m}:${pad(ss)}`;
+}
+
 type ToolsTab = "collections" | "synthesis" | "retrieval" | "indexing" | "general";
 const TOOLS_TABS: [ToolsTab, string][] = [
   ["collections", "Collections"],
@@ -127,6 +137,11 @@ export default function App() {
   const [indexKind, setIndexKind] = useState<"cpu" | "gpu" | null>(null);
   const [progress, setProgress] = useState<{ pct: number; label: string } | null>(null);
   const [indexNote, setIndexNote] = useState<string | null>(null);
+  const [indexStart, setIndexStart] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState(0);
+  const [idxCount, setIdxCount] = useState<{ done: number; total: number; chunks: number }>({ done: 0, total: 0, chunks: 0 });
+  const [indexLog, setIndexLog] = useState<string[]>([]);
+  const [showIndexLog, setShowIndexLog] = useState(false);
   const [llmStatus, setLlmStatus] = useState<{ ok: boolean; message: string } | null>(null);
 
   // Manage operates on the first selected collection.
@@ -200,30 +215,46 @@ export default function App() {
       const ev = e.payload;
       const file = (p: string) => p.split("/").pop();
       if (ev.kind === "loading") setProgress({ pct: 0, label: "Loading models…" });
-      else if (ev.kind === "started") setProgress({ pct: 0, label: `Found ${ev.total} file(s)` });
-      else if (ev.kind === "working")
+      else if (ev.kind === "started") {
+        setProgress({ pct: 0, label: `Found ${ev.total} file(s)` });
+        setIdxCount({ done: 0, total: ev.total, chunks: 0 });
+      } else if (ev.kind === "working")
         setProgress({ pct: (ev.total ? (ev.n - 1) / ev.total : 0) * 100, label: `Reading ${file(ev.path)} (${ev.n}/${ev.total})` });
       else if (ev.kind === "embedding") {
         const within = ev.chunks_total ? ev.chunks_done / ev.chunks_total : 0;
         const pct = (ev.total ? (ev.n - 1 + within) / ev.total : 0) * 100;
         setProgress({ pct, label: `Indexing ${ev.title} — ${ev.chunks_done}/${ev.chunks_total} chunks (${ev.n}/${ev.total})` });
-      } else if (ev.kind === "indexed")
+      } else if (ev.kind === "indexed") {
         setProgress({ pct: (ev.n / ev.total) * 100, label: `Indexed ${ev.title}` });
-      else if (ev.kind === "unchanged")
+        setIdxCount((c) => ({ done: ev.n, total: ev.total, chunks: c.chunks + ev.chunks }));
+      } else if (ev.kind === "unchanged") {
         setProgress({ pct: (ev.n / ev.total) * 100, label: `Unchanged ${ev.title}` });
-      else if (ev.kind === "skipped")
+        setIdxCount((c) => ({ ...c, done: ev.n, total: ev.total }));
+      } else if (ev.kind === "skipped") {
         setProgress({ pct: (ev.n / ev.total) * 100, label: `Skipped ${file(ev.path)}: ${ev.reason}` });
-      else if (ev.kind === "finished") {
+        setIdxCount((c) => ({ ...c, done: ev.n, total: ev.total }));
+      } else if (ev.kind === "finished") {
         const s = ev.stats;
         setIndexNote(
           `Done — ${s.books_indexed} indexed, ${s.books_unchanged} unchanged, ${s.books_skipped + s.books_failed} skipped, ${s.chunks_written} chunks written.`
         );
       }
     });
+    const unLog = listen<string>("index-log", (e) =>
+      setIndexLog((l) => [...l, e.payload].slice(-300))
+    );
     return () => {
       un.then((f) => f());
+      unLog.then((f) => f());
     };
   }, []);
+
+  // Tick a clock once a second while indexing so the elapsed timer updates live.
+  useEffect(() => {
+    if (!indexing) return;
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [indexing]);
 
   // Keep the transcript scrolled to the latest turn.
   useEffect(() => {
@@ -486,12 +517,21 @@ export default function App() {
   const providerLabel = (id: string) =>
     id === "ollama" ? "Ollama" : CLOUD_PROVIDERS.find((p) => p.id === id)?.label ?? id;
 
-  async function runIndex() {
-    if (!currentColl || indexing) return;
+  function startIndexUi(kind: "cpu" | "gpu") {
     setIndexing(true);
-    setIndexKind("cpu");
+    setIndexKind(kind);
     setIndexNote(null);
     setProgress(null);
+    setIndexLog([]);
+    setIdxCount({ done: 0, total: 0, chunks: 0 });
+    const t = Date.now();
+    setIndexStart(t);
+    setNowMs(t);
+  }
+
+  async function runIndex() {
+    if (!currentColl || indexing) return;
+    startIndexUi("cpu");
     try {
       await invoke<IndexStats>("index_collection", { collectionId: currentColl.id });
     } catch (e) {
@@ -499,6 +539,7 @@ export default function App() {
     }
     setIndexing(false);
     setIndexKind(null);
+    setIndexStart(null);
     setProgress(null);
   }
 
@@ -513,10 +554,7 @@ export default function App() {
 
   async function runFastIndex() {
     if (!currentColl || indexing) return;
-    setIndexing(true);
-    setIndexKind("gpu");
-    setIndexNote(null);
-    setProgress(null);
+    startIndexUi("gpu");
     try {
       await invoke<IndexStats>("fast_index_collection", { collectionId: currentColl.id });
     } catch (e) {
@@ -524,6 +562,7 @@ export default function App() {
     }
     setIndexing(false);
     setIndexKind(null);
+    setIndexStart(null);
     setProgress(null);
   }
 
@@ -743,7 +782,7 @@ export default function App() {
           </div>
         )}
 
-        {(progress || indexNote) && (
+        {(progress || indexNote || indexLog.length > 0) && (
           <div style={{ marginTop: 8 }}>
             {progress && (
               <>
@@ -754,6 +793,31 @@ export default function App() {
                   {progress.label}
                 </div>
               </>
+            )}
+            {indexing && indexStart && (() => {
+              const elapsed = Math.max(0, (nowMs - indexStart) / 1000);
+              const rate = elapsed > 0 ? idxCount.chunks / elapsed : 0;
+              const eta =
+                idxCount.done > 0 && idxCount.total > 0
+                  ? (elapsed / idxCount.done) * (idxCount.total - idxCount.done)
+                  : null;
+              return (
+                <div className="muted idx-meta" style={{ marginTop: 4 }}>
+                  Elapsed {fmtDur(elapsed)}
+                  {idxCount.total > 0 && ` · ${idxCount.done}/${idxCount.total} books`}
+                  {idxCount.chunks > 0 && ` · ${idxCount.chunks.toLocaleString()} chunks`}
+                  {rate > 0 && ` · ${rate.toFixed(0)} ch/s`}
+                  {eta != null && ` · ETA ${fmtDur(eta)}`}
+                </div>
+              );
+            })()}
+            {indexLog.length > 0 && (
+              <div style={{ marginTop: 6 }}>
+                <button className="ghost" onClick={() => setShowIndexLog((v) => !v)}>
+                  {showIndexLog ? "▾" : "▸"} Log ({indexLog.length})
+                </button>
+                {showIndexLog && <pre className="setup-log">{indexLog.slice(-120).join("\n")}</pre>}
+              </div>
             )}
             {indexNote && (
               <div className={indexNote.startsWith("Error") ? "note-err" : "note-ok"} style={{ marginTop: 4 }}>
