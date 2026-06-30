@@ -432,6 +432,115 @@ a:hover {
   line-height: 1.5;
 }
 
+/* ---- Conversation / Themes tabs ---- */
+.main-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 8px 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.main-tabs button {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 7px 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.main-tabs button:hover {
+  color: var(--text);
+}
+.main-tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+/* ---- Themes (library map) ---- */
+.themes {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 20px;
+}
+.themes-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.themes-head h2 {
+  margin: 0 0 2px;
+  font-size: 17px;
+}
+.theme-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 760px;
+}
+.theme {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  overflow: hidden;
+}
+.theme-h {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 10px 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.theme-h:hover {
+  background: var(--panel-2);
+}
+.theme-h .caret {
+  color: var(--muted);
+  margin-right: 4px;
+}
+.sub-list {
+  padding: 2px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sub {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.sub-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.sub-blurb {
+  font-size: 12px;
+  margin: 1px 0 5px;
+  line-height: 1.45;
+}
+.angles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.angle {
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--accent);
+}
+.angle:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
 /* ---- Help / RAG guide ---- */
 .help {
   font-size: 13px;

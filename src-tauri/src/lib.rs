@@ -1115,6 +1115,175 @@ async fn save_artifact(
     Ok(path.to_string_lossy().into_owned())
 }
 
+// ---- Library theme map (the "Themes" tab) ----
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct SubTheme {
+    name: String,
+    #[serde(default)]
+    blurb: String,
+}
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct Theme {
+    name: String,
+    #[serde(default)]
+    subthemes: Vec<SubTheme>,
+}
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ThemeMap {
+    generated_at: u64,
+    model: String,
+    book_count: usize,
+    themes: Vec<Theme>,
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Where a collection-set's generated theme map is cached (keyed by the sorted ids).
+fn theme_map_path(data_dir: &Path, collection_ids: &[String]) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut ids = collection_ids.to_vec();
+    ids.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ids.join("|").hash(&mut h);
+    data_dir
+        .join("theme_maps")
+        .join(format!("{:016x}.json", h.finish()))
+}
+
+/// The first top-level JSON array in `s` (LLMs often wrap it in prose/fences).
+fn extract_json_array(s: &str) -> Option<&str> {
+    let start = s.find('[')?;
+    let end = s.rfind(']')?;
+    (end > start).then(|| &s[start..=end])
+}
+
+/// Load a previously generated theme map for these collections, if any.
+#[tauri::command]
+async fn get_theme_map(
+    state: State<'_, AppState>,
+    collection_ids: Vec<String>,
+) -> Result<Option<ThemeMap>, String> {
+    let p = theme_map_path(&state.data_dir, &collection_ids);
+    Ok(std::fs::read_to_string(p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// Generate a theme → subtheme map of the selected collections from their book
+/// titles via the LLM, cache it, and return it.
+#[tauri::command]
+async fn build_theme_map(
+    state: State<'_, AppState>,
+    collection_ids: Vec<String>,
+    model: String,
+) -> Result<ThemeMap, String> {
+    // Resolve collections (drop the !Send DB handle before any await).
+    let colls: Vec<Collection> = {
+        let db = state.db()?;
+        db.list_collections()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|c| collection_ids.contains(&c.id))
+            .collect()
+    };
+    if colls.is_empty() {
+        return Err("no valid collection selected".into());
+    }
+
+    // Gather book titles (weighted by how much of the index they cover).
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for c in &colls {
+        if let Ok(store) = Store::open(&c.db_path, "chunks").await {
+            if let Ok(titles) = store.book_titles().await {
+                for (t, n) in titles {
+                    *counts.entry(t).or_default() += n;
+                }
+            }
+        }
+    }
+    if counts.is_empty() {
+        return Err(
+            "the selected collection has no indexed books yet — index a folder first.".into(),
+        );
+    }
+    let mut titles: Vec<(String, usize)> = counts.into_iter().collect();
+    titles.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let book_count = titles.len();
+    const MAX_TITLES: usize = 180;
+    let shown = book_count.min(MAX_TITLES);
+    let list = titles[..shown]
+        .iter()
+        .map(|(t, _)| format!("- {t}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more = if book_count > shown {
+        format!("\n…and {} more titles.", book_count - shown)
+    } else {
+        String::new()
+    };
+
+    let prompt = format!(
+        "You are organizing a personal library into a browsable map of themes.\n\n\
+         The library contains these book titles:\n{list}{more}\n\n\
+         Produce a concise hierarchy that helps someone explore the library: 6 to 10 top-level \
+         themes, each with 2 to 6 subthemes. For each subtheme write a one-sentence blurb of what \
+         it covers. Group by subject matter, not by individual book, and be specific to THIS \
+         library.\n\n\
+         Return ONLY valid JSON (no prose, no markdown) in exactly this shape:\n\
+         [{{\"name\":\"Theme\",\"subthemes\":[{{\"name\":\"Subtheme\",\"blurb\":\"one sentence\"}}]}}]"
+    );
+
+    let model = if model.trim().is_empty() {
+        state.settings().default_model()
+    } else {
+        model
+    };
+    let (text, _usage) = state
+        .llm()
+        .generate_stream(&model, &prompt, |_| {}, |_| {})
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let json = extract_json_array(&text).ok_or_else(|| {
+        format!(
+            "the model didn't return JSON. Try a stronger model. Got:\n{}",
+            text.chars().take(300).collect::<String>()
+        )
+    })?;
+    // Models sometimes emit raw control characters (e.g. a literal newline) inside
+    // JSON strings, which is invalid JSON. Replace any with spaces before parsing —
+    // harmless for inter-token whitespace, and salvages otherwise-good maps.
+    let cleaned: String = json
+        .chars()
+        .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
+        .collect();
+    let themes: Vec<Theme> = serde_json::from_str(&cleaned).map_err(|e| {
+        format!("couldn't parse the theme map ({e}). Try rebuilding with a stronger model.")
+    })?;
+    if themes.is_empty() {
+        return Err("the model returned an empty map — try a stronger model.".into());
+    }
+
+    let map = ThemeMap {
+        generated_at: now_millis(),
+        model,
+        book_count,
+        themes,
+    };
+    let p = theme_map_path(&state.data_dir, &collection_ids);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&p, serde_json::to_string_pretty(&map).unwrap_or_default());
+    Ok(map)
+}
+
 fn init_state() -> AppState {
     // Load embedding models from the local HF cache only (no network at runtime).
     std::env::set_var("HF_HUB_OFFLINE", "1");
@@ -1222,7 +1391,9 @@ pub fn run() {
             save_settings,
             source_exists,
             ask,
-            save_artifact
+            save_artifact,
+            get_theme_map,
+            build_theme_map
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

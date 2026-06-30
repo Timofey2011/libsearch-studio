@@ -241,6 +241,30 @@ impl Store {
         Ok(self.table.count_rows(None).await?)
     }
 
+    /// Distinct book titles with their chunk counts (most-covered first) — the
+    /// signal used to build a browsable theme map of the library.
+    pub async fn book_titles(&self) -> Result<Vec<(String, usize)>, StoreError> {
+        let mut stream = self
+            .table
+            .query()
+            .select(Select::columns(&["title".to_string()]))
+            .execute()
+            .await?;
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| StoreError::Stream(e.to_string()))?;
+            let t = str_col(&batch, "title")?;
+            for i in 0..t.len() {
+                if t.is_valid(i) {
+                    *counts.entry(t.value(i).to_string()).or_default() += 1;
+                }
+            }
+        }
+        let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(v)
+    }
+
     /// Distinct `(book_id, source_path)` pairs in the index — used to backfill the
     /// fingerprint manifest for an imported index so future re-indexes dedup it.
     pub async fn book_paths(&self) -> Result<Vec<(String, String)>, StoreError> {

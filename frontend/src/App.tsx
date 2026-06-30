@@ -47,6 +47,19 @@ const TOOLS_TABS: [ToolsTab, string][] = [
   ["help", "Help"],
 ];
 
+type SubTheme = { name: string; blurb: string };
+type Theme = { name: string; subthemes: SubTheme[] };
+type ThemeMap = { generated_at: number; model: string; book_count: number; themes: Theme[] };
+
+// "Ask angles" — preset ways to interrogate a theme to facilitate reasoning.
+const ANGLES: { label: string; q: (t: string) => string }[] = [
+  { label: "Overview", q: (t) => `Give a clear, well-structured overview of ${t}, drawing on the library.` },
+  { label: "Key ideas", q: (t) => `What are the most important concepts and ideas about ${t}? Explain each briefly.` },
+  { label: "Compare", q: (t) => `Compare the different perspectives or approaches to ${t} found across the sources.` },
+  { label: "Open questions", q: (t) => `What open questions, debates, or unresolved issues surround ${t}?` },
+  { label: "Critique", q: (t) => `What are the main criticisms or limitations discussed about ${t}?` },
+];
+
 type Reader = { path: string; page: number | null; missing: boolean };
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
@@ -143,6 +156,11 @@ export default function App() {
   const [idxCount, setIdxCount] = useState<{ done: number; total: number; chunks: number }>({ done: 0, total: 0, chunks: 0 });
   const [indexLog, setIndexLog] = useState<string[]>([]);
   const [showIndexLog, setShowIndexLog] = useState(false);
+  const [mainTab, setMainTab] = useState<"chat" | "themes">("chat");
+  const [themeMap, setThemeMap] = useState<ThemeMap | null>(null);
+  const [buildingMap, setBuildingMap] = useState(false);
+  const [mapError, setMapError] = useState<string | null>(null);
+  const [openThemes, setOpenThemes] = useState<Record<number, boolean>>({});
   const [llmStatus, setLlmStatus] = useState<{ ok: boolean; message: string } | null>(null);
 
   // Manage operates on the first selected collection.
@@ -268,6 +286,17 @@ export default function App() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [indexLog, showIndexLog]);
 
+  // Load any cached theme map for the selected collections.
+  useEffect(() => {
+    if (!collIds.length) {
+      setThemeMap(null);
+      return;
+    }
+    invoke<ThemeMap | null>("get_theme_map", { collectionIds: collIds })
+      .then((m) => setThemeMap(m ?? null))
+      .catch(() => {});
+  }, [collIds]);
+
   // Stream setup output from the one-click GPU provisioning.
   useEffect(() => {
     const un = listen<string>("setup-log", (e) => setSetupLog((l) => [...l.slice(-400), e.payload]));
@@ -347,6 +376,66 @@ export default function App() {
     setSavedByIdx({});
     setReader(null);
     setTokens({ in: 0, out: 0 });
+  }
+
+  // Start a *fresh* conversation and immediately ask `q` (used by theme launchers).
+  // Uses the freshly created id directly to avoid a convId state race.
+  async function askNew(q: string) {
+    if (!collIds.length || busy) return;
+    setMainTab("chat");
+    setReader(null);
+    setSavedByIdx({});
+    setTokens({ in: 0, out: 0 });
+    setBusy(true);
+    try {
+      const c = await invoke<Conversation>("create_conversation", { collectionIds: collIds, title: q });
+      setConvId(c.id);
+      setConversations((prev) => [c, ...prev]);
+      setMessages([
+        { role: "user", content: q, thinking: "", sources: [] },
+        { role: "assistant", content: "", thinking: "", sources: [] },
+      ]);
+      const res = await invoke<SearchResult[]>("ask", {
+        collectionIds: collIds,
+        conversationId: c.id,
+        question: q,
+        model,
+      });
+      setMessages((prev) => {
+        const copy = [...prev];
+        const last = copy.length - 1;
+        if (copy[last]?.role === "assistant") copy[last] = { ...copy[last], sources: res.map(toSrc) };
+        return copy;
+      });
+    } catch (e) {
+      setMessages((prev) => {
+        const copy = [...prev];
+        const last = copy.length - 1;
+        if (copy[last]?.role === "assistant")
+          copy[last] = { ...copy[last], content: copy[last].content + `\n[Error: ${String(e)}]` };
+        return copy;
+      });
+    }
+    setBusy(false);
+  }
+
+  function askTheme(theme: string, sub: string, angle: (typeof ANGLES)[number]) {
+    const subject = sub ? `"${sub}" (within ${theme})` : `"${theme}"`;
+    askNew(angle.q(subject));
+  }
+
+  async function buildMap() {
+    if (!collIds.length || buildingMap) return;
+    setBuildingMap(true);
+    setMapError(null);
+    try {
+      const m = await invoke<ThemeMap>("build_theme_map", { collectionIds: collIds, model });
+      setThemeMap(m);
+      setOpenThemes(Object.fromEntries(m.themes.map((_, i) => [i, true])));
+    } catch (e) {
+      setMapError(String(e));
+    }
+    setBuildingMap(false);
   }
 
   // Insert a newline at the caret (Alt/Shift+Enter), keeping the caret after it.
@@ -1127,6 +1216,79 @@ export default function App() {
     );
   }
 
+  function renderThemesView() {
+    return (
+      <div className="themes">
+        <div className="themes-head">
+          <div>
+            <h2>Library map</h2>
+            {themeMap ? (
+              <div className="muted">
+                {themeMap.book_count} books · generated {new Date(themeMap.generated_at).toLocaleString()} · {themeMap.model}
+              </div>
+            ) : (
+              <div className="muted">A map of {collLabel} into themes you can explore — click an angle to launch a focused, grounded question.</div>
+            )}
+          </div>
+          <button className="primary" onClick={buildMap} disabled={buildingMap || !collIds.length}>
+            {buildingMap ? "Building…" : themeMap ? "Rebuild" : "Build map"}
+          </button>
+        </div>
+
+        {mapError && <div className="note-err" style={{ marginTop: 8 }}>{mapError}</div>}
+
+        {!collIds.length && <div className="empty">Select a library in the Conversation tab first.</div>}
+
+        {collIds.length > 0 && buildingMap && (
+          <div className="empty">Reading your library and organizing it into themes… this uses your current model and can take a moment.</div>
+        )}
+
+        {collIds.length > 0 && !themeMap && !buildingMap && (
+          <div className="empty">No map yet — click <b>Build map</b> to organize {collLabel} into browsable themes.</div>
+        )}
+
+        {themeMap && !buildingMap && (
+          <div className="theme-list">
+            {themeMap.themes.map((th, i) => (
+              <div className="theme" key={i}>
+                <button className="theme-h" onClick={() => setOpenThemes((o) => ({ ...o, [i]: !o[i] }))}>
+                  <span className="caret">{openThemes[i] ? "▾" : "▸"}</span> {th.name}
+                  <span className="muted"> · {th.subthemes.length}</span>
+                </button>
+                {openThemes[i] && (
+                  <div className="sub-list">
+                    {th.subthemes.length === 0 && (
+                      <div className="angles">
+                        {ANGLES.map((a) => (
+                          <button key={a.label} className="angle" disabled={busy} onClick={() => askTheme(th.name, "", a)}>
+                            {a.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {th.subthemes.map((s, j) => (
+                      <div className="sub" key={j}>
+                        <div className="sub-name">{s.name}</div>
+                        {s.blurb && <div className="sub-blurb muted">{s.blurb}</div>}
+                        <div className="angles">
+                          {ANGLES.map((a) => (
+                            <button key={a.label} className="angle" disabled={busy} onClick={() => askTheme(th.name, s.name, a)} title={a.q(`"${s.name}"`)}>
+                              {a.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       {/* Conversation sidebar */}
@@ -1225,6 +1387,21 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {/* Conversation / Themes tabs */}
+        <div className="main-tabs">
+          <button className={mainTab === "chat" ? "active" : ""} onClick={() => setMainTab("chat")}>
+            Conversation
+          </button>
+          <button className={mainTab === "themes" ? "active" : ""} onClick={() => setMainTab("themes")}>
+            ✦ Themes
+          </button>
+        </div>
+
+        {mainTab === "themes" && renderThemesView()}
+
+        {mainTab === "chat" && (
+          <>
         {/* Transcript */}
         <div ref={scrollRef} className="transcript">
           {messages.length === 0 && (
@@ -1368,6 +1545,8 @@ export default function App() {
             </div>
           </div>
         </div>
+          </>
+        )}
       </div>
 
       {/* Reader */}
