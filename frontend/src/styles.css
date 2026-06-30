@@ -532,6 +532,13 @@ a:hover {
   white-space: pre-wrap;
   color: var(--muted);
 }
+/* The indexing log streams live, so pin it to a fixed height (scrolls internally,
+   auto-pinned to the newest line) — it must not grow and shove controls around. */
+.index-log {
+  height: 140px;
+  max-height: 140px;
+  margin-top: 6px;
+}
 
 .progress-track {
   height: 6px;

@@ -154,6 +154,7 @@ export default function App() {
         ? collections.find((c) => c.id === collIds[0])?.name ?? "1 collection"
         : `${collIds.length} collections`;
   const scrollRef = useRef<HTMLDivElement>(null);
+  const logRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
     invoke<Collection[]>("list_collections").then(setCollections).catch(console.error);
@@ -261,6 +262,11 @@ export default function App() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
+
+  // Keep the (fixed-height) indexing log pinned to its latest line.
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [indexLog, showIndexLog]);
 
   // Stream setup output from the one-click GPU provisioning.
   useEffect(() => {
@@ -832,7 +838,11 @@ export default function App() {
                 <button className="ghost" onClick={() => setShowIndexLog((v) => !v)}>
                   {showIndexLog ? "▾" : "▸"} Log ({indexLog.length})
                 </button>
-                {showIndexLog && <pre className="setup-log">{indexLog.slice(-120).join("\n")}</pre>}
+                {showIndexLog && (
+                  <pre ref={logRef} className="setup-log index-log">
+                    {indexLog.slice(-200).join("\n")}
+                  </pre>
+                )}
               </div>
             )}
             {indexNote && (
