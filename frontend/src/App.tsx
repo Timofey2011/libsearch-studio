@@ -502,6 +502,15 @@ export default function App() {
     setProgress(null);
   }
 
+  async function stopIndex() {
+    try {
+      await invoke("cancel_indexing");
+      setIndexNote("Stopping…");
+    } catch (e) {
+      setIndexNote("Error: " + String(e));
+    }
+  }
+
   async function runFastIndex() {
     if (!currentColl || indexing) return;
     setIndexing(true);
@@ -719,6 +728,11 @@ export default function App() {
                   title="Embed on the GPU via the Python/MPS helper, then import"
                 >
                   {indexKind === "gpu" ? "Indexing…" : "Fast index (GPU)"}
+                </button>
+              )}
+              {indexing && (
+                <button className="stop-btn" onClick={stopIndex} title="Stop indexing (keeps books already indexed)">
+                  ■ Stop
                 </button>
               )}
               <span className="spacer" />

@@ -141,12 +141,14 @@ impl Service {
 
     /// Index `paths` into a collection, skipping files whose fingerprint is unchanged.
     /// Reuses the engine; emits progress via `on_event`. Builds the FTS index at the end.
+    #[allow(clippy::too_many_arguments)] // engine handles + callbacks by design
     pub async fn index_collection(
         &self,
         collection: &Collection,
         paths: &[String],
         embedder: &mut Embedder,
         counter: &dyn TokenCounter,
+        is_cancelled: impl Fn() -> bool,
         mut on_event: impl FnMut(IndexEvent),
     ) -> Result<IndexStats, ServiceError> {
         let store = Store::open_or_create(&collection.db_path, "chunks").await?;
@@ -161,7 +163,11 @@ impl Service {
         let indexed = store.indexed_book_ids().await.unwrap_or_default();
 
         let mut wrote = false;
-        for (i, path) in paths.iter().enumerate() {
+        'files: for (i, path) in paths.iter().enumerate() {
+            // Stop promptly when the user hits Stop; books written so far are kept.
+            if is_cancelled() {
+                break;
+            }
             let n = i + 1;
             let p = Path::new(path);
 
@@ -264,6 +270,10 @@ impl Service {
                 chunks_total,
             });
             for batch in chunks.chunks_mut(EMBED_BATCH) {
+                // Mid-book check so a large book (hundreds of chunks) stops quickly.
+                if is_cancelled() {
+                    break 'files;
+                }
                 let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
                 let vectors = embedder.embed(&texts)?;
                 for (c, v) in batch.iter_mut().zip(vectors) {

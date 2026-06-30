@@ -5,6 +5,8 @@
 //! `ask` streams answer tokens to the webview via the `ask-token` event.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use ls_app::{
     Citation, Collection, Conversation, Db, IndexEvent, IndexStats, Message, Role, Service,
@@ -56,6 +58,8 @@ struct AppState {
     settings: std::sync::Mutex<ls_app::Settings>,
     llm: std::sync::Mutex<Llm>,
     engine: Mutex<Option<Engine>>,
+    /// Set by `cancel_indexing` to ask an in-progress index run to stop.
+    cancel: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -218,6 +222,9 @@ async fn index_collection(
     let models_dir = state.models_dir.clone();
     let data_dir = state.data_dir.clone();
     let w = window.clone();
+    // Fresh cancellation flag for this run; the loop polls it between files.
+    state.cancel.store(false, Ordering::SeqCst);
+    let cancel = state.cancel.clone();
 
     // The embedder load below takes ~20s on first index; tell the UI so the bar
     // doesn't look frozen before the first book is processed.
@@ -239,9 +246,16 @@ async fn index_collection(
             let counter =
                 BgeTokenCounter::load(models_dir.join("bge-m3")).map_err(|e| e.to_string())?;
             let svc = Service::new(&data_dir).map_err(|e| e.to_string())?;
-            svc.index_collection(&coll, &files, &mut embedder, &counter, |ev| {
-                let _ = w.emit("index-progress", ev);
-            })
+            svc.index_collection(
+                &coll,
+                &files,
+                &mut embedder,
+                &counter,
+                || cancel.load(Ordering::SeqCst),
+                |ev| {
+                    let _ = w.emit("index-progress", ev);
+                },
+            )
             .await
             .map_err(|e| e.to_string())
         })
@@ -249,6 +263,14 @@ async fn index_collection(
     .await
     .map_err(|e| e.to_string())??;
     Ok(stats)
+}
+
+/// Ask any in-progress index run (CPU or GPU) to stop. The CPU loop checks this
+/// between files; the GPU path kills the Python helper.
+#[tauri::command]
+async fn cancel_indexing(state: State<'_, AppState>) -> Result<(), String> {
+    state.cancel.store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Parse one stderr progress line from `index_to_parquet.py` and emit it as an
@@ -314,6 +336,8 @@ async fn fast_index_collection(
             "Set the Python interpreter and indexer script in Settings → Fast index (GPU).".into(),
         );
     }
+    // Fresh cancellation flag for this run; we kill the helper if it's set.
+    state.cancel.store(false, Ordering::SeqCst);
 
     let coll = state
         .db()?
@@ -420,24 +444,56 @@ async fn fast_index_collection(
     let mut indexed = 0usize;
     let mut skipped = 0usize;
     let mut tail = String::new();
-    while let Ok(Some(line)) = reader.next_line().await {
-        if let Some(was_indexed) = emit_py_progress(&line, total, &window) {
-            if was_indexed {
-                indexed += 1;
-            } else {
-                skipped += 1;
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            maybe = reader.next_line() => {
+                let line = match maybe {
+                    Ok(Some(l)) => l,
+                    _ => break, // EOF or read error: helper finished
+                };
+                if let Some(was_indexed) = emit_py_progress(&line, total, &window) {
+                    if was_indexed { indexed += 1; } else { skipped += 1; }
+                }
+                tail.push_str(&line);
+                tail.push('\n');
+                if tail.len() > 4000 {
+                    let cut = tail.len() - 4000;
+                    tail.drain(..cut);
+                }
             }
-        }
-        // Keep a bounded tail of output for error reporting.
-        tail.push_str(&line);
-        tail.push('\n');
-        if tail.len() > 4000 {
-            let cut = tail.len() - 4000;
-            tail.drain(..cut);
+            // Poll the cancel flag so Stop reacts within ~250ms, even mid-book.
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if state.cancel.load(Ordering::SeqCst) {
+                    let _ = child.start_kill();
+                    cancelled = true;
+                    break;
+                }
+            }
         }
     }
 
     let status = child.wait().await.map_err(|e| e.to_string())?;
+
+    // Stopped by the user: drop the partial Parquet and report a clean stop.
+    if cancelled {
+        let _ = std::fs::remove_file(&parquet);
+        let stats = IndexStats {
+            books_indexed: 0,
+            books_unchanged: preskipped,
+            books_skipped: skipped,
+            books_failed: 0,
+            chunks_written: 0,
+        };
+        let _ = window.emit(
+            "index-progress",
+            IndexEvent::Finished {
+                stats: stats.clone(),
+            },
+        );
+        return Ok(stats);
+    }
+
     if !status.success() {
         let _ = std::fs::remove_file(&parquet);
         return Err(format!(
@@ -1029,6 +1085,7 @@ fn init_state() -> AppState {
         settings: std::sync::Mutex::new(settings),
         llm: std::sync::Mutex::new(llm),
         engine: Mutex::new(None),
+        cancel: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -1080,6 +1137,7 @@ pub fn run() {
             set_provider,
             index_collection,
             fast_index_collection,
+            cancel_indexing,
             setup_gpu_indexing,
             list_conversations,
             create_conversation,
