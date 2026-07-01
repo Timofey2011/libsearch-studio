@@ -1343,6 +1343,48 @@ async fn build_theme_map(
     Ok(map)
 }
 
+/// "Five whys" deepening: break the deepest node of `path` into finer sub-topics
+/// on demand, so the bubble explorer can drill further than the base map. Returns
+/// a list of `{name, blurb}` children.
+#[tauri::command]
+async fn deepen_theme(
+    state: State<'_, AppState>,
+    model: String,
+    path: Vec<String>,
+) -> Result<Vec<SubTheme>, String> {
+    let Some(leaf) = path.last() else {
+        return Err("no topic selected".into());
+    };
+    let trail = path.join(" › ");
+    let prompt = format!(
+        "In a personal library, consider this topic path:\n{trail}\n\n\
+         Break the most specific topic — \"{leaf}\" — into 4 to 6 finer sub-topics (a \
+         \"five whys\" style deepening that gets progressively more specific). For each, give a \
+         one-sentence blurb. Be concrete; avoid repeating the parent name.\n\n\
+         Return ONLY valid JSON (no prose, no markdown):\n\
+         [{{\"name\":\"Sub-topic\",\"blurb\":\"one sentence\"}}]"
+    );
+    let model = if model.trim().is_empty() {
+        state.settings().default_model()
+    } else {
+        model
+    };
+    let (text, _usage) = state
+        .llm()
+        .generate_stream(&model, &prompt, |_| {}, |_| {})
+        .await
+        .map_err(|e| e.to_string())?;
+    let json = extract_json_array(&text)
+        .ok_or_else(|| "the model didn't return JSON — try a stronger model.".to_string())?;
+    let cleaned: String = json
+        .chars()
+        .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
+        .collect();
+    let subs: Vec<SubTheme> = serde_json::from_str(&cleaned)
+        .map_err(|e| format!("couldn't parse the deepening ({e})."))?;
+    Ok(subs)
+}
+
 fn init_state() -> AppState {
     // Load embedding models from the local HF cache only (no network at runtime).
     std::env::set_var("HF_HUB_OFFLINE", "1");
@@ -1452,7 +1494,8 @@ pub fn run() {
             ask,
             save_artifact,
             get_theme_map,
-            build_theme_map
+            build_theme_map,
+            deepen_theme
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

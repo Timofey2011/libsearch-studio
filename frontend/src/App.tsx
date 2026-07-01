@@ -51,6 +51,32 @@ type SubTheme = { name: string; blurb: string };
 type Theme = { name: string; subthemes: SubTheme[] };
 type ThemeMap = { generated_at: number; model: string; book_count: number; themes: Theme[] };
 
+// A node in the explorable bubble tree (lazily deepened up to MAX_DEPTH levels).
+type BNode = { name: string; blurb?: string; children?: BNode[] };
+const MAX_DEPTH = 5;
+const BUBBLE_COLORS = [
+  "#2563eb", "#7c3aed", "#db2777", "#dc2626", "#ea580c", "#0d9488", "#16a34a",
+  "#0891b2", "#4f46e5", "#9333ea", "#c026d3", "#d97706", "#65a30d", "#e11d48",
+];
+
+// Weight = number of leaf topics under a node (drives bubble size).
+function nodeWeight(n: BNode): number {
+  if (!n.children || n.children.length === 0) return 1;
+  return n.children.reduce((s, c) => s + nodeWeight(c), 0);
+}
+function hexToRgba(hex: string, a: number): string {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+}
+// A question whose specificity scales with how deep you've drilled.
+function levelQuestion(path: string[]): string {
+  const trail = path.join(" › ");
+  const leaf = path[path.length - 1];
+  if (path.length <= 1) return `Give a high-level summary of ${trail || "the library"} as covered in the library.`;
+  if (path.length === 2) return `Explain "${leaf}" (within ${path[0]}) — the key ideas and how they connect.`;
+  return `Go deep on "${leaf}" in the context of ${path.slice(0, -1).join(" › ")}: specifics, mechanisms, trade-offs, and detailed points.`;
+}
+
 // "Ask angles" — preset ways to interrogate a theme to facilitate reasoning.
 const ANGLES: { label: string; q: (t: string) => string }[] = [
   { label: "Overview", q: (t) => `Give a clear, well-structured overview of ${t}, drawing on the library.` },
@@ -162,6 +188,10 @@ export default function App() {
   const [buildingMap, setBuildingMap] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
   const [openThemes, setOpenThemes] = useState<Record<number, boolean>>({});
+  const [themeView, setThemeView] = useState<"explore" | "list">("explore");
+  const [exploreTree, setExploreTree] = useState<BNode[]>([]);
+  const [focusPath, setFocusPath] = useState<number[]>([]);
+  const [deepening, setDeepening] = useState(false);
   const [llmStatus, setLlmStatus] = useState<{ ok: boolean; message: string } | null>(null);
 
   // Manage operates on the first selected collection.
@@ -297,6 +327,21 @@ export default function App() {
       .then((m) => setThemeMap(m ?? null))
       .catch(() => {});
   }, [collIds]);
+
+  // Rebuild the explorable bubble tree whenever the map changes.
+  useEffect(() => {
+    if (!themeMap) {
+      setExploreTree([]);
+      return;
+    }
+    setExploreTree(
+      themeMap.themes.map((t) => ({
+        name: t.name,
+        children: t.subthemes.map((s) => ({ name: s.name, blurb: s.blurb })),
+      }))
+    );
+    setFocusPath([]);
+  }, [themeMap]);
 
   // Stream setup output from the one-click GPU provisioning.
   useEffect(() => {
@@ -1217,6 +1262,139 @@ export default function App() {
     );
   }
 
+  // ---- Explore (bubble) view helpers ----
+  function nodeAt(path: number[]): BNode | null {
+    let nodes = exploreTree;
+    let node: BNode | null = null;
+    for (const i of path) {
+      node = nodes[i] ?? null;
+      if (!node) return null;
+      nodes = node.children ?? [];
+    }
+    return node;
+  }
+  function focusNames(): string[] {
+    let nodes = exploreTree;
+    const names: string[] = [];
+    for (const i of focusPath) {
+      const n = nodes[i];
+      if (!n) break;
+      names.push(n.name);
+      nodes = n.children ?? [];
+    }
+    return names;
+  }
+  async function deepenFocus() {
+    const names = focusNames();
+    if (!names.length || deepening) return;
+    setDeepening(true);
+    setMapError(null);
+    try {
+      const subs = await invoke<SubTheme[]>("deepen_theme", { model, path: names });
+      setExploreTree((prev) => {
+        const copy: BNode[] = JSON.parse(JSON.stringify(prev));
+        let nodes = copy;
+        let n: BNode | null = null;
+        for (const i of focusPath) {
+          n = nodes[i];
+          if (!n) return prev;
+          if (!n.children) n.children = [];
+          nodes = n.children;
+        }
+        if (n) n.children = subs.map((s) => ({ name: s.name, blurb: s.blurb }));
+        return copy;
+      });
+    } catch (e) {
+      setMapError(String(e));
+    }
+    setDeepening(false);
+  }
+
+  function renderExplore() {
+    const focus = focusPath.length ? nodeAt(focusPath) : null;
+    const children = focus ? focus.children ?? [] : exploreTree;
+    const names = focusNames();
+    const colorIdx = focusPath.length ? focusPath[0] : -1;
+    const maxW = Math.max(1, ...children.map(nodeWeight));
+    return (
+      <div className="explore">
+        <div className="crumbs">
+          <button className={focusPath.length ? "" : "here"} onClick={() => setFocusPath([])}>Library</button>
+          {names.map((nm, i) => (
+            <span key={i}>
+              <span className="sep">›</span>
+              <button className={i === names.length - 1 ? "here" : ""} onClick={() => setFocusPath(focusPath.slice(0, i + 1))}>
+                {nm}
+              </button>
+            </span>
+          ))}
+        </div>
+
+        {focus && (
+          <div className="focus-panel">
+            {focus.blurb && <div className="muted focus-blurb">{focus.blurb}</div>}
+            <div className="ask-row">
+              <div className="ask-q">{levelQuestion(names)}</div>
+              <button className="primary" disabled={busy} onClick={() => askNew(levelQuestion(names))}>
+                Ask ↵
+              </button>
+            </div>
+            <div className="angles">
+              {ANGLES.map((a) => (
+                <button
+                  key={a.label}
+                  className="angle"
+                  disabled={busy}
+                  onClick={() => askNew(a.q(`"${focus.name}" (${names.slice(0, -1).join(" › ") || "the library"})`))}
+                >
+                  {a.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {children.length > 0 ? (
+          <div className="bubbles">
+            {children.map((c, i) => {
+              const w = nodeWeight(c);
+              const d = Math.round(74 + 76 * Math.sqrt(w / maxW));
+              const base = BUBBLE_COLORS[(colorIdx >= 0 ? colorIdx : i) % BUBBLE_COLORS.length];
+              const bg = colorIdx >= 0 ? hexToRgba(base, 0.5 + 0.12 * (i % 4)) : base;
+              return (
+                <button
+                  key={i}
+                  className="bubble"
+                  style={{ width: d, height: d, background: bg, fontSize: Math.max(11, Math.min(15, d / 7)) }}
+                  title={c.blurb || c.name}
+                  onClick={() => setFocusPath([...focusPath, i])}
+                >
+                  <span className="b-name">{c.name}</span>
+                  {w > 1 && <span className="b-count">{w}</span>}
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          focus && (
+            <div className="deepen-box">
+              {names.length < MAX_DEPTH ? (
+                <button onClick={deepenFocus} disabled={deepening}>
+                  {deepening ? "Deepening…" : "Deepen with AI ↓"}
+                </button>
+              ) : (
+                <span className="muted">Deepest level reached.</span>
+              )}
+              <span className="muted" style={{ marginLeft: 10, fontSize: 11.5 }}>
+                Break this into finer sub-topics (five-whys), then ask more specific questions.
+              </span>
+            </div>
+          )
+        )}
+      </div>
+    );
+  }
+
   function renderThemesView() {
     return (
       <div className="themes">
@@ -1231,9 +1409,17 @@ export default function App() {
               <div className="muted">A map of {collLabel} into themes you can explore — click an angle to launch a focused, grounded question.</div>
             )}
           </div>
-          <button className="primary" onClick={buildMap} disabled={buildingMap || !collIds.length}>
-            {buildingMap ? "Building…" : themeMap ? "Rebuild" : "Build map"}
-          </button>
+          <div className="row">
+            {themeMap && !buildingMap && (
+              <div className="seg">
+                <button className={themeView === "explore" ? "on" : ""} onClick={() => setThemeView("explore")}>Explore</button>
+                <button className={themeView === "list" ? "on" : ""} onClick={() => setThemeView("list")}>List</button>
+              </div>
+            )}
+            <button className="primary" onClick={buildMap} disabled={buildingMap || !collIds.length}>
+              {buildingMap ? "Building…" : themeMap ? "Rebuild" : "Build map"}
+            </button>
+          </div>
         </div>
 
         {mapError && <div className="note-err" style={{ marginTop: 8 }}>{mapError}</div>}
@@ -1248,7 +1434,9 @@ export default function App() {
           <div className="empty">No map yet — click <b>Build map</b> to organize {collLabel} into browsable themes.</div>
         )}
 
-        {themeMap && !buildingMap && (
+        {themeMap && !buildingMap && themeView === "explore" && renderExplore()}
+
+        {themeMap && !buildingMap && themeView === "list" && (
           <div className="theme-list">
             {themeMap.themes.map((th, i) => (
               <div className="theme" key={i}>

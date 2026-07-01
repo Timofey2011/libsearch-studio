@@ -596,6 +596,136 @@ a:hover {
   border-color: var(--accent);
 }
 
+/* segmented Explore/List toggle */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.seg button {
+  background: var(--bg);
+  border: none;
+  border-radius: 0;
+  padding: 5px 12px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.seg button.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ---- Explore: bubble chart ---- */
+.explore {
+  margin-top: 8px;
+}
+.crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.crumbs button {
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 3px 7px;
+  color: var(--accent);
+  font-size: 13px;
+}
+.crumbs button:hover {
+  background: var(--accent-soft);
+}
+.crumbs button.here {
+  color: var(--text);
+  font-weight: 600;
+}
+.crumbs .sep {
+  color: var(--muted);
+  margin: 0 1px;
+}
+.focus-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: 10px 12px;
+  margin-bottom: 14px;
+}
+.focus-blurb {
+  font-size: 12.5px;
+  margin-bottom: 8px;
+  line-height: 1.5;
+}
+.ask-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.ask-q {
+  flex: 1;
+  font-size: 13.5px;
+  font-weight: 500;
+}
+.bubbles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 6px 0 20px;
+}
+.bubble {
+  border: none;
+  border-radius: 50%;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 8px;
+  line-height: 1.2;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+  overflow: hidden;
+}
+.bubble:hover {
+  transform: scale(1.05);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+}
+.bubble .b-name {
+  font-weight: 600;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  max-width: 100%;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+}
+.bubble .b-count {
+  margin-top: 3px;
+  font-size: 10px;
+  opacity: 0.85;
+  background: rgba(255, 255, 255, 0.25);
+  border-radius: 999px;
+  padding: 0 6px;
+}
+.deepen-box {
+  display: flex;
+  align-items: center;
+  padding: 8px 0;
+}
+.deepen-box button {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
 /* ---- Help / RAG guide ---- */
 .help {
   font-size: 13px;
