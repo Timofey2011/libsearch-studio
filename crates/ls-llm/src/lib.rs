@@ -206,6 +206,28 @@ fn parse_anthropic_sse_line(line: &str) -> Result<LineOut, LlmError> {
     }
 }
 
+/// Turn a failed `/chat/completions` HTTP status into an actionable message.
+/// A 401/403 here is most often a non-chat model (image/embedding) rather than a
+/// bad key — providers like Fireworks reject a chat call to an image model with 401.
+fn chat_error_message(status: u16, body: &str) -> String {
+    let snippet = body.trim();
+    let snippet = if snippet.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", snippet.chars().take(200).collect::<String>())
+    };
+    match status {
+        401 | 403 => format!(
+            "That model doesn't support chat — image and embedding models return {status}. \
+             Pick a chat model, or check the API key in Settings.{snippet}"
+        ),
+        404 => format!("Model not found ({status}). Check the model id in Settings.{snippet}"),
+        400 => format!("The provider rejected the request ({status}).{snippet}"),
+        429 => format!("Rate limited ({status}). Try again in a moment."),
+        _ => format!("Provider error ({status}).{snippet}"),
+    }
+}
+
 /// Parse one SSE `data:` line from an OpenAI-compatible `/chat/completions` stream.
 /// Reasoning models expose `delta.reasoning_content` (or `reasoning`).
 fn parse_openai_sse_line(line: &str) -> Result<LineOut, LlmError> {
@@ -569,8 +591,12 @@ impl OpenAiCompatClient {
                 "messages": [{ "role": "user", "content": prompt }],
             }))
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LlmError::Decode(chat_error_message(status.as_u16(), &body)));
+        }
         run_stream(resp, parse_openai_sse_line, on_token, on_reasoning).await
     }
 }
