@@ -946,7 +946,9 @@ async fn ask(
     // History for follow-up context. On retry we regenerate the last answer: drop
     // the trailing assistant turn(s) and keep the existing question, so history is
     // everything before it and no duplicate user turn is added.
-    let msgs = db.list_messages(&conversation_id).map_err(|e| e.to_string())?;
+    let msgs = db
+        .list_messages(&conversation_id)
+        .map_err(|e| e.to_string())?;
     let history: Vec<HistoryTurn> = if retry {
         if let Some(ui) = msgs.iter().rposition(|m| m.role == Role::User) {
             for m in &msgs[ui + 1..] {
@@ -1016,9 +1018,19 @@ async fn ask(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Drop weak matches so a query with no real answer doesn't list irrelevant
-    // sources; renumber so the [n] citation labels stay contiguous.
-    results.retain(|r| r.score >= settings.min_relevance);
+    // Tiered relevance: keep confident matches (>= min_relevance). If none clear
+    // that bar — common for niche/deep-dive questions where the passage exists but
+    // scores modestly — fall back to a fuzzier floor and take the best few, so we
+    // answer from loosely-related passages instead of nothing. Pure-noise queries
+    // (scores ~0) still fall below even the loose floor and yield no sources.
+    let has_confident = results.iter().any(|r| r.score >= settings.min_relevance);
+    if has_confident {
+        results.retain(|r| r.score >= settings.min_relevance);
+    } else {
+        let loose = (settings.min_relevance * 0.25).clamp(0.02, 0.06);
+        results.retain(|r| r.score >= loose);
+        results.truncate(settings.final_top_k);
+    }
     for (i, r) in results.iter_mut().enumerate() {
         r.rank = i + 1;
     }
