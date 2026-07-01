@@ -346,6 +346,44 @@ impl Store {
             .await?;
         collect(stream).await
     }
+
+    /// Typo-tolerant full-text search: each query term is matched with an
+    /// Elasticsearch-style "AUTO" edit distance (0 for ≤2 chars, 1 for 3–5, 2 for
+    /// longer), so a misspelling like "investmenet" still hits "investment". The
+    /// first character must match (prefix_length=1) to keep fuzzy expansion tight.
+    /// Runs alongside the exact `fts_search`; the two are RRF-fused in `ls-query`,
+    /// so exact/stemmed matches keep their precision and this only adds recall.
+    pub async fn fts_search_fuzzy(
+        &self,
+        text: &str,
+        limit: usize,
+    ) -> Result<Vec<RetrievedChunk>, StoreError> {
+        use lancedb::index::scalar::{BooleanQuery, FullTextSearchQuery, MatchQuery, Occur};
+
+        let clauses: Vec<(Occur, _)> = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|tok| {
+                let fz = MatchQuery::auto_fuzziness(tok);
+                let mq = MatchQuery::new(tok.to_string())
+                    .with_fuzziness(Some(fz))
+                    .with_prefix_length(1);
+                (Occur::Should, mq.into())
+            })
+            .collect();
+        if clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let q = FullTextSearchQuery::new_query(BooleanQuery::new(clauses).into());
+        let stream = self
+            .table
+            .query()
+            .full_text_search(q)
+            .limit(limit)
+            .execute()
+            .await?;
+        collect(stream).await
+    }
 }
 
 async fn collect<S, E>(mut stream: S) -> Result<Vec<RetrievedChunk>, StoreError>
