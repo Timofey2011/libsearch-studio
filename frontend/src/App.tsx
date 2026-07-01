@@ -162,6 +162,7 @@ export default function App() {
   const [savedByIdx, setSavedByIdx] = useState<Record<number, string>>({});
   const [thinkOpen, setThinkOpen] = useState<Record<number, boolean>>({});
   const [tokens, setTokens] = useState({ in: 0, out: 0 });
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
 
@@ -403,6 +404,7 @@ export default function App() {
         conversationId: cid,
         question: q,
         model,
+        retry: false,
       });
       setMessages((prev) => {
         const copy = [...prev];
@@ -430,6 +432,59 @@ export default function App() {
     setTokens({ in: 0, out: 0 });
   }
 
+  function copyText(text: string, idx: number) {
+    navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        setCopiedIdx(idx);
+        setTimeout(() => setCopiedIdx((c) => (c === idx ? null : c)), 1200);
+      })
+      .catch(() => {});
+  }
+
+  // Regenerate the answer at message index `idx` (an assistant turn): drop it and
+  // re-ask its preceding question in the same conversation (no duplicate turn).
+  async function retryFrom(idx: number) {
+    if (busy || !convId) return;
+    const q = messages[idx - 1]?.content;
+    if (!q || messages[idx]?.role !== "assistant") return;
+    setBusy(true);
+    setSavedByIdx((s) => {
+      const c = { ...s };
+      delete c[idx];
+      return c;
+    });
+    // Truncate to the question and add a fresh assistant turn to stream into.
+    setMessages((prev) => [
+      ...prev.slice(0, idx),
+      { role: "assistant", content: "", thinking: "", sources: [] },
+    ]);
+    try {
+      const res = await invoke<SearchResult[]>("ask", {
+        collectionIds: collIds,
+        conversationId: convId,
+        question: q,
+        model,
+        retry: true,
+      });
+      setMessages((prev) => {
+        const copy = [...prev];
+        const last = copy.length - 1;
+        if (copy[last]?.role === "assistant") copy[last] = { ...copy[last], sources: res.map(toSrc) };
+        return copy;
+      });
+    } catch (e) {
+      setMessages((prev) => {
+        const copy = [...prev];
+        const last = copy.length - 1;
+        if (copy[last]?.role === "assistant")
+          copy[last] = { ...copy[last], content: copy[last].content + `\n[Error: ${String(e)}]` };
+        return copy;
+      });
+    }
+    setBusy(false);
+  }
+
   // Start a *fresh* conversation and immediately ask `q` (used by theme launchers).
   // Uses the freshly created id directly to avoid a convId state race.
   async function askNew(q: string) {
@@ -452,6 +507,7 @@ export default function App() {
         conversationId: c.id,
         question: q,
         model,
+        retry: false,
       });
       setMessages((prev) => {
         const copy = [...prev];
@@ -1643,6 +1699,11 @@ export default function App() {
             msg.role === "user" ? (
               <div key={idx} className="turn user">
                 <div className="bubble-user">{msg.content}</div>
+                <div className="msg-tools user-tools">
+                  <button className="mini" onClick={() => copyText(msg.content, idx)}>
+                    {copiedIdx === idx ? "Copied ✓" : "Copy"}
+                  </button>
+                </div>
               </div>
             ) : (
               <div key={idx} className="turn">
@@ -1665,31 +1726,41 @@ export default function App() {
                     <span className="muted">{msg.thinking ? "Reasoning…" : "Thinking…"}</span>
                   )}
                 </div>
-                {msg.sources.length > 0 && (
-                  <>
-                    <div className="actions">
-                      <button onClick={() => saveArtifact(idx)} title="Save this answer + sources as Markdown">
+                {msg.content && (
+                  <div className="actions">
+                    <button className="mini" onClick={() => copyText(msg.content, idx)}>
+                      {copiedIdx === idx ? "Copied ✓" : "Copy"}
+                    </button>
+                    {idx === messages.length - 1 && (
+                      <button className="mini" onClick={() => retryFrom(idx)} disabled={busy} title="Regenerate this answer">
+                        ↻ Retry
+                      </button>
+                    )}
+                    {msg.sources.length > 0 && (
+                      <button className="mini" onClick={() => saveArtifact(idx)} title="Save this answer + sources as Markdown">
                         Save as Markdown
                       </button>
-                      {savedByIdx[idx] && (
-                        <span className={savedByIdx[idx].startsWith("Error") ? "note-err" : "note-ok"}>
-                          {savedByIdx[idx].startsWith("Error") ? savedByIdx[idx] : `Saved → ${savedByIdx[idx]}`}
-                        </span>
-                      )}
-                    </div>
-                    <div className="sources">
-                      <b>Sources</b>
-                      <ol>
-                        {msg.sources.map((s) => (
-                          <li key={s.rank}>
-                            <button className="src-link" onClick={() => openSource(s)} title="Open source at the cited page">
-                              {s.citation}
-                            </button>
-                          </li>
-                        ))}
-                      </ol>
-                    </div>
-                  </>
+                    )}
+                    {savedByIdx[idx] && (
+                      <span className={savedByIdx[idx].startsWith("Error") ? "note-err" : "note-ok"}>
+                        {savedByIdx[idx].startsWith("Error") ? savedByIdx[idx] : `Saved → ${savedByIdx[idx]}`}
+                      </span>
+                    )}
+                  </div>
+                )}
+                {msg.sources.length > 0 && (
+                  <div className="sources">
+                    <b>Sources</b>
+                    <ol>
+                      {msg.sources.map((s) => (
+                        <li key={s.rank}>
+                          <button className="src-link" onClick={() => openSource(s)} title="Open source at the cited page">
+                            {s.citation}
+                          </button>
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
                 )}
               </div>
             )

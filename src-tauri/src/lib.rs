@@ -931,6 +931,7 @@ async fn ask(
     conversation_id: String,
     question: String,
     model: String,
+    retry: bool,
 ) -> Result<Vec<SearchResult>, String> {
     let db = state.db()?;
     let all_colls = db.list_collections().map_err(|e| e.to_string())?;
@@ -942,28 +943,46 @@ async fn ask(
         return Err("no valid collection selected".into());
     }
 
-    // Prior turns for follow-up context (before we add the new question).
-    let history: Vec<HistoryTurn> = db
-        .list_messages(&conversation_id)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|m| HistoryTurn {
-            role: m.role.as_str().to_string(),
-            content: m.content,
+    // History for follow-up context. On retry we regenerate the last answer: drop
+    // the trailing assistant turn(s) and keep the existing question, so history is
+    // everything before it and no duplicate user turn is added.
+    let msgs = db.list_messages(&conversation_id).map_err(|e| e.to_string())?;
+    let history: Vec<HistoryTurn> = if retry {
+        if let Some(ui) = msgs.iter().rposition(|m| m.role == Role::User) {
+            for m in &msgs[ui + 1..] {
+                let _ = db.delete_message(&m.id);
+            }
+            msgs[..ui]
+                .iter()
+                .map(|m| HistoryTurn {
+                    role: m.role.as_str().to_string(),
+                    content: m.content.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        let h = msgs
+            .into_iter()
+            .map(|m| HistoryTurn {
+                role: m.role.as_str().to_string(),
+                content: m.content,
+            })
+            .collect();
+        // Persist the user's turn immediately (a fresh ask, not a retry).
+        db.add_message(&Message {
+            id: new_id(),
+            conversation_id: conversation_id.clone(),
+            role: Role::User,
+            content: question.clone(),
+            citations: vec![],
+            in_tokens: 0,
+            out_tokens: 0,
         })
-        .collect();
-
-    // Persist the user's turn immediately.
-    db.add_message(&Message {
-        id: new_id(),
-        conversation_id: conversation_id.clone(),
-        role: Role::User,
-        content: question.clone(),
-        citations: vec![],
-        in_tokens: 0,
-        out_tokens: 0,
-    })
-    .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
+        h
+    };
 
     // Lazily load the engine on first ask (kept resident afterwards).
     let mut guard = state.engine.lock().await;

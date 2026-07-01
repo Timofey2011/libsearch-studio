@@ -194,6 +194,13 @@ impl Db {
 
     // ---- messages ----
 
+    /// Delete a single message by id (used by "retry" to drop the old answer).
+    pub fn delete_message(&self, id: &str) -> Result<(), DbError> {
+        self.conn
+            .execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn add_message(&self, m: &Message) -> Result<(), DbError> {
         let ord: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(ord), -1) + 1 FROM messages WHERE conversation_id = ?1",
