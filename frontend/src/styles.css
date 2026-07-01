@@ -812,6 +812,33 @@ a:hover {
 .settings-grid input[type="number"] {
   width: 90px;
 }
+.settings-grid label.sub {
+  font-size: 12px;
+  opacity: 0.75;
+}
+/* API-key input + its inline "Check key" button share one grid cell. */
+.key-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.key-row input {
+  flex: 1;
+  min-width: 0;
+}
+.probe-note {
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.probe-note.ok {
+  color: var(--ok, #3ea66b);
+}
+.probe-note.err {
+  color: var(--danger, #d9534f);
+}
+.probe-note.checking {
+  color: var(--muted);
+}
 
 .setup-log {
   margin: 8px 0 0;

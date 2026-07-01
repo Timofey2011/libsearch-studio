@@ -15,7 +15,8 @@ use ls_artifacts::{ArtifactDoc, ArtifactRenderer, Markdown, Source};
 use ls_embed::{BgeTokenCounter, Embedder, Reranker};
 use ls_index::Store;
 use ls_llm::{
-    build_prompt_with_history, AnthropicClient, HistoryTurn, Llm, OllamaClient, OpenAiCompatClient,
+    build_prompt_with_history, is_chat_model, AnthropicClient, HistoryTurn, Llm, OllamaClient,
+    OpenAiCompatClient, ANTHROPIC_MODELS,
 };
 use ls_query::{search_multi, SearchResult};
 use tauri::{Emitter, Manager, State, WebviewWindow};
@@ -743,7 +744,63 @@ async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> 
     // Best-effort: some providers (e.g. Fireworks) don't expose `/models` on the
     // inference endpoint. Never fail the call — the UI falls back to the model
     // configured in Settings, and the status check reports reachability.
-    Ok(state.llm().list_models().await.unwrap_or_default())
+    let models = state.llm().list_models().await.unwrap_or_default();
+    Ok(models.into_iter().filter(|m| is_chat_model(m)).collect())
+}
+
+#[derive(serde::Serialize)]
+struct ProviderProbe {
+    ok: bool,
+    message: String,
+    models: Vec<String>,
+}
+
+/// Validate a provider's API key and return its available chat models, without
+/// touching saved settings — so the user can check a key before committing to it.
+/// Generic across providers: OpenAI-compatible ones probe `/models`; Anthropic
+/// has no cheap key check so its curated list is returned optimistically.
+#[tauri::command]
+async fn probe_provider(provider: String, api_key: String) -> Result<ProviderProbe, String> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Ok(ProviderProbe {
+            ok: false,
+            message: "Enter an API key to check it".into(),
+            models: vec![],
+        });
+    }
+    if provider == "anthropic" {
+        // No unauthenticated probe that doesn't cost tokens; trust the key shape.
+        return Ok(ProviderProbe {
+            ok: true,
+            message: "Key saved — Anthropic models below".into(),
+            models: ANTHROPIC_MODELS.iter().map(|s| s.to_string()).collect(),
+        });
+    }
+    let Some(base) = openai_compat_base(&provider) else {
+        return Err(format!("unknown provider '{provider}'"));
+    };
+    let client = OpenAiCompatClient::new(base, key);
+    match client.list_models().await {
+        Ok(models) => {
+            let chat: Vec<String> = models.into_iter().filter(|m| is_chat_model(m)).collect();
+            let msg = if chat.is_empty() {
+                "Key valid — provider lists no chat models (type your model id below)".into()
+            } else {
+                format!("Key valid · {} chat model(s)", chat.len())
+            };
+            Ok(ProviderProbe {
+                ok: true,
+                message: msg,
+                models: chat,
+            })
+        }
+        Err(e) => Ok(ProviderProbe {
+            ok: false,
+            message: format!("Key check failed — {e}"),
+            models: vec![],
+        }),
+    }
 }
 
 /// Preload a model into Ollama so the next `ask` is warm. Called when the user
@@ -1517,6 +1574,7 @@ pub fn run() {
             rename_conversation,
             delete_conversation,
             list_models,
+            probe_provider,
             warm_model,
             check_llm,
             get_settings,

@@ -380,6 +380,37 @@ where
 }
 
 /// Parse an OpenAI-compatible `/models` response (`{ "data": [{ "id": ... }] }`).
+/// Heuristic: is this model id a chat/completions model (vs. image, embedding,
+/// audio, rerank, moderation…)? Used to keep non-chat models out of the model
+/// picker — sending a chat request to e.g. a Fireworks image model 401/404s.
+/// Kept deliberately generic so it works across OpenAI, Gemini, Fireworks, etc.
+pub fn is_chat_model(id: &str) -> bool {
+    let l = id.to_lowercase();
+    const NON_CHAT: &[&str] = &[
+        "flux",
+        "stable-diffusion",
+        "sd3",
+        "sdxl",
+        "dall-e",
+        "playground-v",
+        "kandinsky",
+        "-image",
+        "image-",
+        "embed",
+        "whisper",
+        "tts",
+        "-audio",
+        "rerank",
+        "clip",
+        "moderation",
+        "-vae",
+        "upscal",
+        "controlnet",
+        "guard",
+    ];
+    !NON_CHAT.iter().any(|n| l.contains(n))
+}
+
 fn parse_openai_models(body: &str) -> Result<Vec<String>, LlmError> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| LlmError::Decode(e.to_string()))?;
@@ -555,7 +586,7 @@ impl OpenAiCompatClient {
         }
     }
 
-    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+    pub async fn list_models(&self) -> Result<Vec<String>, LlmError> {
         let body = self
             .http
             .get(format!("{}/models", self.base_url))
@@ -654,6 +685,33 @@ impl Llm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_model_filter() {
+        // Chat models pass.
+        for m in [
+            "gpt-4o",
+            "gemini-2.0-flash",
+            "accounts/fireworks/models/kimi-k2p7-code",
+            "deepseek-r1",
+            "claude-opus-4-8",
+        ] {
+            assert!(is_chat_model(m), "{m} should be a chat model");
+        }
+        // Image / embedding / audio / rerank / moderation are filtered out.
+        for m in [
+            "accounts/fireworks/models/flux-1-schnell",
+            "stable-diffusion-xl",
+            "dall-e-3",
+            "text-embedding-3-large",
+            "whisper-1",
+            "tts-1",
+            "bge-reranker-v2-m3",
+            "omni-moderation-latest",
+        ] {
+            assert!(!is_chat_model(m), "{m} should be filtered out");
+        }
+    }
 
     fn result(rank: usize, citation: &str, text: &str) -> SearchResult {
         SearchResult {

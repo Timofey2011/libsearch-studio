@@ -170,6 +170,10 @@ export default function App() {
   const [toolsTab, setToolsTab] = useState<ToolsTab>("collections");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [settingsNote, setSettingsNote] = useState<string | null>(null);
+  // Per-provider key-check result: validated chat models for the dropdown.
+  const [probe, setProbe] = useState<
+    Record<string, { status: "checking" | "ok" | "err"; message: string; models: string[] }>
+  >({});
   const [settingUp, setSettingUp] = useState(false);
   const [setupLog, setSetupLog] = useState<string[]>([]);
   const [newName, setNewName] = useState("");
@@ -220,6 +224,17 @@ export default function App() {
     // is exactly the state the status indicator needs to surface.
     checkLlm("");
   }, []);
+
+  // When the Synthesis tab opens on a cloud provider that already has a key,
+  // validate it and populate the model dropdown automatically.
+  useEffect(() => {
+    if (!toolsOpen || toolsTab !== "synthesis" || !settings) return;
+    const prov = settings.llm_provider;
+    if (prov === "ollama" || prov === "anthropic") return;
+    const key = settings.providers[prov]?.api_key?.trim();
+    if (key && !probe[prov]) probeProvider(prov, key);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolsOpen, toolsTab, settings?.llm_provider]);
 
   // Populate the model dropdown. Model listing is best-effort: cloud /models can
   // omit chat models and include image/embedding ones (e.g. Fireworks lists flux
@@ -840,6 +855,34 @@ export default function App() {
       const cur = s.providers[provider] ?? { api_key: "", model: "" };
       return { ...s, providers: { ...s.providers, [provider]: { ...cur, [field]: value } } };
     });
+    // Editing the key invalidates a prior check for this provider.
+    if (field === "api_key")
+      setProbe((p) => {
+        const { [provider]: _drop, ...rest } = p;
+        return rest;
+      });
+  }
+
+  // Validate a provider's key and fetch its chat models for the dropdown, without
+  // saving. Auto-picks the first model if none is chosen yet.
+  async function probeProvider(provider: string, key: string) {
+    setProbe((p) => ({ ...p, [provider]: { status: "checking", message: "Checking…", models: [] } }));
+    try {
+      const r = await invoke<{ ok: boolean; message: string; models: string[] }>("probe_provider", {
+        provider,
+        apiKey: key,
+      });
+      setProbe((p) => ({
+        ...p,
+        [provider]: { status: r.ok ? "ok" : "err", message: r.message, models: r.models },
+      }));
+      const cur = settings?.providers[provider]?.model ?? "";
+      if (r.ok && r.models.length > 0 && !r.models.includes(cur)) {
+        editCreds(provider, "model", r.models[0]);
+      }
+    } catch (e) {
+      setProbe((p) => ({ ...p, [provider]: { status: "err", message: String(e), models: [] } }));
+    }
   }
 
   async function pickArtifactsDir() {
@@ -1122,35 +1165,76 @@ export default function App() {
           (() => {
             const p = CLOUD_PROVIDERS.find((x) => x.id === settings.llm_provider)!;
             const creds = settings.providers[p.id] ?? { api_key: "", model: "" };
+            const pr = probe[p.id];
+            const isAnthropic = p.id === "anthropic";
+            // Dropdown options = validated chat models, plus the currently-saved
+            // model even if the provider's /models omitted it (Fireworks does).
+            const opts = isAnthropic ? ANTHROPIC_MODELS : pr?.models ?? [];
+            const listed = creds.model && !opts.includes(creds.model) ? [creds.model, ...opts] : opts;
+            const useDropdown = listed.length > 0;
             return (
               <>
                 <label>API key</label>
-                <input
-                  type="password"
-                  placeholder={`key from ${p.keyHint}`}
-                  value={creds.api_key}
-                  onChange={(e) => editCreds(p.id, "api_key", e.target.value)}
-                />
+                <div className="key-row">
+                  <input
+                    type="password"
+                    placeholder={`key from ${p.keyHint}`}
+                    value={creds.api_key}
+                    onChange={(e) => editCreds(p.id, "api_key", e.target.value)}
+                  />
+                  <button
+                    className="mini"
+                    disabled={!creds.api_key.trim() || pr?.status === "checking"}
+                    onClick={() => probeProvider(p.id, creds.api_key)}
+                  >
+                    {pr?.status === "checking" ? "Checking…" : "Check key"}
+                  </button>
+                </div>
+                {pr && (
+                  <>
+                    <span />
+                    <div className={`probe-note ${pr.status}`}>
+                      {pr.status === "ok" ? "✓ " : pr.status === "err" ? "✕ " : ""}
+                      {pr.message}
+                    </div>
+                  </>
+                )}
                 <label>Model</label>
-                {p.id === "anthropic" ? (
-                  <select value={creds.model || ANTHROPIC_MODELS[1]} onChange={(e) => editCreds(p.id, "model", e.target.value)}>
-                    {ANTHROPIC_MODELS.map((m) => (
+                {useDropdown ? (
+                  <select value={creds.model} onChange={(e) => editCreds(p.id, "model", e.target.value)}>
+                    {listed.map((m) => (
                       <option key={m} value={m}>
                         {m}
                       </option>
                     ))}
                   </select>
                 ) : (
-                  <input placeholder={p.modelHint} value={creds.model} onChange={(e) => editCreds(p.id, "model", e.target.value)} />
+                  <input
+                    placeholder={pr?.status === "checking" ? "checking key…" : p.modelHint}
+                    value={creds.model}
+                    onChange={(e) => editCreds(p.id, "model", e.target.value)}
+                  />
+                )}
+                {/* Manual override for OpenAI-compat providers whose /models omits
+                    a valid chat model (e.g. some Fireworks models). */}
+                {!isAnthropic && useDropdown && (
+                  <>
+                    <label className="sub">or model id</label>
+                    <input
+                      placeholder={p.modelHint}
+                      value={creds.model}
+                      onChange={(e) => editCreds(p.id, "model", e.target.value)}
+                    />
+                  </>
                 )}
               </>
             );
           })()
         )}
         <div className="tools-note muted">
-          Cloud API keys are stored locally in plaintext (settings.toml) and used only to call that provider. OpenAI,
-          Gemini, Fireworks, and Ollama Cloud share one OpenAI-compatible client; after saving, the model dropdown lists
-          the provider's models.
+          Cloud API keys are stored locally in plaintext (settings.toml) and used only to call that provider. Click{" "}
+          <b>Check key</b> to validate it and load that provider's chat models into the dropdown (image, embedding, and
+          audio models are filtered out). If a valid chat model isn't listed, type its id in the “or model id” field.
         </div>
       </div>
     );
