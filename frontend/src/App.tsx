@@ -229,7 +229,13 @@ export default function App() {
       if (cm) opts = [cm];
     }
     setModels(opts);
-    setModel((cur) => (opts.includes(cur) ? cur : opts[0] ?? ""));
+    // Prefer the model saved for this provider, so a relaunch restores the choice.
+    const saved = s ? (prov === "ollama" ? s.ollama_model : s.providers[prov ?? ""]?.model) : "";
+    setModel((cur) => {
+      if (saved && opts.includes(saved)) return saved;
+      if (opts.includes(cur)) return cur;
+      return opts[0] ?? "";
+    });
     return opts;
   }
 
@@ -745,6 +751,16 @@ export default function App() {
     setModel(m);
     invoke("warm_model", { model: m }).catch(console.error);
     checkLlm(m);
+    // Persist the choice so it sticks across relaunches (per provider).
+    const s = settings;
+    if (!s || !m) return;
+    const prov = s.llm_provider;
+    const next: Settings =
+      prov === "ollama"
+        ? { ...s, ollama_model: m }
+        : { ...s, providers: { ...s.providers, [prov]: { ...(s.providers[prov] ?? { api_key: "", model: "" }), model: m } } };
+    setSettings(next);
+    invoke("save_settings", { settings: next }).catch(console.error);
   }
 
   function editSetting<K extends keyof Settings>(key: K, value: Settings[K]) {
