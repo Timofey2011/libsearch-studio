@@ -221,18 +221,23 @@ export default function App() {
     checkLlm("");
   }, []);
 
-  // Populate the model dropdown. Model listing is best-effort: if a cloud
-  // provider doesn't expose /models, fall back to the model set in Settings.
+  // Populate the model dropdown. Model listing is best-effort: cloud /models can
+  // omit chat models and include image/embedding ones (e.g. Fireworks lists flux
+  // first — and it returns 401 for a chat request), so we always keep the
+  // configured model available and prefer it, and never default to a non-chat one.
   async function refreshModels(s: Settings | null): Promise<string[]> {
     let opts = await invoke<string[]>("list_models").catch(() => [] as string[]);
     const prov = s?.llm_provider;
-    if (opts.length === 0 && s && prov && prov !== "ollama") {
-      const cm = s.providers[prov]?.model;
-      if (cm) opts = [cm];
-    }
-    setModels(opts);
-    // Prefer the model saved for this provider, so a relaunch restores the choice.
     const saved = s ? (prov === "ollama" ? s.ollama_model : s.providers[prov ?? ""]?.model) : "";
+    if (prov && prov !== "ollama") {
+      // Ensure the configured chat model is present (Fireworks etc. may not list it).
+      if (saved && !opts.includes(saved)) opts = [saved, ...opts];
+      // Drop obvious non-chat models so they can't become the default.
+      const nonChat = /flux|stable-diffusion|sdxl|-image|embed|whisper|rerank|clip/i;
+      opts = opts.filter((m) => m === saved || !nonChat.test(m));
+    }
+    if (opts.length === 0 && saved) opts = [saved];
+    setModels(opts);
     setModel((cur) => {
       if (saved && opts.includes(saved)) return saved;
       if (opts.includes(cur)) return cur;
