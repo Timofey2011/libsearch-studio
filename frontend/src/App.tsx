@@ -205,6 +205,7 @@ export default function App() {
         : `${collIds.length} collections`;
   const scrollRef = useRef<HTMLDivElement>(null);
   const logRef = useRef<HTMLPreElement>(null);
+  const thinkRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     invoke<Collection[]>("list_collections").then(setCollections).catch(console.error);
@@ -323,6 +324,11 @@ export default function App() {
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [indexLog, showIndexLog]);
+
+  // Keep the streaming chain-of-thought pinned to its newest line.
+  useEffect(() => {
+    if (thinkRef.current) thinkRef.current.scrollTop = thinkRef.current.scrollHeight;
+  }, [messages]);
 
   // Load any cached theme map for the selected collections.
   useEffect(() => {
@@ -1707,23 +1713,34 @@ export default function App() {
               </div>
             ) : (
               <div key={idx} className="turn">
-                {msg.thinking && (
-                  <div className="thinking">
-                    <button
-                      className="thinking-toggle"
-                      onClick={() => setThinkOpen((o) => ({ ...o, [idx]: !o[idx] }))}
-                    >
-                      <span className="caret">{thinkOpen[idx] ? "▾" : "▸"}</span> Thinking
-                      {!msg.content && <span className="muted"> · reasoning…</span>}
-                    </button>
-                    {thinkOpen[idx] && <div className="thinking-body">{msg.thinking}</div>}
-                  </div>
-                )}
+                {msg.thinking &&
+                  (() => {
+                    // Auto-expand the chain-of-thought while it streams (no answer
+                    // yet on the last turn); the user's manual toggle overrides it.
+                    const reasoningLive = busy && idx === messages.length - 1 && !msg.content;
+                    const open = thinkOpen[idx] ?? reasoningLive;
+                    return (
+                      <div className="thinking">
+                        <button
+                          className="thinking-toggle"
+                          onClick={() => setThinkOpen((o) => ({ ...o, [idx]: !(o[idx] ?? reasoningLive) }))}
+                        >
+                          <span className="caret">{open ? "▾" : "▸"}</span> Chain of thought
+                          {reasoningLive && <span className="think-live"> · reasoning live…</span>}
+                        </button>
+                        {open && (
+                          <div className="thinking-body" ref={idx === messages.length - 1 ? thinkRef : undefined}>
+                            {msg.thinking}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                 <div className="card-assistant">
                   {msg.content ? (
                     renderRich(msg.content, msg.sources)
                   ) : (
-                    <span className="muted">{msg.thinking ? "Reasoning…" : "Thinking…"}</span>
+                    <span className="muted think-live">{msg.thinking ? "Reasoning…" : "Thinking…"}</span>
                   )}
                 </div>
                 {msg.content && (

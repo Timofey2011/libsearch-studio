@@ -896,7 +896,7 @@ a:hover {
 .thinking-body {
   margin-top: 4px;
   padding: 10px 12px;
-  border-left: 2px solid var(--border);
+  border-left: 2px solid var(--accent);
   background: var(--panel);
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   color: var(--muted);
@@ -905,6 +905,15 @@ a:hover {
   white-space: pre-wrap;
   max-height: 260px;
   overflow: auto;
+}
+/* live pulse while the model is still reasoning */
+.think-live {
+  color: var(--accent);
+  animation: think-pulse 1.3s ease-in-out infinite;
+}
+@keyframes think-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
 }
 
 .card-assistant {
