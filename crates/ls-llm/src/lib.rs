@@ -389,7 +389,7 @@ fn parse_tags(body: &str) -> Result<Vec<String>, LlmError> {
 /// models register a very large default context (e.g. 262144), whose KV-cache
 /// prefill is slow. Our prompts are a handful of ~400-token passages, so 8192 is
 /// ample and keeps first-token fast.
-const NUM_CTX: u32 = 8192;
+const NUM_CTX: u32 = 16384;
 
 /// Local Ollama client.
 #[derive(Clone)]

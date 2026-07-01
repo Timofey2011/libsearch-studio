@@ -1156,6 +1156,30 @@ fn theme_map_path(data_dir: &Path, collection_ids: &[String]) -> PathBuf {
         .join(format!("{:016x}.json", h.finish()))
 }
 
+/// Collapse a title to a dedup key: lowercased, separators → spaces, and
+/// version / MEAP / numeric / edition tokens dropped, so `Investing for Programmers`
+/// and `Investing_for_Programmers_v7_MEAP (1)` map to the same work.
+fn normalize_title(t: &str) -> String {
+    let lower: String = t
+        .to_lowercase()
+        .replace(['_', '-', '.', '(', ')', ':', ',', '/'], " ");
+    let mut out: Vec<&str> = Vec::new();
+    for tok in lower.split_whitespace() {
+        let is_ver = tok.len() > 1
+            && (tok.starts_with('v') || tok.starts_with('b'))
+            && tok[1..].chars().all(|c| c.is_ascii_digit());
+        let drop = tok == "meap"
+            || tok == "edition"
+            || tok == "final"
+            || tok.chars().all(|c| c.is_ascii_digit())
+            || is_ver;
+        if !drop {
+            out.push(tok);
+        }
+    }
+    out.join(" ")
+}
+
 /// The first top-level JSON array in `s` (LLMs often wrap it in prose/fences).
 fn extract_json_array(s: &str) -> Option<&str> {
     let start = s.find('[')?;
@@ -1212,29 +1236,64 @@ async fn build_theme_map(
             "the selected collection has no indexed books yet — index a folder first.".into(),
         );
     }
-    let mut titles: Vec<(String, usize)> = counts.into_iter().collect();
-    titles.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // Collapse version/MEAP/duplicate variants: the highest-count variant (raw is
+    // sorted desc) becomes the display title, and counts are summed. This removes
+    // noise and frees slots so minority subjects aren't crowded out.
+    let mut merged: std::collections::HashMap<String, (String, usize)> =
+        std::collections::HashMap::new();
+    {
+        let mut raw: Vec<(String, usize)> = counts.into_iter().collect();
+        raw.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (title, n) in raw {
+            let key = normalize_title(&title);
+            if key.is_empty() {
+                continue;
+            }
+            let e = merged.entry(key).or_insert_with(|| (title.clone(), 0));
+            e.1 += n;
+        }
+    }
+    let mut titles: Vec<(String, usize)> = merged.into_values().collect();
     let book_count = titles.len();
-    const MAX_TITLES: usize = 180;
-    let shown = book_count.min(MAX_TITLES);
-    let list = titles[..shown]
+
+    // Send as many distinct works as comfortably fit the context. When capping,
+    // sample evenly across an *alphabetical* order so we don't bias toward the
+    // biggest books and drop whole subject areas (finance, architecture, …).
+    const MAX_TITLES: usize = 800;
+    titles.sort_by_cached_key(|(t, _)| t.to_lowercase());
+    let selected: Vec<&str> = if book_count <= MAX_TITLES {
+        titles.iter().map(|(t, _)| t.as_str()).collect()
+    } else {
+        let step = book_count as f64 / MAX_TITLES as f64;
+        (0..MAX_TITLES)
+            .map(|i| {
+                titles[((i as f64 * step) as usize).min(book_count - 1)]
+                    .0
+                    .as_str()
+            })
+            .collect()
+    };
+    let shown = selected.len();
+    let list = selected
         .iter()
-        .map(|(t, _)| format!("- {t}"))
+        .map(|t| format!("- {t}"))
         .collect::<Vec<_>>()
         .join("\n");
     let more = if book_count > shown {
-        format!("\n…and {} more titles.", book_count - shown)
+        format!("\n…and {} more works not shown.", book_count - shown)
     } else {
         String::new()
     };
 
     let prompt = format!(
         "You are organizing a personal library into a browsable map of themes.\n\n\
-         The library contains these book titles:\n{list}{more}\n\n\
-         Produce a concise hierarchy that helps someone explore the library: 6 to 10 top-level \
-         themes, each with 2 to 6 subthemes. For each subtheme write a one-sentence blurb of what \
-         it covers. Group by subject matter, not by individual book, and be specific to THIS \
-         library.\n\n\
+         The library contains these {shown} works (titles):\n{list}{more}\n\n\
+         Identify EVERY distinct subject area present — including smaller ones such as finance & \
+         investing, business, process & management, software architecture, mathematics, and any \
+         domain-specific topics. Do NOT omit a subject just because few books cover it, and do not \
+         collapse everything into a handful of programming themes. Produce 8 to 16 top-level \
+         themes, each with 2 to 6 subthemes and a one-sentence blurb per subtheme. Group by \
+         subject matter, not by individual book.\n\n\
          Return ONLY valid JSON (no prose, no markdown) in exactly this shape:\n\
          [{{\"name\":\"Theme\",\"subthemes\":[{{\"name\":\"Subtheme\",\"blurb\":\"one sentence\"}}]}}]"
     );
