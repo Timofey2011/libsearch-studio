@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LibSearch Studio",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "identifier": "com.libsearch.studio",
   "build": {
     "frontendDist": "../frontend/dist",
