@@ -2,6 +2,21 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.6.0 — 2026-07-02
+
+Bump manifests 0.5.9 → 0.6.0. First batch of the conversation-memory arc
+(docs/ROADMAP-2.md, "Ledger, not Brain"):
+- Earlier-topics digest: turns older than the 6-turn window are compressed into
+  capped one-liners instead of vanishing (shed before full turns on budget).
+- Stale [n] citation markers are stripped from assistant-role history so old
+  answers' numbering can't collide with the current Sources block.
+- Tiered follow-up fusion: mid-length and long follow-ups now widen retrieval
+  when semantically continuous with the prior turn (bge-m3 cosine, threshold
+  0.33 calibrated by new EN/RU fixtures — which falsified the initial 0.5
+  guess); pronoun-led and short follow-ups fuse as before. Zero LLM calls.
+- New models-gated fixture harness (cargo test -p ls-query --features models)
+  gates future retrieval-quality changes.
+
 ## v0.5.9 — 2026-07-02
 
 Bump manifests 0.5.8 → 0.5.9. Clean-install polish (found by walking the real
