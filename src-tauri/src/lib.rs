@@ -255,8 +255,7 @@ async fn index_collection(
             .build()
             .map_err(|e| e.to_string())?;
         rt.block_on(async move {
-            let mut embedder =
-                Embedder::load(models_dir.join("bge-m3")).map_err(models_missing)?;
+            let mut embedder = Embedder::load(models_dir.join("bge-m3")).map_err(models_missing)?;
             let counter =
                 BgeTokenCounter::load(models_dir.join("bge-m3")).map_err(models_missing)?;
             let svc = Service::new(&data_dir).map_err(|e| e.to_string())?;
@@ -1072,8 +1071,19 @@ fn looks_anaphoric(q: &str) -> bool {
                 .to_lowercase();
             matches!(
                 first.as_str(),
-                "why" | "and" | "so" | "it" | "its" | "they" | "them" | "this" | "that"
-                    | "those" | "these" | "he" | "she"
+                "why"
+                    | "and"
+                    | "so"
+                    | "it"
+                    | "its"
+                    | "they"
+                    | "them"
+                    | "this"
+                    | "that"
+                    | "those"
+                    | "these"
+                    | "he"
+                    | "she"
             )
         }
         _ => false,
@@ -1086,9 +1096,16 @@ fn looks_anaphoric(q: &str) -> bool {
 /// 3") are excluded, since a few passages can genuinely cover them.
 fn is_aggregative(q: &str) -> bool {
     let l = q.to_lowercase();
-    let localized = ["chapter", "section", "page ", "paragraph", "figure ", "table "]
-        .iter()
-        .any(|w| l.contains(w));
+    let localized = [
+        "chapter",
+        "section",
+        "page ",
+        "paragraph",
+        "figure ",
+        "table ",
+    ]
+    .iter()
+    .any(|w| l.contains(w));
     if localized {
         return false;
     }
@@ -1797,7 +1814,12 @@ mod tests {
     #[test]
     fn anaphoric_detection() {
         // Short / pronoun-led follow-ups.
-        for q in ["why?", "and then?", "what about Redis", "why does that matter"] {
+        for q in [
+            "why?",
+            "and then?",
+            "what about Redis",
+            "why does that matter",
+        ] {
             assert!(looks_anaphoric(q), "{q:?} should look anaphoric");
         }
         // Real standalone questions are not follow-ups.

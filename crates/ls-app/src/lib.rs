@@ -72,9 +72,7 @@ mod tests {
             Some("iCloud Drive")
         );
         assert_eq!(
-            cloud_sync_provider(Path::new(
-                "/Users/x/Library/CloudStorage/GoogleDrive-a/lib"
-            )),
+            cloud_sync_provider(Path::new("/Users/x/Library/CloudStorage/GoogleDrive-a/lib")),
             Some("a cloud drive (File Provider)")
         );
         assert_eq!(

@@ -76,7 +76,10 @@ fn estimate_tokens(s: &str) -> usize {
     if total == 0 {
         return 0;
     }
-    let cyrillic = s.chars().filter(|c| ('\u{0400}'..='\u{04FF}').contains(c)).count();
+    let cyrillic = s
+        .chars()
+        .filter(|c| ('\u{0400}'..='\u{04FF}').contains(c))
+        .count();
     let divisor = if cyrillic * 5 >= total { 2.5 } else { 4.0 };
     ((total as f32) / divisor).ceil() as usize
 }
@@ -101,7 +104,11 @@ pub fn build_prompt_with_history(
     let mut window: Vec<(&str, String)> = history[start..]
         .iter()
         .map(|turn| {
-            let speaker = if turn.role == "assistant" { "Assistant" } else { "User" };
+            let speaker = if turn.role == "assistant" {
+                "Assistant"
+            } else {
+                "User"
+            };
             (speaker, truncate(&turn.content, MAX_TURN_CHARS))
         })
         .collect();

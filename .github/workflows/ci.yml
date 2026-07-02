@@ -26,11 +26,17 @@ jobs:
       - run: cargo test --workspace --exclude app
 
   # Smoke-build the desktop app (no installers, no signing) on both platforms.
+  # The bundle target is per-OS: `app` (.app) exists only on macOS; Linux offers
+  # deb/rpm/appimage — deb is the lightest smoke-build.
   bundle:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        include:
+          - os: macos-latest
+            bundles: app
+          - os: ubuntu-latest
+            bundles: deb
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -56,4 +62,4 @@ jobs:
       - run: pnpm --dir frontend install --frozen-lockfile
       # Run the Tauri CLI from the repo root so src-tauri/ is discoverable.
       - name: Build app bundle
-        run: ./frontend/node_modules/.bin/tauri build --bundles app
+        run: ./frontend/node_modules/.bin/tauri build --bundles ${{ matrix.bundles }}

@@ -192,12 +192,12 @@ fn correct_query(query: &str, candidates: &[RetrievedChunk]) -> String {
                 .iter()
                 // Prefilter: same first letter and comparable length, so we only
                 // run edit_distance on plausible candidates.
-                .filter(|(w, _)| {
-                    w.chars().next() == first && w.len().abs_diff(low.len()) <= maxd
-                })
+                .filter(|(w, _)| w.chars().next() == first && w.len().abs_diff(low.len()) <= maxd)
                 .filter_map(|(w, &f)| {
                     let d = edit_distance(&low, w);
-                    (1..=maxd).contains(&d).then(|| (d, std::cmp::Reverse(f), w.clone()))
+                    (1..=maxd)
+                        .contains(&d)
+                        .then(|| (d, std::cmp::Reverse(f), w.clone()))
                 })
                 .min();
             match best {
