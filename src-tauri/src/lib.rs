@@ -428,6 +428,13 @@ async fn fast_index_collection(
             "Set the Python interpreter and indexer script in Settings → Fast index (GPU).".into(),
         );
     }
+    // Keep the app-managed helper current with this build: a user who ran setup on
+    // an older version otherwise keeps the stale on-disk gpu_embed.py after an
+    // update. Only the app-managed path is refreshed, never a custom script.
+    let managed_script = state.data_dir.join("scripts").join("gpu_embed.py");
+    if std::path::Path::new(&script) == managed_script {
+        let _ = std::fs::write(&managed_script, GPU_EMBED_PY);
+    }
     // Fresh cancellation flag for this run; we kill the helper if it's set.
     state.cancel.store(false, Ordering::SeqCst);
 

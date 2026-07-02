@@ -5,7 +5,8 @@ Unlike `index_to_parquet.py`, this has NO dependency on the ebook-kb repo — it
 only needs `pymupdf`, `sentence-transformers`, and `pyarrow`, so the app can
 install it into a local venv and ship a fully self-contained fast-index path.
 
-Extract (PyMuPDF) -> token-window chunk (bge-m3 tokenizer) -> embed on MPS
+Extract (PyMuPDF) -> concatenate pages -> token-window chunk across page breaks
+(bge-m3 tokenizer, line-snapped, real char-offset loc) -> embed on MPS
 (sentence-transformers bge-m3, L2-normalized — parity-identical to the Rust
 query embedder) -> Parquet matching ls-index::store::chunk_schema.
 
@@ -13,9 +14,14 @@ query embedder) -> Parquet matching ls-index::store::chunk_schema.
 
 Per-book progress is printed to stderr as `[i/total] <title>: <n> chunks` so the
 app can parse it live.
+
+NOTE: chunk boundaries + loc metadata changed here — books indexed by an older
+build keep their old chunks until re-indexed, so re-index a collection to pick up
+the cross-page chunking.
 """
 
 import argparse
+import bisect
 import hashlib
 import pathlib
 import sys
@@ -26,6 +32,12 @@ import pyarrow.parquet as pq
 import fitz  # PyMuPDF
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
+from transformers import logging as hf_logging
+
+# Tokenizing a whole book at once trips "sequence length is longer than the
+# maximum" — expected here (we window it ourselves), so quiet it to keep the
+# stderr the app parses for progress clean.
+hf_logging.set_verbosity_error()
 
 MODEL = "BAAI/bge-m3"
 TARGET_TOKENS = 400
@@ -57,24 +69,64 @@ def extract_pages(path: pathlib.Path):
     return pages
 
 
-def chunk_pages(pages, tokenizer):
-    """Token-window chunks (~400 tokens, 80 overlap), carrying the start page."""
-    chunks = []
+def build_full_text(pages):
+    """Concatenate page texts into one stream so chunks can cross page breaks.
+    Returns (full_text, page_offsets) where page_offsets[k] = (char_offset, page_no)
+    marks where each page begins in full_text (sorted by offset)."""
+    parts, page_offsets, offset = [], [], 0
     for page_no, text in pages:
-        text = text.strip()
-        if not text:
-            continue
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        step = TARGET_TOKENS - OVERLAP_TOKENS
-        for start in range(0, len(ids), step):
-            window = ids[start : start + TARGET_TOKENS]
-            if not window:
-                break
-            chunk_text = tokenizer.decode(window).strip()
-            if chunk_text:
-                chunks.append((page_no, chunk_text))
-            if start + TARGET_TOKENS >= len(ids):
-                break
+        page_offsets.append((offset, page_no))
+        parts.append(text)
+        offset += len(text)
+        parts.append("\n")  # page separator
+        offset += 1
+    return "".join(parts), page_offsets
+
+
+def page_at(page_offsets, pos):
+    """1-based page number containing character position `pos`."""
+    if not page_offsets:
+        return 1
+    offs = [o for o, _ in page_offsets]
+    i = bisect.bisect_right(offs, pos) - 1
+    return page_offsets[max(i, 0)][1]
+
+
+# Only snap a window edge to a line break within this many characters, so normal
+# short PDF lines align cleanly but a giant no-newline paragraph doesn't collapse
+# successive windows onto the same line range.
+_SNAP_CHARS = 200
+
+
+def chunk_book(full, page_offsets, tokenizer):
+    """Token-window (~400 tok, 80 overlap) over the WHOLE book, so chunks span page
+    breaks instead of being cut at every page. Edges snap to line boundaries so a
+    chunk doesn't start/end mid-line. Returns [(loc_start, loc_end, start_page,
+    text)] with REAL character offsets (not 0)."""
+    enc = tokenizer(full, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+    n = len(offsets)
+    if n == 0:
+        return []
+    step = TARGET_TOKENS - OVERLAP_TOKENS
+    chunks, start, prev = [], 0, None
+    while start < n:
+        end = min(start + TARGET_TOKENS, n)
+        c_start = offsets[start][0]
+        c_end = offsets[end - 1][1]
+        prev_nl = full.rfind("\n", 0, c_start)
+        ls = prev_nl + 1 if (prev_nl != -1 and c_start - prev_nl <= _SNAP_CHARS) else c_start
+        next_nl = full.find("\n", c_end)
+        le = next_nl if (next_nl != -1 and next_nl - c_end <= _SNAP_CHARS) else c_end
+        if le <= ls:
+            ls, le = c_start, max(c_end, c_start + 1)
+        text = full[ls:le].strip()
+        if text and (ls, le) != prev:
+            chunks.append((ls, le, page_at(page_offsets, ls), text))
+            prev = (ls, le)
+        if end >= n:
+            break
+        start += step
     return chunks
 
 
@@ -118,7 +170,8 @@ def main() -> None:
             title = path.stem
             book_id = hashlib.sha1(str(path.resolve()).encode()).hexdigest()[:16]
             try:
-                pieces = chunk_pages(extract_pages(path), tokenizer)
+                full, page_offsets = build_full_text(extract_pages(path))
+                pieces = chunk_book(full, page_offsets, tokenizer)
             except Exception as e:  # noqa: BLE001
                 print(f"[{i}/{n}] skip (error) {p}: {e}", file=sys.stderr)
                 continue
@@ -126,7 +179,7 @@ def main() -> None:
                 print(f"[{i}/{n}] skip (no text) {p}", file=sys.stderr)
                 continue
 
-            texts = [t for _, t in pieces]
+            texts = [t for (_ls, _le, _pg, t) in pieces]
             t_book = time.perf_counter()
             vectors = model.encode(
                 texts, batch_size=args.batch, normalize_embeddings=True,
@@ -134,7 +187,7 @@ def main() -> None:
             )
             dt = time.perf_counter() - t_book
             rows = []
-            for j, ((page_no, text), vec) in enumerate(zip(pieces, vectors)):
+            for j, ((loc_start, loc_end, page_no, text), vec) in enumerate(zip(pieces, vectors)):
                 rows.append({
                     "id": f"{book_id}:{j}",
                     "book_id": book_id,
@@ -144,8 +197,8 @@ def main() -> None:
                     "format": "pdf",
                     "chapter": "",
                     "page": int(page_no),
-                    "loc_start": 0,
-                    "loc_end": 0,
+                    "loc_start": int(loc_start),
+                    "loc_end": int(loc_end),
                     "text": text,
                     "vector": [float(x) for x in vec],
                 })
