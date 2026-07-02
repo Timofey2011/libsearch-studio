@@ -1384,8 +1384,20 @@ export default function App() {
         </div>
         <label>Models folder</label>
         <input value={settings.models_dir} onChange={(e) => editSetting("models_dir", e.target.value)} />
+        <label>Data folder</label>
+        <div className="row">
+          <button onClick={revealDataFolder}>Reveal in file manager</button>
+          <span className="muted" style={{ fontSize: 12 }}>
+            Holds your index, history &amp; settings. To back up: quit the app, copy this folder.
+            Keep it off Dropbox/iCloud — sync corrupts the index.
+          </span>
+        </div>
       </div>
     );
+  }
+
+  async function revealDataFolder() {
+    await invoke("reveal_data_folder").catch((e) => setSettingsNote("Error: " + String(e)));
   }
 
   function renderHelpTab() {
