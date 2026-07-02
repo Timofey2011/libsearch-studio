@@ -1254,7 +1254,7 @@ async fn ask(
     // Whole-book / aggregative questions are answered from only a few passages, so
     // prepend an honest caveat (it streams first and is saved with the answer).
     let caveat = if is_aggregative(&question) {
-        "_Heads up: this answers from a handful of retrieved passages, not the full text, so a whole-book summary can miss things. Ask about specific topics for the most reliable answers._\n\n"
+        "*Heads up: this answers from a handful of retrieved passages, not the full text, so a whole-book summary can miss things. Ask about specific topics for the most reliable answers.*\n\n"
     } else {
         ""
     };
@@ -1297,7 +1297,7 @@ async fn ask(
                     id: new_id(),
                     conversation_id: conversation_id.clone(),
                     role: Role::Assistant,
-                    content: format!("{partial}\n\n_[answer interrupted: {msg}]_"),
+                    content: format!("{partial}\n\n*[answer interrupted: {msg}]*"),
                     citations: results.iter().map(to_citation).collect(),
                     in_tokens: 0,
                     out_tokens: 0,
