@@ -240,6 +240,10 @@ pub async fn search(
 /// Fan out a query over several collections: retrieve from each, merge into one
 /// pool, then rerank once so results from different collections compete fairly.
 /// The candidate budget is split across stores to bound rerank latency.
+/// `context` is an optional prior-turn query used only to WIDEN retrieval for an
+/// anaphoric follow-up ("why?" after a topic): its passages are merged into the
+/// candidate pool, but the rerank is still keyed on `query`, so relevance is
+/// judged against what the user actually asked now.
 pub async fn search_multi(
     stores: &[&Store],
     embedder: &mut Embedder,
@@ -247,6 +251,7 @@ pub async fn search_multi(
     query: &str,
     final_k: usize,
     hybrid_k: usize,
+    context: Option<&str>,
 ) -> Result<Vec<SearchResult>, QueryError> {
     if stores.is_empty() {
         return Ok(Vec::new());
@@ -259,6 +264,16 @@ pub async fn search_multi(
     let mut all: Vec<RetrievedChunk> = Vec::new();
     for store in stores {
         all.extend(retrieve(store, qvec.clone(), query, per).await?);
+    }
+    // Follow-up widening: also retrieve on the previous turn + current question,
+    // so "why?" still surfaces the prior topic's passages. Merged, then deduped;
+    // rerank below stays keyed on `query`.
+    if let Some(ctx) = context {
+        let augmented = format!("{ctx}\n{query}");
+        let cvec = embedder.embed_query(&augmented)?;
+        for store in stores {
+            all.extend(retrieve(store, cvec.clone(), &augmented, per).await?);
+        }
     }
     let mut seen = HashSet::new();
     all.retain(|c| seen.insert(c.id.clone()));
