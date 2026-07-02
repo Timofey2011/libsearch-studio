@@ -545,7 +545,10 @@ pub const ANTHROPIC_MODELS: &[&str] = &[
     "claude-fable-5",
 ];
 
-const ANTHROPIC_MAX_TOKENS: u32 = 2048;
+// Anthropic requires an explicit max_tokens. 2048 silently truncated long grounded
+// answers mid-sentence; 4096 comfortably covers them. Output is billed as generated,
+// so a higher cap only permits longer answers, it doesn't cost more per se.
+const ANTHROPIC_MAX_TOKENS: u32 = 4096;
 
 /// Anthropic Messages API client (cloud). The API key is supplied by the user
 /// via settings and never originates from code.
