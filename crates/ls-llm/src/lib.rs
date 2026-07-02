@@ -14,6 +14,27 @@ pub enum LlmError {
     Http(#[from] reqwest::Error),
     #[error("decode: {0}")]
     Decode(String),
+    #[error("the provider stalled — no data for {0}s (connection dropped or model too slow)")]
+    Timeout(u64),
+}
+
+/// How long to wait for the initial TCP/TLS connect before giving up. Deliberately
+/// short: a wrong host/port or an unreachable Ollama should fail fast, not hang.
+const CONNECT_TIMEOUT_SECS: u64 = 15;
+/// Idle deadline between streamed chunks. Generous so a local model's cold-load
+/// (multi-GB into RAM before the first token) isn't cut off, but bounded so a
+/// dropped connection or a wedged provider can't hang the ask forever. Reset on
+/// every chunk, so it caps the gap between tokens, not the total generation time.
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+
+/// A reqwest client with a connect timeout, shared by every provider. Streaming
+/// bodies must NOT get a request-level `.timeout()` (it would kill legitimate long
+/// generations); the per-chunk idle deadline lives in `run_stream` instead.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 const SYSTEM: &str = "You answer strictly from the numbered sources below. Cite the sources \
@@ -330,7 +351,15 @@ where
     let mut splitter = ThinkSplitter::default();
     let mut usage = Usage::default();
 
-    while let Some(chunk) = stream.next().await {
+    let idle = std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS);
+    loop {
+        // Bound the wait for the NEXT chunk (not the whole stream), so a dropped
+        // connection or a wedged model surfaces a clean timeout instead of hanging.
+        let chunk = match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_elapsed) => return Err(LlmError::Timeout(STREAM_IDLE_TIMEOUT_SECS)),
+        };
         buf.push_str(&String::from_utf8_lossy(&chunk?));
         while let Some(nl) = buf.find('\n') {
             let line: String = buf.drain(..=nl).collect();
@@ -455,7 +484,7 @@ impl OllamaClient {
     pub fn new(host: &str) -> Self {
         Self {
             base: host.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            http: http_client(),
         }
     }
 
@@ -530,7 +559,7 @@ impl AnthropicClient {
     pub fn new(api_key: &str) -> Self {
         Self {
             api_key: api_key.to_string(),
-            http: reqwest::Client::new(),
+            http: http_client(),
         }
     }
 
@@ -582,7 +611,7 @@ impl OpenAiCompatClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
-            http: reqwest::Client::new(),
+            http: http_client(),
         }
     }
 
