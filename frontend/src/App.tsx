@@ -201,6 +201,10 @@ export default function App() {
 
   // Manage operates on the first selected collection.
   const currentColl = collections.find((c) => c.id === collIds[0]) || null;
+  // A fresh user has no collection with source folders yet — show onboarding
+  // instead of the dead "ask a question" empty-state (the composer is disabled
+  // with nothing to search, which is a dead end otherwise).
+  const hasUsableLibrary = collections.some((c) => c.source_paths.length > 0);
   const collLabel =
     collIds.length === 0
       ? "Select collections"
@@ -456,6 +460,65 @@ export default function App() {
     setSavedByIdx({});
     setReader(null);
     setTokens({ in: 0, out: 0 });
+  }
+
+  function openTools(tab: ToolsTab) {
+    setToolsTab(tab);
+    setToolsOpen(true);
+  }
+
+  // First-run onboarding: a fresh user has no indexed library, so the composer is
+  // disabled and the passive empty-state is a dead end. Route them straight to the
+  // two things needed for a first answer — add+index a folder, and pick a model.
+  function renderOnboarding() {
+    const hasFolders = collections.some((c) => c.source_paths.length > 0);
+    const modelReady = !!llmStatus?.ok;
+    return (
+      <div className="onboarding">
+        <div className="onboarding-card">
+          <div className="onboarding-title">Welcome to LibSearch Studio</div>
+          <div className="onboarding-sub">
+            Chat with your own PDF &amp; ebook library — answers are grounded in your books with
+            clickable citations, and nothing leaves your machine at query time. Two quick steps to
+            your first answer:
+          </div>
+          <ol className="onboarding-steps">
+            <li className={hasFolders ? "done" : ""}>
+              <div className="step-head">
+                <span className="step-num">{hasFolders ? "✓" : "1"}</span>
+                <b>Add a folder of books and index it</b>
+              </div>
+              <div className="step-body">
+                Point LibSearch at a folder of PDFs/EPUBs; indexing builds the searchable index
+                locally (a GPU option is available for large libraries).
+                <div>
+                  <button className="primary" onClick={() => openTools("collections")}>
+                    {hasFolders ? "Manage library →" : "Add a library →"}
+                  </button>
+                </div>
+              </div>
+            </li>
+            <li className={modelReady ? "done" : ""}>
+              <div className="step-head">
+                <span className="step-num">{modelReady ? "✓" : "2"}</span>
+                <b>Choose where answers come from</b>
+              </div>
+              <div className="step-body">
+                Use local Ollama (fully offline) or add a cloud provider key. This is the model that
+                writes the grounded answer.
+                <div>
+                  <button onClick={() => openTools("synthesis")}>Pick a model →</button>
+                </div>
+              </div>
+            </li>
+          </ol>
+          <div className="onboarding-foot muted">
+            New here? The <button className="linklike" onClick={() => openTools("help")}>Help</button>{" "}
+            tab explains how retrieval and citations work.
+          </div>
+        </div>
+      </div>
+    );
   }
 
   function copyText(text: string, idx: number) {
@@ -1787,9 +1850,12 @@ export default function App() {
           <>
         {/* Transcript */}
         <div ref={scrollRef} className="transcript">
-          {messages.length === 0 && (
-            <div className="empty">Ask a question to start a conversation grounded in your library.</div>
-          )}
+          {messages.length === 0 &&
+            (hasUsableLibrary ? (
+              <div className="empty">Ask a question to start a conversation grounded in your library.</div>
+            ) : (
+              renderOnboarding()
+            ))}
           {messages.map((msg, idx) =>
             msg.role === "user" ? (
               <div key={idx} className="turn user">

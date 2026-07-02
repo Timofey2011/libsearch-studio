@@ -884,6 +884,92 @@ a:hover {
   margin-top: 28px;
   text-align: center;
 }
+
+/* First-run onboarding card (shown in the transcript when there's no library). */
+.onboarding {
+  display: flex;
+  justify-content: center;
+  padding: 32px 16px;
+}
+.onboarding-card {
+  width: 100%;
+  max-width: 560px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 22px 24px;
+}
+.onboarding-title {
+  font-size: 18px;
+  font-weight: 650;
+  margin-bottom: 6px;
+}
+.onboarding-sub {
+  color: var(--muted);
+  font-size: 13.5px;
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+.onboarding-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.onboarding-steps > li {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+}
+.onboarding-steps > li.done {
+  opacity: 0.72;
+}
+.step-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 14px;
+}
+.step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  flex: none;
+}
+.onboarding-steps > li.done .step-num {
+  background: var(--ok, #3ea66b);
+}
+.step-body {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 8px 0 0 31px;
+}
+.step-body > div {
+  margin-top: 10px;
+}
+.onboarding-foot {
+  margin-top: 16px;
+  font-size: 12.5px;
+}
+.linklike {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+}
 .turn {
   margin: 14px 0;
   display: flex;
