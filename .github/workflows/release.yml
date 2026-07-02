@@ -1,0 +1,71 @@
+name: Release
+
+# Publish a GitHub Release with the packaged .dmg whenever a version tag is pushed.
+#   git tag -a v0.5.9 -m "LibSearch Studio v0.5.9" && git push origin v0.5.9
+# The release body is the tagged commit's message + install/Gatekeeper notes + a
+# SHA-256 of the dmg. Builds on an Apple-Silicon runner (arm64 .dmg).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create releases + upload assets
+
+jobs:
+  release:
+    runs-on: macos-latest # Apple Silicon → arm64 build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install protoc
+        run: brew install protobuf
+      - run: pnpm --dir frontend install --frozen-lockfile
+
+      # Run the Tauri CLI from the repo root so src-tauri/ is discoverable.
+      - name: Build app bundle
+        run: ./frontend/node_modules/.bin/tauri build --bundles app
+
+      # hdiutil-only dmg (tauri's own dmg target needs Finder automation, which
+      # fails on a headless runner).
+      - name: Package .dmg
+        run: ./scripts/make_dmg.sh
+
+      - name: Assemble release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          DMG=$(ls target/release/bundle/dmg/*_arm64.dmg | head -1)
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+          SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
+          {
+            # The tagged commit's body is the human-written release notes.
+            git tag -l --format='%(contents:body)' "${GITHUB_REF_NAME}"
+            echo
+            echo '### Install (macOS, Apple Silicon)'
+            echo
+            echo 'Open the `.dmg` and drag **LibSearch Studio** to Applications. This build is **not notarized**, so on first launch macOS blocks it as coming from an unidentified developer — **right-click the app → Open**, then confirm. (Or clear quarantine: `xattr -dr com.apple.quarantine "/Applications/LibSearch Studio.app"`.)'
+            echo
+            echo 'First run walks you through adding a library and downloading the local search models.'
+            echo
+            echo '```'
+            echo "SHA-256  $SHA"
+            echo '```'
+          } > RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.notes.outputs.dmg }}
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true

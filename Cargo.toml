@@ -18,7 +18,7 @@ version = "0.5.9"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
-repository = "https://github.com/timofey/libsearch-studio"
+repository = "https://github.com/Timofey2011/libsearch-studio"
 
 [workspace.dependencies]
 ls-core = { path = "crates/ls-core" }
