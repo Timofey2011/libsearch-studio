@@ -1373,11 +1373,13 @@ export default function App() {
           />
         </div>
         <div style={{ marginTop: 10 }}>
-          <button onClick={runSetup} disabled={settingUp} title="Create a local venv, install deps, and download/export the models">
-            {settingUp ? "Setting up…" : "Set up GPU indexing (auto)"}
+          <button onClick={runSetup} disabled={settingUp} title="Create a local venv, install deps, and download/export the search models">
+            {settingUp ? "Setting up…" : "Set up search models (auto)"}
           </button>
           <div className="muted" style={{ marginTop: 6 }}>
-            One-click: local venv + models. Downloads several GB; restart after it finishes.
+            Required to index &amp; search: downloads the ONNX embedding models (and enables GPU
+            indexing) into a local venv (several GB). Ready to index &amp; ask as soon as it finishes —
+            no restart needed.
           </div>
           {setupLog.length > 0 && <pre className="setup-log">{setupLog.join("\n")}</pre>}
         </div>

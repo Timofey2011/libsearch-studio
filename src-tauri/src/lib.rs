@@ -53,7 +53,9 @@ struct Engine {
 
 struct AppState {
     data_dir: PathBuf,
-    models_dir: PathBuf,
+    // Behind a mutex so one-click setup can point it at the freshly provisioned
+    // models without an app restart (the lazily-loaded engine is reset too).
+    models_dir: std::sync::Mutex<PathBuf>,
     // Settings and the LLM client are editable at runtime (Settings UI), so both
     // sit behind plain mutexes; values are cloned out before any await.
     settings: std::sync::Mutex<ls_app::Settings>,
@@ -66,6 +68,9 @@ struct AppState {
 impl AppState {
     fn db(&self) -> Result<Db, String> {
         Db::open(self.data_dir.join("app.db")).map_err(|e| e.to_string())
+    }
+    fn models_dir(&self) -> PathBuf {
+        self.models_dir.lock().unwrap().clone()
     }
     fn settings(&self) -> ls_app::Settings {
         self.settings.lock().unwrap().clone()
@@ -108,6 +113,14 @@ fn reranker_dir(models: &Path) -> PathBuf {
     } else {
         models.join("bge-reranker-v2-m3")
     }
+}
+
+/// A load failure for the ONNX search models almost always means they aren't
+/// provisioned yet (a fresh install, or a moved models dir) — point the user at
+/// setup instead of surfacing a raw ONNX/tokenizer/file error. Shared by the
+/// index and ask paths.
+fn models_missing(e: impl std::fmt::Display) -> String {
+    format!("The search models aren't set up yet — open Settings → Indexing → Set up to download them. ({e})")
 }
 
 #[tauri::command]
@@ -220,7 +233,7 @@ async fn index_collection(
         return Err("no PDF files found under the collection's source paths".into());
     }
 
-    let models_dir = state.models_dir.clone();
+    let models_dir = state.models_dir();
     let data_dir = state.data_dir.clone();
     let w = window.clone();
     // Fresh cancellation flag for this run; the loop polls it between files.
@@ -243,9 +256,9 @@ async fn index_collection(
             .map_err(|e| e.to_string())?;
         rt.block_on(async move {
             let mut embedder =
-                Embedder::load(models_dir.join("bge-m3")).map_err(|e| e.to_string())?;
+                Embedder::load(models_dir.join("bge-m3")).map_err(models_missing)?;
             let counter =
-                BgeTokenCounter::load(models_dir.join("bge-m3")).map_err(|e| e.to_string())?;
+                BgeTokenCounter::load(models_dir.join("bge-m3")).map_err(models_missing)?;
             let svc = Service::new(&data_dir).map_err(|e| e.to_string())?;
             svc.index_collection(
                 &coll,
@@ -739,9 +752,13 @@ async fn setup_gpu_indexing(
             .map_err(|e| e.to_string())?;
         *state.settings.lock().unwrap() = s;
     }
+    // Point the running app at the freshly provisioned models and drop the
+    // lazily-loaded engine so the next ask/index reloads them — no restart needed.
+    *state.models_dir.lock().unwrap() = models_dir;
+    *state.engine.lock().await = None;
     let _ = window.emit(
         "setup-log",
-        "✓ Setup complete. Restart the app to load the new models.".to_string(),
+        "✓ Setup complete — models ready. You can index and ask now.".to_string(),
     );
     Ok(())
 }
@@ -1166,13 +1183,9 @@ async fn ask(
     // so point them at setup instead of surfacing a raw ONNX/file error.
     let mut guard = state.engine.lock().await;
     if guard.is_none() {
-        let models_hint = |e: String| {
-            format!("The search models aren't set up yet — open Settings → Indexing → Set up to download them. ({e})")
-        };
-        let embedder = Embedder::load(state.models_dir.join("bge-m3"))
-            .map_err(|e| models_hint(e.to_string()))?;
-        let reranker =
-            Reranker::load(reranker_dir(&state.models_dir)).map_err(|e| models_hint(e.to_string()))?;
+        let models_dir = state.models_dir();
+        let embedder = Embedder::load(models_dir.join("bge-m3")).map_err(models_missing)?;
+        let reranker = Reranker::load(reranker_dir(&models_dir)).map_err(models_missing)?;
         *guard = Some(Engine { embedder, reranker });
     }
     let engine = guard.as_mut().unwrap();
@@ -1695,7 +1708,7 @@ fn init_state() -> AppState {
     let llm = build_llm(&settings);
     AppState {
         data_dir,
-        models_dir,
+        models_dir: std::sync::Mutex::new(models_dir),
         settings: std::sync::Mutex::new(settings),
         llm: std::sync::Mutex::new(llm),
         engine: Mutex::new(None),
@@ -1721,7 +1734,7 @@ pub fn run() {
             // doesn't pay the ONNX load cost.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let models = handle.state::<AppState>().models_dir.clone();
+                let models = handle.state::<AppState>().models_dir();
                 let loaded = tauri::async_runtime::spawn_blocking(move || {
                     let e = Embedder::load(models.join("bge-m3")).ok()?;
                     let r = Reranker::load(reranker_dir(&models)).ok()?;
