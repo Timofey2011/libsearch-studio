@@ -835,6 +835,40 @@ async fn reveal_data_folder(state: State<'_, AppState>) -> Result<String, String
 }
 
 #[derive(serde::Serialize)]
+struct DataSafety {
+    at_risk: bool,
+    provider: String,
+    path: String,
+}
+
+/// Warn if the app's data dir or any collection's index sits on a cloud-sync
+/// mount (Dropbox/iCloud/…), which silently corrupts LanceDB + SQLite. Only the
+/// index/data paths are checked — a user's source book folders may be synced.
+#[tauri::command]
+async fn data_safety(state: State<'_, AppState>) -> Result<DataSafety, String> {
+    let mut paths: Vec<PathBuf> = vec![state.data_dir.clone()];
+    if let Ok(db) = state.db() {
+        if let Ok(colls) = db.list_collections() {
+            paths.extend(colls.into_iter().map(|c| PathBuf::from(c.db_path)));
+        }
+    }
+    for p in paths {
+        if let Some(provider) = ls_app::cloud_sync_provider(&p) {
+            return Ok(DataSafety {
+                at_risk: true,
+                provider: provider.to_string(),
+                path: p.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    Ok(DataSafety {
+        at_risk: false,
+        provider: String::new(),
+        path: String::new(),
+    })
+}
+
+#[derive(serde::Serialize)]
 struct LlmStatus {
     ok: bool,
     message: String,
@@ -1000,6 +1034,62 @@ async fn delete_conversation(
         .map_err(|e| e.to_string())
 }
 
+/// A short or pronoun-led question is probably a follow-up ("why?", "what about
+/// Redis?") that reads as noise on its own, so retrieval should also see the prior
+/// turn. Tight enough not to fire on a real short question like "how does TLS work".
+fn looks_anaphoric(q: &str) -> bool {
+    let words: Vec<&str> = q.split_whitespace().collect();
+    match words.len() {
+        0 => false,
+        1..=3 => true,
+        n if n <= 6 => {
+            let first = words[0]
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            matches!(
+                first.as_str(),
+                "why" | "and" | "so" | "it" | "its" | "they" | "them" | "this" | "that"
+                    | "those" | "these" | "he" | "she"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Whether a question asks for a whole-book / aggregative answer ("summarize this
+/// book", "main themes"), which RAG serves from a handful of passages and so can
+/// misrepresent — we attach an honest caveat. Localized asks ("summarize chapter
+/// 3") are excluded, since a few passages can genuinely cover them.
+fn is_aggregative(q: &str) -> bool {
+    let l = q.to_lowercase();
+    let localized = ["chapter", "section", "page ", "paragraph", "figure ", "table "]
+        .iter()
+        .any(|w| l.contains(w));
+    if localized {
+        return false;
+    }
+    const PATTERNS: &[&str] = &[
+        "summariz",
+        "summaris",
+        "main point",
+        "main theme",
+        "main idea",
+        "key idea",
+        "key takeaway",
+        "key point",
+        "overview",
+        "what is this book about",
+        "what's this book about",
+        "what is the book about",
+        "tl;dr",
+        "table of contents",
+        "the whole book",
+        "entire book",
+        "gist of",
+    ];
+    PATTERNS.iter().any(|p| l.contains(p))
+}
+
 #[tauri::command]
 async fn ask(
     state: State<'_, AppState>,
@@ -1089,6 +1179,19 @@ async fn ask(
                 .map_err(|e| e.to_string())?,
         );
     }
+    // Follow-up widening: if the question is anaphoric/short, feed the previous
+    // user turn as retrieval context so it isn't searched in isolation.
+    let prior_user = history
+        .iter()
+        .rev()
+        .find(|t| t.role == "user")
+        .map(|t| t.content.clone());
+    let context = if looks_anaphoric(&question) {
+        prior_user.as_deref()
+    } else {
+        None
+    };
+
     let store_refs: Vec<&Store> = stores.iter().collect();
     let mut results = search_multi(
         &store_refs,
@@ -1097,6 +1200,7 @@ async fn ask(
         &question,
         settings.final_top_k,
         settings.hybrid_top_k,
+        context,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1107,11 +1211,14 @@ async fn ask(
     // answer from loosely-related passages instead of nothing. Pure-noise queries
     // (scores ~0) still fall below even the loose floor and yield no sources.
     let has_confident = results.iter().any(|r| r.score >= settings.min_relevance);
+    // Provenance: true when we answered only from the fuzzy fallback tier, so the
+    // UI can flag the answer as lower-confidence.
+    let loose = !has_confident;
     if has_confident {
         results.retain(|r| r.score >= settings.min_relevance);
     } else {
-        let loose = (settings.min_relevance * 0.25).clamp(0.02, 0.06);
-        results.retain(|r| r.score >= loose);
+        let floor = (settings.min_relevance * 0.25).clamp(0.02, 0.06);
+        results.retain(|r| r.score >= floor);
         results.truncate(settings.final_top_k);
     }
     for (i, r) in results.iter_mut().enumerate() {
@@ -1135,18 +1242,31 @@ async fn ask(
         return Ok(results);
     }
 
+    // Flag lower-confidence (fuzzy-tier) provenance to the UI.
+    let _ = window.emit("ask-provenance", loose);
+
     let model = if model.trim().is_empty() {
         settings.default_model()
     } else {
         model
     };
     let prompt = build_prompt_with_history(&question, &results, &history);
+    // Whole-book / aggregative questions are answered from only a few passages, so
+    // prepend an honest caveat (it streams first and is saved with the answer).
+    let caveat = if is_aggregative(&question) {
+        "_Heads up: this answers from a handful of retrieved passages, not the full text, so a whole-book summary can miss things. Ask about specific topics for the most reliable answers._\n\n"
+    } else {
+        ""
+    };
+    if !caveat.is_empty() {
+        let _ = window.emit("ask-token", caveat.to_string());
+    }
     let w = window.clone();
     let wr = window.clone();
-    // Accumulate the streamed answer as it arrives, so if generation errors or
-    // times out mid-stream we can still persist what the user already saw instead
-    // of dropping a nearly-complete answer from the conversation.
-    let acc = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    // Accumulate the streamed answer as it arrives (seeded with any caveat), so if
+    // generation errors or times out mid-stream we can still persist what the user
+    // already saw instead of dropping a nearly-complete answer.
+    let acc = std::sync::Arc::new(std::sync::Mutex::new(caveat.to_string()));
     let acc_tok = acc.clone();
     let gen = state
         .llm()
@@ -1189,12 +1309,13 @@ async fn ask(
         }
     };
 
-    // Persist the assistant turn with its grounding citations + token usage.
+    // Persist the assistant turn (including any caveat that streamed first) with
+    // its grounding citations + token usage.
     db.add_message(&Message {
         id: new_id(),
         conversation_id: conversation_id.clone(),
         role: Role::Assistant,
-        content: answer,
+        content: format!("{caveat}{answer}"),
         citations: results.iter().map(to_citation).collect(),
         in_tokens: usage.in_tokens,
         out_tokens: usage.out_tokens,
@@ -1634,6 +1755,7 @@ pub fn run() {
             probe_provider,
             warm_model,
             reveal_data_folder,
+            data_safety,
             check_llm,
             get_settings,
             save_settings,
@@ -1646,4 +1768,45 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_aggregative, looks_anaphoric};
+
+    #[test]
+    fn anaphoric_detection() {
+        // Short / pronoun-led follow-ups.
+        for q in ["why?", "and then?", "what about Redis", "why does that matter"] {
+            assert!(looks_anaphoric(q), "{q:?} should look anaphoric");
+        }
+        // Real standalone questions are not follow-ups.
+        for q in [
+            "how do event-driven microservices communicate",
+            "summarize the main points of this book",
+            "explain idempotence in distributed systems",
+        ] {
+            assert!(!looks_anaphoric(q), "{q:?} should NOT look anaphoric");
+        }
+    }
+
+    #[test]
+    fn aggregative_detection() {
+        for q in [
+            "summarize this book",
+            "what are the main themes",
+            "give me an overview",
+            "what is this book about",
+        ] {
+            assert!(is_aggregative(q), "{q:?} should be aggregative");
+        }
+        // Localized asks and specific questions are not whole-book aggregation.
+        for q in [
+            "summarize chapter 3's argument",
+            "what does section 2 say about locks",
+            "how does the saga pattern work",
+        ] {
+            assert!(!is_aggregative(q), "{q:?} should NOT be aggregative");
+        }
+    }
 }
