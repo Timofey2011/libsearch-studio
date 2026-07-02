@@ -58,9 +58,34 @@ pub fn build_prompt(question: &str, results: &[SearchResult]) -> String {
     build_prompt_with_history(question, results, &[])
 }
 
+/// Reserve this many tokens of the context window for the model's output, so a
+/// long prompt can't crowd out the answer.
+const OUTPUT_HEADROOM_TOKENS: u32 = 2048;
+
+/// Rough token budget for the assembled prompt: the context window minus output
+/// headroom, times a safety margin (our char-based estimate is approximate).
+fn prompt_token_budget() -> usize {
+    ((NUM_CTX.saturating_sub(OUTPUT_HEADROOM_TOKENS)) as f32 * 0.9) as usize
+}
+
+/// Cheap, dependency-free token estimate. English ≈ chars/4; Cyrillic BPE-fragments
+/// roughly twice as hard, so use a smaller divisor when the text is substantially
+/// Cyrillic (this app targets mixed EN+RU libraries).
+fn estimate_tokens(s: &str) -> usize {
+    let total = s.chars().count();
+    if total == 0 {
+        return 0;
+    }
+    let cyrillic = s.chars().filter(|c| ('\u{0400}'..='\u{04FF}').contains(c)).count();
+    let divisor = if cyrillic * 5 >= total { 2.5 } else { 4.0 };
+    ((total as f32) / divisor).ceil() as usize
+}
+
 /// Like [`build_prompt`] but prepends recent conversation turns so the model can
 /// resolve follow-ups ("what about X?"). Retrieval still targets the current
-/// question; history is context only, not a source to cite.
+/// question; history is context only, not a source to cite. If the assembled
+/// prompt would exceed the context budget, the OLDEST history turns are dropped
+/// first — the grounding sources and the question are never trimmed.
 pub fn build_prompt_with_history(
     question: &str,
     results: &[SearchResult],
@@ -71,26 +96,39 @@ pub fn build_prompt_with_history(
         sources.push_str(&format!("[{}] {}\n{}\n\n", r.rank, r.citation, r.text));
     }
 
-    let mut convo = String::new();
+    // Most-recent window, each turn truncated (unchanged default behaviour).
     let start = history.len().saturating_sub(MAX_HISTORY_TURNS);
-    for turn in &history[start..] {
-        let speaker = if turn.role == "assistant" {
-            "Assistant"
+    let mut window: Vec<(&str, String)> = history[start..]
+        .iter()
+        .map(|turn| {
+            let speaker = if turn.role == "assistant" { "Assistant" } else { "User" };
+            (speaker, truncate(&turn.content, MAX_TURN_CHARS))
+        })
+        .collect();
+
+    let assemble = |turns: &[(&str, String)]| -> String {
+        let mut convo = String::new();
+        for (speaker, content) in turns {
+            convo.push_str(&format!("{speaker}: {content}\n"));
+        }
+        let history_block = if convo.is_empty() {
+            String::new()
         } else {
-            "User"
+            format!("Conversation so far:\n{convo}\n")
         };
-        let content = truncate(&turn.content, MAX_TURN_CHARS);
-        convo.push_str(&format!("{speaker}: {content}\n"));
-    }
-    let history_block = if convo.is_empty() {
-        String::new()
-    } else {
-        format!("Conversation so far:\n{convo}\n")
+        format!(
+            "{SYSTEM}\n\n{history_block}Sources:\n{sources}\nQuestion: {question}\nAnswer (with [n] citations):"
+        )
     };
 
-    format!(
-        "{SYSTEM}\n\n{history_block}Sources:\n{sources}\nQuestion: {question}\nAnswer (with [n] citations):"
-    )
+    // Drop oldest history turns until the prompt fits the budget (or none remain).
+    let budget = prompt_token_budget();
+    let mut prompt = assemble(&window);
+    while !window.is_empty() && estimate_tokens(&prompt) > budget {
+        window.remove(0);
+        prompt = assemble(&window);
+    }
+    prompt
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -717,6 +755,22 @@ impl Llm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_estimate_is_script_aware() {
+        // Latin ≈ chars/4.
+        assert_eq!(estimate_tokens(&"a".repeat(40)), 10);
+        // Substantially Cyrillic text uses the smaller divisor (~chars/2.5).
+        let ru = "экономика".repeat(5); // 45 Cyrillic chars
+        assert!(estimate_tokens(&ru) > (ru.chars().count() / 4));
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn prompt_budget_leaves_output_headroom() {
+        assert!(prompt_token_budget() < NUM_CTX as usize);
+        assert!(prompt_token_budget() > 8000);
+    }
 
     #[test]
     fn chat_model_filter() {
