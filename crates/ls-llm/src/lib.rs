@@ -84,11 +84,56 @@ fn estimate_tokens(s: &str) -> usize {
     ((total as f32) / divisor).ceil() as usize
 }
 
+/// Strip `[n]` / `[n, m]` citation markers from a prior ASSISTANT answer. Their
+/// numbering refers to THAT turn's retrieval, which collides with the current
+/// Sources block — the model can echo a stale `[3]` that now maps to an unrelated
+/// snippet. Only applied to assistant-role text (and digest lines derived from
+/// it); user text is never touched, so "[1984]" or "[2]" list references in a
+/// question survive verbatim.
+fn strip_citation_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            // Match [digits, commas, spaces] with at least one digit.
+            let mut j = i + 1;
+            let mut digits = false;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == ',' || chars[j] == ' ')
+            {
+                digits |= chars[j].is_ascii_digit();
+                j += 1;
+            }
+            if digits && j < chars.len() && chars[j] == ']' {
+                i = j + 1; // skip the whole marker
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Collapse a turn to a single line (digest lines must stay one-per-turn).
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Earlier-topics digest caps: turns older than the recent window are compressed
+/// to one-liners instead of being hard-dropped, bounded so a very long
+/// conversation can't crowd out grounding.
+const DIGEST_USER_CHARS: usize = 150;
+const DIGEST_ASSISTANT_CHARS: usize = 250;
+const DIGEST_TOKEN_CAP: usize = 800;
+
 /// Like [`build_prompt`] but prepends recent conversation turns so the model can
 /// resolve follow-ups ("what about X?"). Retrieval still targets the current
-/// question; history is context only, not a source to cite. If the assembled
-/// prompt would exceed the context budget, the OLDEST history turns are dropped
-/// first — the grounding sources and the question are never trimmed.
+/// question; history is context only, not a source to cite. Turns older than the
+/// recent window are compressed into an "Earlier in this conversation" digest of
+/// one-liners (capped) instead of vanishing. If the assembled prompt would exceed
+/// the context budget, digest lines are shed first (oldest first), then full
+/// turns — the grounding sources and the question are never trimmed.
 pub fn build_prompt_with_history(
     question: &str,
     results: &[SearchResult],
@@ -99,41 +144,78 @@ pub fn build_prompt_with_history(
         sources.push_str(&format!("[{}] {}\n{}\n\n", r.rank, r.citation, r.text));
     }
 
-    // Most-recent window, each turn truncated (unchanged default behaviour).
     let start = history.len().saturating_sub(MAX_HISTORY_TURNS);
+
+    // Older turns → one-line digest (chronological; oldest shed first to fit).
+    let mut digest: Vec<String> = history[..start]
+        .iter()
+        .map(|turn| {
+            if turn.role == "assistant" {
+                let text = strip_citation_markers(&turn.content);
+                format!(
+                    "- Assistant: {}",
+                    truncate(&one_line(&text), DIGEST_ASSISTANT_CHARS)
+                )
+            } else {
+                format!(
+                    "- User: {}",
+                    truncate(&one_line(&turn.content), DIGEST_USER_CHARS)
+                )
+            }
+        })
+        .collect();
+    while digest.iter().map(|l| estimate_tokens(l)).sum::<usize>() > DIGEST_TOKEN_CAP {
+        digest.remove(0);
+    }
+
+    // Most-recent window, each turn truncated. Assistant turns lose their stale
+    // [n] markers; user turns are verbatim.
     let mut window: Vec<(&str, String)> = history[start..]
         .iter()
         .map(|turn| {
-            let speaker = if turn.role == "assistant" {
-                "Assistant"
+            if turn.role == "assistant" {
+                (
+                    "Assistant",
+                    truncate(&strip_citation_markers(&turn.content), MAX_TURN_CHARS),
+                )
             } else {
-                "User"
-            };
-            (speaker, truncate(&turn.content, MAX_TURN_CHARS))
+                ("User", truncate(&turn.content, MAX_TURN_CHARS))
+            }
         })
         .collect();
 
-    let assemble = |turns: &[(&str, String)]| -> String {
-        let mut convo = String::new();
-        for (speaker, content) in turns {
-            convo.push_str(&format!("{speaker}: {content}\n"));
+    let assemble = |digest: &[String], turns: &[(&str, String)]| -> String {
+        let mut context = String::new();
+        if !digest.is_empty() {
+            context.push_str("Earlier in this conversation:\n");
+            for line in digest {
+                context.push_str(line);
+                context.push('\n');
+            }
+            context.push('\n');
         }
-        let history_block = if convo.is_empty() {
-            String::new()
-        } else {
-            format!("Conversation so far:\n{convo}\n")
-        };
+        if !turns.is_empty() {
+            context.push_str("Conversation so far:\n");
+            for (speaker, content) in turns {
+                context.push_str(&format!("{speaker}: {content}\n"));
+            }
+            context.push('\n');
+        }
         format!(
-            "{SYSTEM}\n\n{history_block}Sources:\n{sources}\nQuestion: {question}\nAnswer (with [n] citations):"
+            "{SYSTEM}\n\n{context}Sources:\n{sources}\nQuestion: {question}\nAnswer (with [n] citations):"
         )
     };
 
-    // Drop oldest history turns until the prompt fits the budget (or none remain).
+    // Shed digest lines first, then oldest full turns, until the prompt fits.
     let budget = prompt_token_budget();
-    let mut prompt = assemble(&window);
-    while !window.is_empty() && estimate_tokens(&prompt) > budget {
-        window.remove(0);
-        prompt = assemble(&window);
+    let mut prompt = assemble(&digest, &window);
+    while estimate_tokens(&prompt) > budget && (!digest.is_empty() || !window.is_empty()) {
+        if !digest.is_empty() {
+            digest.remove(0);
+        } else {
+            window.remove(0);
+        }
+        prompt = assemble(&digest, &window);
     }
     prompt
 }
@@ -764,6 +846,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strips_assistant_citation_markers_only() {
+        // Single + multi-number markers vanish from assistant text.
+        assert_eq!(
+            strip_citation_markers("Sagas coordinate [1] transactions [2, 3]."),
+            "Sagas coordinate  transactions ."
+        );
+        // Non-citation brackets survive: words, code, years-with-letters.
+        assert_eq!(strip_citation_markers("array[i] and [TODO]"), "array[i] and [TODO]");
+        // Digits-only brackets ARE markers by the UI's own definition ([1984]
+        // renders as a citation link in assistant messages), so they strip too.
+        assert_eq!(strip_citation_markers("in [1984] it"), "in  it");
+        assert_eq!(strip_citation_markers("no brackets"), "no brackets");
+    }
+
+    fn turn(role: &str, content: &str) -> HistoryTurn {
+        HistoryTurn {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn digest_covers_old_turns_and_history_strips_markers() {
+        // 8 turns: the first 2 fall outside the 6-turn window -> digest.
+        let mut history = vec![
+            turn("user", "tell me about sagas"),
+            turn("assistant", "Sagas [1] split transactions [2]."),
+        ];
+        for i in 0..3 {
+            history.push(turn("user", &format!("follow-up {i}")));
+            history.push(turn("assistant", &format!("answer {i} [1]")));
+        }
+        let prompt = build_prompt_with_history("next question", &[], &history);
+        // Old turns appear as digest one-liners, stripped of markers.
+        assert!(prompt.contains("Earlier in this conversation:"));
+        assert!(prompt.contains("- User: tell me about sagas"));
+        // one_line() collapses the whitespace left by stripping.
+        assert!(prompt.contains("- Assistant: Sagas split transactions ."));
+        // Recent assistant turns are marker-free too; user turns verbatim.
+        assert!(prompt.contains("Assistant: answer 2 \n") || prompt.contains("Assistant: answer 2"));
+        assert!(!prompt.contains("answer 2 [1]"));
+        assert!(prompt.contains("User: follow-up 2"));
+    }
+
+    #[test]
+    fn short_history_has_no_digest() {
+        let history = vec![turn("user", "q1"), turn("assistant", "a1 [1]")];
+        let prompt = build_prompt_with_history("q2", &[], &history);
+        assert!(!prompt.contains("Earlier in this conversation:"));
+        assert!(prompt.contains("User: q1"));
+        assert!(!prompt.contains("[1]")); // assistant marker stripped
+    }
+
+    #[test]
     fn token_estimate_is_script_aware() {
         // Latin ≈ chars/4.
         assert_eq!(estimate_tokens(&"a".repeat(40)), 10);
@@ -882,7 +1018,9 @@ mod tests {
         );
         assert!(p.contains("Conversation so far:"));
         assert!(p.contains("User: what are coroutines?"));
-        assert!(p.contains("Assistant: Lightweight threads [1]."));
+        // The assistant turn's stale [1] marker is stripped (it referred to that
+        // turn's own retrieval, which would collide with the current Sources).
+        assert!(p.contains("Assistant: Lightweight threads ."));
         assert!(p.contains("how do they differ from threads?"));
         // No history -> no conversation block.
         assert!(!build_prompt("q", &[]).contains("Conversation so far"));
