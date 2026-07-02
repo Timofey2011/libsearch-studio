@@ -1117,20 +1117,51 @@ async fn ask(
     let prompt = build_prompt_with_history(&question, &results, &history);
     let w = window.clone();
     let wr = window.clone();
-    let (answer, usage) = state
+    // Accumulate the streamed answer as it arrives, so if generation errors or
+    // times out mid-stream we can still persist what the user already saw instead
+    // of dropping a nearly-complete answer from the conversation.
+    let acc = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let acc_tok = acc.clone();
+    let gen = state
         .llm()
         .generate_stream(
             &model,
             &prompt,
-            |tok| {
+            move |tok| {
+                if let Ok(mut s) = acc_tok.lock() {
+                    s.push_str(tok);
+                }
                 let _ = w.emit("ask-token", tok.to_string());
             },
-            |think| {
+            move |think| {
                 let _ = wr.emit("ask-reasoning", think.to_string());
             },
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
+
+    let (answer, usage) = match gen {
+        Ok(ok) => ok,
+        Err(e) => {
+            // Persist whatever streamed so far, flagged as interrupted, so a long
+            // answer that fails near the end doesn't vanish from history.
+            let partial = acc.lock().map(|s| s.clone()).unwrap_or_default();
+            let msg = e.to_string();
+            if !partial.trim().is_empty() {
+                let _ = db.add_message(&Message {
+                    id: new_id(),
+                    conversation_id: conversation_id.clone(),
+                    role: Role::Assistant,
+                    content: format!("{partial}\n\n_[answer interrupted: {msg}]_"),
+                    citations: results.iter().map(to_citation).collect(),
+                    in_tokens: 0,
+                    out_tokens: 0,
+                });
+            }
+            // The frontend surfaces the failure from this Err (it appends the error
+            // to the already-streamed text); no separate event needed.
+            return Err(msg);
+        }
+    };
 
     // Persist the assistant turn with its grounding citations + token usage.
     db.add_message(&Message {
