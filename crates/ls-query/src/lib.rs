@@ -237,6 +237,62 @@ pub async fn search(
     rerank(reranker, query, candidates, final_k)
 }
 
+/// Cosine floor for semantic follow-up fusion: below this, the current question
+/// and the prior user turn are treated as a topic switch (no widening).
+///
+/// Calibrated empirically against bge-m3 (fp32) via tests/fusion_fixtures.rs
+/// (`cargo test -p ls-query --features models -- --nocapture`): related EN/RU
+/// follow-ups measured 0.337–0.564, clean topic switches 0.222–0.321, with one
+/// in-domain gray case (saga → JVM tuning) at 0.352. The threshold errs toward
+/// fusing because the costs are asymmetric: a false fuse only MERGES candidate
+/// pools (rerank stays keyed on the current question, so noise loses), while a
+/// false no-fuse leaves a follow-up retrieving off-topic — the bug being fixed.
+pub const FUSION_COSINE_THRESHOLD: f32 = 0.33;
+
+/// Is the question led by a pronoun/connective that implies it leans on the
+/// previous turn ("why", "and then", "how does it work")?
+pub fn pronoun_led(q: &str) -> bool {
+    let first = q
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    matches!(
+        first.as_str(),
+        "why"
+            | "and"
+            | "so"
+            | "it"
+            | "its"
+            | "they"
+            | "them"
+            | "this"
+            | "that"
+            | "those"
+            | "these"
+            | "he"
+            | "she"
+    )
+}
+
+/// Tiered gate: should retrieval for `question` be widened with the prior user
+/// turn? `cosine` is invoked ONLY when the tier needs semantic similarity, so
+/// short/pronoun-led follow-ups cost nothing extra.
+/// - ≤3 words: always fuse (too short to stand alone).
+/// - 4–12 words: fuse if pronoun/connective-led, else if cosine ≥ threshold.
+/// - 13+ words: cosine only (long questions usually stand alone; fuse only on
+///   strong semantic continuity).
+pub fn should_fuse_followup(question: &str, cosine: impl FnOnce() -> Option<f32>) -> bool {
+    let words = question.split_whitespace().count();
+    match words {
+        0 => false,
+        1..=3 => true,
+        4..=12 if pronoun_led(question) => true,
+        _ => matches!(cosine(), Some(c) if c >= FUSION_COSINE_THRESHOLD),
+    }
+}
+
 /// Fan out a query over several collections: retrieve from each, merge into one
 /// pool, then rerank once so results from different collections compete fairly.
 /// The candidate budget is split across stores to bound rerank latency.
@@ -244,6 +300,9 @@ pub async fn search(
 /// anaphoric follow-up ("why?" after a topic): its passages are merged into the
 /// candidate pool, but the rerank is still keyed on `query`, so relevance is
 /// judged against what the user actually asked now.
+/// `precomputed_qvec` lets the caller reuse an embedding of `query` it already
+/// computed (e.g. for the fusion gate's cosine) instead of embedding twice.
+#[allow(clippy::too_many_arguments)]
 pub async fn search_multi(
     stores: &[&Store],
     embedder: &mut Embedder,
@@ -252,6 +311,7 @@ pub async fn search_multi(
     final_k: usize,
     hybrid_k: usize,
     context: Option<&str>,
+    precomputed_qvec: Option<Vec<f32>>,
 ) -> Result<Vec<SearchResult>, QueryError> {
     if stores.is_empty() {
         return Ok(Vec::new());
@@ -260,7 +320,10 @@ pub async fn search_multi(
     // contributes), so the rerank pool stays ~hybrid_k regardless of N.
     let per = (hybrid_k / stores.len()).max(6);
 
-    let qvec = embedder.embed_query(query)?;
+    let qvec = match precomputed_qvec {
+        Some(v) => v,
+        None => embedder.embed_query(query)?,
+    };
     let mut all: Vec<RetrievedChunk> = Vec::new();
     for store in stores {
         all.extend(retrieve(store, qvec.clone(), query, per).await?);
@@ -319,6 +382,34 @@ mod tests {
         assert_eq!(edit_distance("investmenet", "investment"), 1);
         assert_eq!(edit_distance("kitten", "sitting"), 3);
         assert_eq!(edit_distance("same", "same"), 0);
+    }
+
+    #[test]
+    fn fusion_gate_tiers() {
+        let no_cosine = || -> Option<f32> { panic!("cosine must not be called for this tier") };
+        // ≤3 words: always fuse, cosine never invoked.
+        assert!(should_fuse_followup("why?", no_cosine));
+        assert!(should_fuse_followup("what about Redis", no_cosine));
+        // 4–12 words, pronoun-led: fuse without cosine.
+        assert!(should_fuse_followup("why does that matter here", no_cosine));
+        assert!(should_fuse_followup("and how does it compare", no_cosine));
+        // 4–12 words, not pronoun-led: cosine decides.
+        assert!(should_fuse_followup(
+            "how does compensation work exactly",
+            || Some(0.7)
+        ));
+        assert!(!should_fuse_followup("how do I tune the JVM", || Some(0.2)));
+        // 13+ words: cosine only, even if pronoun-led.
+        let long = "why would the described consensus protocol fail when the network partitions into three segments";
+        assert!(should_fuse_followup(long, || Some(0.8)));
+        assert!(!should_fuse_followup(long, || Some(0.1)));
+        // Cosine unavailable (embed error) → don't fuse.
+        assert!(!should_fuse_followup(
+            "how does compensation work exactly",
+            || None
+        ));
+        // Empty: never.
+        assert!(!should_fuse_followup("", no_cosine));
     }
 
     #[test]

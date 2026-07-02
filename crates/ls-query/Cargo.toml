@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Tests that load the real bge-m3 ONNX model (fusion cosine fixtures). Off by
+# default so `cargo test` stays fast and offline (same split as ls-embed).
+models = []
+
 [dependencies]
 ls-core = { workspace = true }
 ls-index = { workspace = true }

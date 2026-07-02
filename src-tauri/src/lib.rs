@@ -1057,39 +1057,6 @@ async fn delete_conversation(
         .map_err(|e| e.to_string())
 }
 
-/// A short or pronoun-led question is probably a follow-up ("why?", "what about
-/// Redis?") that reads as noise on its own, so retrieval should also see the prior
-/// turn. Tight enough not to fire on a real short question like "how does TLS work".
-fn looks_anaphoric(q: &str) -> bool {
-    let words: Vec<&str> = q.split_whitespace().collect();
-    match words.len() {
-        0 => false,
-        1..=3 => true,
-        n if n <= 6 => {
-            let first = words[0]
-                .trim_matches(|c: char| !c.is_alphanumeric())
-                .to_lowercase();
-            matches!(
-                first.as_str(),
-                "why"
-                    | "and"
-                    | "so"
-                    | "it"
-                    | "its"
-                    | "they"
-                    | "them"
-                    | "this"
-                    | "that"
-                    | "those"
-                    | "these"
-                    | "he"
-                    | "she"
-            )
-        }
-        _ => false,
-    }
-}
-
 /// Whether a question asks for a whole-book / aggregative answer ("summarize this
 /// book", "main themes"), which RAG serves from a handful of passages and so can
 /// misrepresent — we attach an honest caveat. Localized asks ("summarize chapter
@@ -1216,17 +1183,35 @@ async fn ask(
                 .map_err(|e| e.to_string())?,
         );
     }
-    // Follow-up widening: if the question is anaphoric/short, feed the previous
-    // user turn as retrieval context so it isn't searched in isolation.
+    // Follow-up widening (tiered gate, ls_query::should_fuse_followup): short
+    // questions always lean on the prior turn; mid-length ones fuse when
+    // pronoun-led OR semantically continuous (cosine vs the prior user turn);
+    // long ones only on strong continuity. The cosine embeds the question once
+    // and the embedding is reused by search_multi below (no double embed).
     let prior_user = history
         .iter()
         .rev()
         .find(|t| t.role == "user")
         .map(|t| t.content.clone());
-    let context = if looks_anaphoric(&question) {
-        prior_user.as_deref()
-    } else {
-        None
+    let mut qvec: Option<Vec<f32>> = None;
+    let context = match prior_user.as_deref() {
+        Some(prior) => {
+            let embedder = &mut engine.embedder;
+            let fuse = ls_query::should_fuse_followup(&question, || {
+                let qv = embedder.embed_query(&question).ok()?;
+                let pv = embedder.embed_query(prior).ok()?;
+                // embed_query L2-normalizes, so dot product = cosine.
+                let cos: f32 = qv.iter().zip(&pv).map(|(a, b)| a * b).sum();
+                qvec = Some(qv);
+                Some(cos)
+            });
+            if fuse {
+                Some(prior)
+            } else {
+                None
+            }
+        }
+        None => None,
     };
 
     let store_refs: Vec<&Store> = stores.iter().collect();
@@ -1238,6 +1223,7 @@ async fn ask(
         settings.final_top_k,
         settings.hybrid_top_k,
         context,
+        qvec,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1809,28 +1795,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_aggregative, looks_anaphoric};
+    use super::is_aggregative;
 
-    #[test]
-    fn anaphoric_detection() {
-        // Short / pronoun-led follow-ups.
-        for q in [
-            "why?",
-            "and then?",
-            "what about Redis",
-            "why does that matter",
-        ] {
-            assert!(looks_anaphoric(q), "{q:?} should look anaphoric");
-        }
-        // Real standalone questions are not follow-ups.
-        for q in [
-            "how do event-driven microservices communicate",
-            "summarize the main points of this book",
-            "explain idempotence in distributed systems",
-        ] {
-            assert!(!looks_anaphoric(q), "{q:?} should NOT look anaphoric");
-        }
-    }
+    // The follow-up fusion gate (tiers + pronoun detection) lives in ls-query
+    // (should_fuse_followup / pronoun_led) with its own unit tests; the cosine
+    // threshold is validated by ls-query's models-gated fusion fixtures.
 
     #[test]
     fn aggregative_detection() {

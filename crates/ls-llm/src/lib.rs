@@ -99,7 +99,8 @@ fn strip_citation_markers(s: &str) -> String {
             // Match [digits, commas, spaces] with at least one digit.
             let mut j = i + 1;
             let mut digits = false;
-            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == ',' || chars[j] == ' ')
+            while j < chars.len()
+                && (chars[j].is_ascii_digit() || chars[j] == ',' || chars[j] == ' ')
             {
                 digits |= chars[j].is_ascii_digit();
                 j += 1;
@@ -853,7 +854,10 @@ mod tests {
             "Sagas coordinate  transactions ."
         );
         // Non-citation brackets survive: words, code, years-with-letters.
-        assert_eq!(strip_citation_markers("array[i] and [TODO]"), "array[i] and [TODO]");
+        assert_eq!(
+            strip_citation_markers("array[i] and [TODO]"),
+            "array[i] and [TODO]"
+        );
         // Digits-only brackets ARE markers by the UI's own definition ([1984]
         // renders as a citation link in assistant messages), so they strip too.
         assert_eq!(strip_citation_markers("in [1984] it"), "in  it");
@@ -885,7 +889,9 @@ mod tests {
         // one_line() collapses the whitespace left by stripping.
         assert!(prompt.contains("- Assistant: Sagas split transactions ."));
         // Recent assistant turns are marker-free too; user turns verbatim.
-        assert!(prompt.contains("Assistant: answer 2 \n") || prompt.contains("Assistant: answer 2"));
+        assert!(
+            prompt.contains("Assistant: answer 2 \n") || prompt.contains("Assistant: answer 2")
+        );
         assert!(!prompt.contains("answer 2 [1]"));
         assert!(prompt.contains("User: follow-up 2"));
     }
