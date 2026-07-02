@@ -30,3 +30,56 @@ pub fn data_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".local/share/libsearch-studio")
 }
+
+/// If `path` lives under a known cloud-sync mount, return the provider's name.
+/// LanceDB and the SQLite DB corrupt when a sync client rewrites their files
+/// underneath them, so the app warns when its INDEX/data dir is on one of these
+/// (this must NOT be applied to a user's source library folders — reading books
+/// from a synced folder is fine). Matches macOS + common cross-platform markers.
+pub fn cloud_sync_provider(path: &std::path::Path) -> Option<&'static str> {
+    let p = path.to_string_lossy();
+    const MARKERS: &[(&str, &str)] = &[
+        ("/Library/Mobile Documents", "iCloud Drive"),
+        ("/Library/CloudStorage/", "a cloud drive (File Provider)"),
+        ("/Dropbox", "Dropbox"),
+        ("/.dropbox", "Dropbox"),
+        ("/Google Drive", "Google Drive"),
+        ("/GoogleDrive", "Google Drive"),
+        ("/OneDrive", "OneDrive"),
+        ("/pCloud", "pCloud"),
+    ];
+    MARKERS
+        .iter()
+        .find(|(marker, _)| p.contains(marker))
+        .map(|(_, name)| *name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cloud_sync_provider;
+    use std::path::Path;
+
+    #[test]
+    fn flags_cloud_mounts_not_local_paths() {
+        assert_eq!(
+            cloud_sync_provider(Path::new("/Users/x/Dropbox/libsearch/lancedb")),
+            Some("Dropbox")
+        );
+        assert_eq!(
+            cloud_sync_provider(Path::new(
+                "/Users/x/Library/Mobile Documents/com~apple~CloudDocs/lib"
+            )),
+            Some("iCloud Drive")
+        );
+        assert_eq!(
+            cloud_sync_provider(Path::new(
+                "/Users/x/Library/CloudStorage/GoogleDrive-a/lib"
+            )),
+            Some("a cloud drive (File Provider)")
+        );
+        assert_eq!(
+            cloud_sync_provider(Path::new("/Users/x/.local/share/libsearch-studio/lancedb")),
+            None
+        );
+    }
+}
