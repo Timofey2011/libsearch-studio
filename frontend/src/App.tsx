@@ -23,7 +23,7 @@ type SearchResult = {
 
 // A cited source, in the shape shared by live results, stored citations, and artifacts.
 type Src = { rank: number; citation: string; source_path: string; page: number | null; text?: string };
-type ChatMessage = { role: "user" | "assistant"; content: string; thinking: string; sources: Src[] };
+type ChatMessage = { role: "user" | "assistant"; content: string; thinking: string; sources: Src[]; loose?: boolean };
 type Conversation = { id: string; title: string; collection_ids: string[] };
 type BackendMessage = { role: "user" | "assistant"; content: string; citations: Src[]; in_tokens: number; out_tokens: number };
 
@@ -159,6 +159,8 @@ export default function App() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [convId, setConvId] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [dataSafety, setDataSafety] = useState<{ at_risk: boolean; provider: string; path: string } | null>(null);
+  const [safetyDismissed, setSafetyDismissed] = useState(false);
   const [savedByIdx, setSavedByIdx] = useState<Record<number, string>>({});
   const [thinkOpen, setThinkOpen] = useState<Record<number, boolean>>({});
   const [tokens, setTokens] = useState({ in: 0, out: 0 });
@@ -218,6 +220,7 @@ export default function App() {
   useEffect(() => {
     invoke<Collection[]>("list_collections").then(setCollections).catch(console.error);
     invoke<Conversation[]>("list_conversations").then(setConversations).catch(console.error);
+    invoke<{ at_risk: boolean; provider: string; path: string }>("data_safety").then(setDataSafety).catch(console.error);
     invoke<Settings>("get_settings")
       .then((s) => {
         setSettings(s);
@@ -286,10 +289,23 @@ export default function App() {
     const unUsage = listen<{ in_tokens: number; out_tokens: number }>("ask-usage", (e) =>
       setTokens((t) => ({ in: t.in + e.payload.in_tokens, out: t.out + e.payload.out_tokens }))
     );
+    // Provenance: mark the in-flight answer as lower-confidence when it came from
+    // the fuzzy fallback tier.
+    const unProv = listen<boolean>("ask-provenance", (e) =>
+      setMessages((prev) => {
+        if (!prev.length) return prev;
+        const last = prev.length - 1;
+        if (prev[last].role !== "assistant") return prev;
+        const copy = [...prev];
+        copy[last] = { ...copy[last], loose: e.payload };
+        return copy;
+      })
+    );
     return () => {
       unTok.then((f) => f());
       unThink.then((f) => f());
       unUsage.then((f) => f());
+      unProv.then((f) => f());
     };
   }, []);
 
@@ -1813,6 +1829,16 @@ export default function App() {
 
       {/* Chat column */}
       <div className="main">
+        {dataSafety?.at_risk && !safetyDismissed && (
+          <div className="safety-banner">
+            <span>
+              ⚠️ Your library index is on <b>{dataSafety.provider}</b> ({dataSafety.path}). Cloud sync can
+              corrupt the index — move the data folder off it (Settings → General → Reveal).
+            </span>
+            <button className="linklike" onClick={() => openTools("general")}>Open Settings</button>
+            <button className="ghost" title="Dismiss" onClick={() => setSafetyDismissed(true)}>✕</button>
+          </div>
+        )}
         {toolsOpen && settings && (
           <div className="tools-overlay" onClick={() => setToolsOpen(false)}>
             <div className="tools-modal" onClick={(e) => e.stopPropagation()}>
@@ -1910,6 +1936,11 @@ export default function App() {
                     <span className="muted think-live">{msg.thinking ? "Reasoning…" : "Thinking…"}</span>
                   )}
                 </div>
+                {msg.loose && msg.content && (
+                  <div className="provenance" title="No passage cleared the confidence threshold, so this used the best loosely-related matches.">
+                    ◐ Answered from loosely-related passages — treat as lower confidence.
+                  </div>
+                )}
                 {msg.content && (
                   <div className="actions">
                     <button className="mini" onClick={() => copyText(msg.content, idx)}>
