@@ -814,6 +814,26 @@ async fn warm_model(state: State<'_, AppState>, model: String) -> Result<(), Str
     Ok(())
 }
 
+/// Open the app data folder (index, app.db, settings.toml) in the OS file manager,
+/// so the user can find it to back up or verify it's off a cloud-sync mount. The
+/// sanctioned backup recipe is "quit the app, copy this folder."
+#[tauri::command]
+async fn reveal_data_folder(state: State<'_, AppState>) -> Result<String, String> {
+    let dir = state.data_dir.clone();
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(target_os = "linux")]
+    let opener = "xdg-open";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let opener = "open";
+    std::process::Command::new(opener)
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("couldn't open the data folder: {e}"))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 #[derive(serde::Serialize)]
 struct LlmStatus {
     ok: bool,
@@ -1043,13 +1063,19 @@ async fn ask(
         h
     };
 
-    // Lazily load the engine on first ask (kept resident afterwards).
+    // Lazily load the engine on first ask (kept resident afterwards). A load
+    // failure here almost always means the embedding models aren't provisioned
+    // (e.g. the user added a folder but never ran setup, or moved the models dir),
+    // so point them at setup instead of surfacing a raw ONNX/file error.
     let mut guard = state.engine.lock().await;
     if guard.is_none() {
-        let embedder =
-            Embedder::load(state.models_dir.join("bge-m3")).map_err(|e| e.to_string())?;
+        let models_hint = |e: String| {
+            format!("The search models aren't set up yet — open Settings → Indexing → Set up to download them. ({e})")
+        };
+        let embedder = Embedder::load(state.models_dir.join("bge-m3"))
+            .map_err(|e| models_hint(e.to_string()))?;
         let reranker =
-            Reranker::load(reranker_dir(&state.models_dir)).map_err(|e| e.to_string())?;
+            Reranker::load(reranker_dir(&state.models_dir)).map_err(|e| models_hint(e.to_string()))?;
         *guard = Some(Engine { embedder, reranker });
     }
     let engine = guard.as_mut().unwrap();
@@ -1607,6 +1633,7 @@ pub fn run() {
             list_models,
             probe_provider,
             warm_model,
+            reveal_data_folder,
             check_llm,
             get_settings,
             save_settings,
