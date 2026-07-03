@@ -2,6 +2,19 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.6.1 — 2026-07-02
+
+Bump manifests 0.6.0 → 0.6.1. Cross-conversation memory lands ("Ledger, not
+Brain", docs/ROADMAP-2.md):
+- Settings → Memory: a user-authored notebook — the textarea IS the app's
+  entire memory. Injected into prompts as explicitly non-citable context
+  (never the Sources block), capped at ~600 tokens with a live counter,
+  exportable to Markdown, with an off-switch. The app never writes it
+  autonomously; "+ Notes" on any answer appends it explicitly.
+- Per-answer "ⓘ context" chip: exactly what went into the prompt (notes,
+  recent turns, digest lines, dropped turns), computed by the prompt builder
+  itself and emitted as a new ask-context event.
+
 ## v0.6.0 — 2026-07-02
 
 Bump manifests 0.5.9 → 0.6.0. First batch of the conversation-memory arc
