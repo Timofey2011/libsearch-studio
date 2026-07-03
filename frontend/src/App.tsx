@@ -205,6 +205,10 @@ export default function App() {
   // The user's global notebook (Settings → Memory); loaded when the tab opens.
   const [note, setNote] = useState("");
   const [noteStatus, setNoteStatus] = useState<string | null>(null);
+  // Re-index nudge: books chunked by an older scheme in the current collection.
+  const [legacyBooks, setLegacyBooks] = useState(0);
+  const [nudgeDismissed, setNudgeDismissed] = useState(false);
+  const [rechunkNote, setRechunkNote] = useState<string | null>(null);
   const [settingsNote, setSettingsNote] = useState<string | null>(null);
   // Per-provider key-check result: validated chat models for the dropdown.
   const [probe, setProbe] = useState<
@@ -284,6 +288,15 @@ export default function App() {
     setNoteStatus(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [toolsOpen, toolsTab]);
+
+  // Index health for the passive re-index nudge (manifest-only, no folder scan).
+  useEffect(() => {
+    if (!toolsOpen || toolsTab !== "collections" || !currentColl) return;
+    invoke<{ legacy_books: number }>("index_health", { collectionId: currentColl.id })
+      .then((h) => setLegacyBooks(h.legacy_books))
+      .catch(console.error);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolsOpen, toolsTab, currentColl?.id, indexing]);
 
   // Populate the model dropdown. Model listing is best-effort: cloud /models can
   // omit chat models and include image/embedding ones (e.g. Fireworks lists flux
@@ -1210,6 +1223,21 @@ export default function App() {
                 Delete collection
               </button>
             </div>
+            {legacyBooks > 0 && !nudgeDismissed && !rechunkNote && (
+              <div className="nudge">
+                <span>
+                  {legacyBooks} book(s) were indexed with an older chunking scheme. Answers work fine, but re-chunking
+                  improves passage boundaries and citation pages.
+                </span>
+                <button className="mini" onClick={() => rechunkCollection(currentColl)} disabled={indexing}>
+                  Re-chunk on next Index
+                </button>
+                <button className="ghost" title="Dismiss for now" onClick={() => setNudgeDismissed(true)}>
+                  ✕
+                </button>
+              </div>
+            )}
+            {rechunkNote && <div className="note-ok" style={{ marginTop: 6, fontSize: 12.5 }}>{rechunkNote}</div>}
           </div>
         )}
 
@@ -1421,6 +1449,24 @@ export default function App() {
         </div>
       </div>
     );
+  }
+
+  // Explicit re-chunk opt-in: forget the collection's fingerprints so the next
+  // Index run re-embeds everything with the current chunker. Never automatic —
+  // a full re-embed of a large library takes hours on the GPU.
+  async function rechunkCollection(coll: Collection) {
+    const ok = window.confirm(
+      `Re-chunk "${coll.name}"?\n\nThe next Index / Re-index will re-embed ALL its books with the current chunker ` +
+        `(better passage boundaries + citation pages). A large library can take hours on the GPU. Nothing is deleted now.`
+    );
+    if (!ok) return;
+    try {
+      const n = await invoke<number>("reset_chunker_state", { collectionId: coll.id });
+      setLegacyBooks(0);
+      setRechunkNote(`Ready — click Index / Re-index to re-embed ${n} book(s) with the current chunker.`);
+    } catch (e) {
+      setRechunkNote("Error: " + String(e));
+    }
   }
 
   async function saveNote() {
@@ -2155,15 +2201,19 @@ export default function App() {
               rows={2}
               placeholder="Ask your library…"
             />
+            {/* While generating, the send button becomes Stop: aborts the stream
+                and keeps whatever already arrived (marked "[answer stopped]"). */}
             <button
               className="send-icon"
-              onClick={send}
-              disabled={busy || !collIds.length || !question.trim()}
-              title="Send (Enter)"
-              aria-label="Send"
+              onClick={busy ? () => invoke("cancel_ask").catch(console.error) : send}
+              disabled={!busy && (!collIds.length || !question.trim())}
+              title={busy ? "Stop generating (keeps the partial answer)" : "Send (Enter)"}
+              aria-label={busy ? "Stop" : "Send"}
             >
               {busy ? (
-                <span className="send-spin" />
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="5" y="5" width="14" height="14" rx="2" />
+                </svg>
               ) : (
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <polyline points="9 10 4 15 9 20" />

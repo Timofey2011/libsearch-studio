@@ -63,6 +63,8 @@ struct AppState {
     engine: Mutex<Option<Engine>>,
     /// Set by `cancel_indexing` to ask an in-progress index run to stop.
     cancel: Arc<AtomicBool>,
+    /// Set by `cancel_ask` (the Stop button) to abort an in-flight generation.
+    ask_cancel: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -283,6 +285,14 @@ async fn index_collection(
 #[tauri::command]
 async fn cancel_indexing(state: State<'_, AppState>) -> Result<(), String> {
     state.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Stop button: abort the in-flight generation. The partial answer streamed so
+/// far is kept (persisted marked "[answer stopped]"); nothing is retried.
+#[tauri::command]
+async fn cancel_ask(state: State<'_, AppState>) -> Result<(), String> {
+    state.ask_cancel.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -899,6 +909,41 @@ async fn export_note(state: State<'_, AppState>, scope: String) -> Result<String
 }
 
 #[derive(serde::Serialize)]
+struct IndexHealth {
+    /// Books whose chunks predate the current chunking scheme (v0.5.8 cross-page).
+    legacy_books: usize,
+}
+
+/// Per-collection index health for the passive re-index nudge. Reads only the
+/// local manifest — never scans source folders (cloud-hydrate footgun).
+#[tauri::command]
+async fn index_health(
+    state: State<'_, AppState>,
+    collection_id: String,
+) -> Result<IndexHealth, String> {
+    Ok(IndexHealth {
+        legacy_books: state
+            .db()?
+            .legacy_chunker_count(&collection_id)
+            .map_err(|e| e.to_string())?,
+    })
+}
+
+/// Explicit "re-chunk" opt-in: forget the collection's book fingerprints so the
+/// next Index run re-embeds everything with the current chunker (dedup would
+/// otherwise skip unchanged books forever). Returns how many books it affects.
+#[tauri::command]
+async fn reset_chunker_state(
+    state: State<'_, AppState>,
+    collection_id: String,
+) -> Result<usize, String> {
+    state
+        .db()?
+        .clear_book_state(&collection_id)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
 struct DataSafety {
     at_risk: bool,
     provider: String,
@@ -1149,6 +1194,9 @@ async fn ask(
     model: String,
     retry: bool,
 ) -> Result<Vec<SearchResult>, String> {
+    // Fresh Stop flag for this ask — reset FIRST so a Stop pressed during any
+    // later phase (retrieval included) is honored, never wiped.
+    state.ask_cancel.store(false, Ordering::SeqCst);
     let db = state.db()?;
     let all_colls = db.list_collections().map_err(|e| e.to_string())?;
     let colls: Vec<Collection> = all_colls
@@ -1343,22 +1391,60 @@ async fn ask(
     // already saw instead of dropping a nearly-complete answer.
     let acc = std::sync::Arc::new(std::sync::Mutex::new(caveat.to_string()));
     let acc_tok = acc.clone();
-    let gen = state
-        .llm()
-        .generate_stream(
-            &model,
-            &prompt,
-            move |tok| {
-                if let Ok(mut s) = acc_tok.lock() {
-                    s.push_str(tok);
+    // Stop button: poll the cancel flag alongside the generation future; dropping
+    // the future aborts the underlying HTTP stream (never retried after first
+    // byte). Whatever already streamed is persisted below, marked stopped. A Stop
+    // that already arrived (during retrieval) skips generation entirely.
+    let ask_cancel = state.ask_cancel.clone();
+    if ask_cancel.load(Ordering::SeqCst) {
+        let _ = window.emit("ask-token", "*[answer stopped]*".to_string());
+        let _ = window.emit("ask-done", ());
+        return Ok(results);
+    }
+    let llm = state.llm();
+    let gen_fut = llm.generate_stream(
+        &model,
+        &prompt,
+        move |tok| {
+            if let Ok(mut s) = acc_tok.lock() {
+                s.push_str(tok);
+            }
+            let _ = w.emit("ask-token", tok.to_string());
+        },
+        move |think| {
+            let _ = wr.emit("ask-reasoning", think.to_string());
+        },
+    );
+    tokio::pin!(gen_fut);
+    let gen = loop {
+        tokio::select! {
+            r = &mut gen_fut => break Some(r),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+                if ask_cancel.load(Ordering::SeqCst) {
+                    break None;
                 }
-                let _ = w.emit("ask-token", tok.to_string());
-            },
-            move |think| {
-                let _ = wr.emit("ask-reasoning", think.to_string());
-            },
-        )
-        .await;
+            }
+        }
+    };
+
+    let Some(gen) = gen else {
+        // Stopped by the user: keep what streamed (marked), close out cleanly.
+        let partial = acc.lock().map(|s| s.clone()).unwrap_or_default();
+        if !partial.trim().is_empty() {
+            let _ = db.add_message(&Message {
+                id: new_id(),
+                conversation_id: conversation_id.clone(),
+                role: Role::Assistant,
+                content: format!("{partial}\n\n*[answer stopped]*"),
+                citations: results.iter().map(to_citation).collect(),
+                in_tokens: 0,
+                out_tokens: 0,
+            });
+        }
+        let _ = window.emit("ask-token", "\n\n*[answer stopped]*".to_string());
+        let _ = window.emit("ask-done", ());
+        return Ok(results);
+    };
 
     let (answer, usage) = match gen {
         Ok(ok) => ok,
@@ -1768,6 +1854,7 @@ fn init_state() -> AppState {
         llm: std::sync::Mutex::new(llm),
         engine: Mutex::new(None),
         cancel: Arc::new(AtomicBool::new(false)),
+        ask_cancel: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -1820,6 +1907,7 @@ pub fn run() {
             index_collection,
             fast_index_collection,
             cancel_indexing,
+            cancel_ask,
             setup_gpu_indexing,
             list_conversations,
             create_conversation,
@@ -1834,6 +1922,8 @@ pub fn run() {
             set_note,
             export_note,
             data_safety,
+            index_health,
+            reset_chunker_state,
             check_llm,
             get_settings,
             save_settings,

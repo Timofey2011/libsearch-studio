@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS book_state (
     book_id       TEXT NOT NULL,
     fingerprint   TEXT NOT NULL,
     content_sig   TEXT NOT NULL DEFAULT '',
+    chunker_ver   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (collection_id, book_id)
 );
 -- User-authored memory ("Ledger, not Brain"): one editable note per scope
@@ -63,26 +64,47 @@ pub struct Db {
     conn: Connection,
 }
 
+/// The chunking scheme version stamped on newly indexed books. Bump when chunk
+/// boundaries/metadata improve enough that a re-index is worth recommending
+/// (v1 = cross-page paragraph-aware GPU chunking + real loc, v0.5.8). Rows from
+/// before the column existed default to 0 = legacy.
+pub const CURRENT_CHUNKER_VER: i64 = 1;
+
+/// Run an idempotent `ALTER TABLE … ADD COLUMN` migration: a "duplicate column"
+/// error means the migration already ran (fine); anything else — locked DB,
+/// disk error, typo — propagates instead of being silently swallowed.
+fn alter_ignore_duplicate(conn: &Connection, sql: &str) -> Result<(), DbError> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
-        // Migrate older DBs created before token columns existed (ignore "duplicate
-        // column" errors when they already exist).
-        let _ = conn.execute(
+        // Idempotent column migrations for DBs created by older builds.
+        alter_ignore_duplicate(
+            &conn,
             "ALTER TABLE messages ADD COLUMN in_tokens INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
+        )?;
+        alter_ignore_duplicate(
+            &conn,
             "ALTER TABLE messages ADD COLUMN out_tokens INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+        )?;
         // Content signature for timestamp-independent dedup (added later).
-        let _ = conn.execute(
+        alter_ignore_duplicate(
+            &conn,
             "ALTER TABLE book_state ADD COLUMN content_sig TEXT NOT NULL DEFAULT ''",
-            [],
-        );
+        )?;
+        // Chunker version per indexed book; 0 = indexed before the marker existed.
+        alter_ignore_duplicate(
+            &conn,
+            "ALTER TABLE book_state ADD COLUMN chunker_ver INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Self { conn })
     }
 
@@ -357,7 +379,8 @@ impl Db {
         }
     }
 
-    /// Record both the metadata fingerprint and the content signature for a book.
+    /// Record both the metadata fingerprint and the content signature for a book,
+    /// stamped with the CURRENT chunker version (freshly indexed = current).
     pub fn set_book_state(
         &self,
         collection_id: &str,
@@ -365,12 +388,39 @@ impl Db {
         fingerprint: &str,
         content_sig: &str,
     ) -> Result<(), DbError> {
+        self.set_book_state_ver(
+            collection_id,
+            book_id,
+            fingerprint,
+            content_sig,
+            CURRENT_CHUNKER_VER,
+        )
+    }
+
+    /// Like [`Db::set_book_state`] but with an explicit chunker version — used by
+    /// backfills recording books whose chunks came from an OLDER scheme (ver 0),
+    /// so the re-index nudge stays honest about them.
+    pub fn set_book_state_ver(
+        &self,
+        collection_id: &str,
+        book_id: &str,
+        fingerprint: &str,
+        content_sig: &str,
+        chunker_ver: i64,
+    ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO book_state (collection_id, book_id, fingerprint, content_sig)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO book_state (collection_id, book_id, fingerprint, content_sig, chunker_ver)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(collection_id, book_id)
-             DO UPDATE SET fingerprint=excluded.fingerprint, content_sig=excluded.content_sig",
-            params![collection_id, book_id, fingerprint, content_sig],
+             DO UPDATE SET fingerprint=excluded.fingerprint, content_sig=excluded.content_sig,
+                           chunker_ver=excluded.chunker_ver",
+            params![
+                collection_id,
+                book_id,
+                fingerprint,
+                content_sig,
+                chunker_ver
+            ],
         )?;
         Ok(())
     }
@@ -397,6 +447,28 @@ impl Db {
             params![collection_id, book_id, fingerprint],
         )?;
         Ok(())
+    }
+
+    /// How many of a collection's indexed books were chunked by an OLDER scheme
+    /// (before [`CURRENT_CHUNKER_VER`]) — the basis of the re-index nudge.
+    pub fn legacy_chunker_count(&self, collection_id: &str) -> Result<usize, DbError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM book_state WHERE collection_id = ?1 AND chunker_ver < ?2",
+            params![collection_id, CURRENT_CHUNKER_VER],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Forget a collection's book fingerprints so the next Index run re-embeds
+    /// everything with the current chunker (the explicit "re-chunk" action —
+    /// the normal dedup would otherwise skip unchanged books forever).
+    pub fn clear_book_state(&self, collection_id: &str) -> Result<usize, DbError> {
+        let n = self.conn.execute(
+            "DELETE FROM book_state WHERE collection_id = ?1",
+            params![collection_id],
+        )?;
+        Ok(n)
     }
 }
 
@@ -430,6 +502,22 @@ mod tests {
 
         db.delete_collection("c1").unwrap();
         assert_eq!(db.list_collections().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn chunker_ver_tracking_and_reset() {
+        let db = Db::open_in_memory().unwrap();
+        // Freshly indexed books are stamped current; backfilled imports are legacy.
+        db.set_book_state("c1", "fresh", "fp1", "sig1").unwrap();
+        db.set_book_state_ver("c1", "imported", "fp2", "sig2", 0)
+            .unwrap();
+        assert_eq!(db.legacy_chunker_count("c1").unwrap(), 1);
+        // Re-indexing the legacy book (normal path) upgrades its stamp.
+        db.set_book_state("c1", "imported", "fp2", "sig2").unwrap();
+        assert_eq!(db.legacy_chunker_count("c1").unwrap(), 0);
+        // Reset forgets fingerprints so a re-index re-embeds everything.
+        assert_eq!(db.clear_book_state("c1").unwrap(), 2);
+        assert_eq!(db.legacy_chunker_count("c1").unwrap(), 0);
     }
 
     #[test]

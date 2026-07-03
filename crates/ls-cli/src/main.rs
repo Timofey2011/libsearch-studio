@@ -179,7 +179,9 @@ async fn run_backfill_state(app_dir: &str, collection_id: &str) -> Result<()> {
         if csig == "missing" {
             missing += 1;
         }
-        db.set_book_state(&coll.id, book_id, &fp, &csig)
+        // Backfilled books keep chunks produced by an OLDER scheme — record them
+        // as legacy (ver 0) so the app's re-index nudge stays honest about them.
+        db.set_book_state_ver(&coll.id, book_id, &fp, &csig, 0)
             .context("write book_state")?;
         ok += 1;
     }
