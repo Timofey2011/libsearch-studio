@@ -940,7 +940,7 @@ mod tests {
             history.push(turn("user", &format!("follow-up {i}")));
             history.push(turn("assistant", &format!("answer {i} [1]")));
         }
-        let (prompt, meta) = build_prompt_with_history("next question", &[], &history, None);
+        let (prompt, _meta) = build_prompt_with_history("next question", &[], &history, None);
         // Old turns appear as digest one-liners, stripped of markers.
         assert!(prompt.contains("Earlier in this conversation:"));
         assert!(prompt.contains("- User: tell me about sagas"));
