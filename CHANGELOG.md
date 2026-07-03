@@ -2,6 +2,18 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.6.2 — 2026-07-02
+
+Bump manifests 0.6.1 → 0.6.2. Completes Roadmap-2's mid-term tier:
+- Stop button: the send button becomes ■ while an answer generates — stopping
+  keeps whatever already streamed (saved marked "[answer stopped]" with its
+  sources). Works at any phase, including during retrieval.
+- Re-index nudge: collections whose books were indexed with an older chunking
+  scheme show a passive, dismissible note with an explicit "Re-chunk on next
+  Index" opt-in (a full re-embed can take hours — never automatic).
+- Safer schema migrations: ALTER errors other than "column already exists" now
+  surface instead of being silently swallowed.
+
 ## v0.6.1 — 2026-07-02
 
 Bump manifests 0.6.0 → 0.6.1. Cross-conversation memory lands ("Ledger, not
