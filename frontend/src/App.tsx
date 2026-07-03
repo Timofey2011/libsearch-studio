@@ -23,7 +23,24 @@ type SearchResult = {
 
 // A cited source, in the shape shared by live results, stored citations, and artifacts.
 type Src = { rank: number; citation: string; source_path: string; page: number | null; text?: string };
-type ChatMessage = { role: "user" | "assistant"; content: string; thinking: string; sources: Src[]; loose?: boolean };
+// Mirrors ls_llm::PromptMeta — what actually went into the prompt for one ask.
+type PromptMeta = {
+  notes_injected: boolean;
+  notes_tokens: number;
+  notes_truncated: boolean;
+  digest_lines: number;
+  recent_turns: number;
+  dropped_turns: number;
+  prompt_tokens: number;
+};
+type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+  thinking: string;
+  sources: Src[];
+  loose?: boolean;
+  ctx?: PromptMeta;
+};
 type Conversation = { id: string; title: string; collection_ids: string[] };
 type BackendMessage = { role: "user" | "assistant"; content: string; citations: Src[]; in_tokens: number; out_tokens: number };
 
@@ -37,15 +54,27 @@ function fmtDur(sec: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(ss)}` : `${m}:${pad(ss)}`;
 }
 
-type ToolsTab = "collections" | "synthesis" | "retrieval" | "indexing" | "general" | "help";
+type ToolsTab = "collections" | "synthesis" | "retrieval" | "memory" | "indexing" | "general" | "help";
 const TOOLS_TABS: [ToolsTab, string][] = [
   ["collections", "Collections"],
   ["synthesis", "Synthesis"],
   ["retrieval", "Retrieval"],
+  ["memory", "Memory"],
   ["indexing", "Indexing"],
   ["general", "General"],
   ["help", "Help"],
 ];
+
+// Mirrors ls_llm::estimate_tokens (chars/4 Latin, /2.5 substantially-Cyrillic) —
+// cosmetic counter only; the authoritative numbers come back in PromptMeta.
+const NOTES_TOKEN_CAP = 600;
+function estimateTokens(s: string): number {
+  const total = [...s].length;
+  if (total === 0) return 0;
+  let cyr = 0;
+  for (const c of s) if (c >= "Ѐ" && c <= "ӿ") cyr++;
+  return Math.ceil(total / (cyr * 5 >= total ? 2.5 : 4));
+}
 
 type SubTheme = { name: string; blurb: string };
 type Theme = { name: string; subthemes: SubTheme[] };
@@ -103,6 +132,7 @@ type Settings = {
   hybrid_top_k: number;
   final_top_k: number;
   min_relevance: number;
+  memory_enabled: boolean;
 };
 
 const ANTHROPIC_MODELS = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-fable-5"];
@@ -165,12 +195,16 @@ export default function App() {
   const [thinkOpen, setThinkOpen] = useState<Record<number, boolean>>({});
   const [tokens, setTokens] = useState({ in: 0, out: 0 });
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const [notedIdx, setNotedIdx] = useState<number | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
 
   const [toolsOpen, setToolsOpen] = useState(false);
   const [toolsTab, setToolsTab] = useState<ToolsTab>("collections");
   const [settings, setSettings] = useState<Settings | null>(null);
+  // The user's global notebook (Settings → Memory); loaded when the tab opens.
+  const [note, setNote] = useState("");
+  const [noteStatus, setNoteStatus] = useState<string | null>(null);
   const [settingsNote, setSettingsNote] = useState<string | null>(null);
   // Per-provider key-check result: validated chat models for the dropdown.
   const [probe, setProbe] = useState<
@@ -243,6 +277,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [toolsOpen, toolsTab, settings?.llm_provider]);
 
+  // Load the notebook when the Memory tab opens.
+  useEffect(() => {
+    if (!toolsOpen || toolsTab !== "memory") return;
+    invoke<string>("get_note", { scope: "global" }).then(setNote).catch(console.error);
+    setNoteStatus(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolsOpen, toolsTab]);
+
   // Populate the model dropdown. Model listing is best-effort: cloud /models can
   // omit chat models and include image/embedding ones (e.g. Fireworks lists flux
   // first — and it returns 401 for a chat request), so we always keep the
@@ -301,11 +343,23 @@ export default function App() {
         return copy;
       })
     );
+    // Context used for this answer (notes/digest/turns) — from the prompt builder.
+    const unCtx = listen<PromptMeta>("ask-context", (e) =>
+      setMessages((prev) => {
+        if (!prev.length) return prev;
+        const last = prev.length - 1;
+        if (prev[last].role !== "assistant") return prev;
+        const copy = [...prev];
+        copy[last] = { ...copy[last], ctx: e.payload };
+        return copy;
+      })
+    );
     return () => {
       unTok.then((f) => f());
       unThink.then((f) => f());
       unUsage.then((f) => f());
       unProv.then((f) => f());
+      unCtx.then((f) => f());
     };
   }, []);
 
@@ -545,6 +599,21 @@ export default function App() {
         setTimeout(() => setCopiedIdx((c) => (c === idx ? null : c)), 1200);
       })
       .catch(() => {});
+  }
+
+  // Append an answer to the global notebook (explicit user action — the only
+  // way the app ever writes memory).
+  async function addToNotes(text: string, idx: number) {
+    try {
+      const cur = await invoke<string>("get_note", { scope: "global" });
+      const next = cur.trim() ? `${cur.trimEnd()}\n\n---\n${text.trim()}` : text.trim();
+      await invoke("set_note", { scope: "global", content: next });
+      setNote(next); // keep the Memory tab in sync if it's open later
+      setNotedIdx(idx);
+      setTimeout(() => setNotedIdx((c) => (c === idx ? null : c)), 1500);
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   // Regenerate the answer at message index `idx` (an assistant turn): drop it and
@@ -1354,6 +1423,74 @@ export default function App() {
     );
   }
 
+  async function saveNote() {
+    try {
+      await invoke("set_note", { scope: "global", content: note });
+      setNoteStatus("Saved ✓");
+    } catch (e) {
+      setNoteStatus("Error: " + String(e));
+    }
+  }
+
+  async function exportNote() {
+    try {
+      const path = await invoke<string>("export_note", { scope: "global" });
+      setNoteStatus(`Exported → ${path}`);
+    } catch (e) {
+      setNoteStatus("Error: " + String(e));
+    }
+  }
+
+  function renderMemoryTab() {
+    if (!settings) return null;
+    const tokens = estimateTokens(note);
+    const over = tokens > NOTES_TOKEN_CAP;
+    return (
+      <div>
+        <div className="tools-note muted" style={{ marginBottom: 10 }}>
+          Your notebook is the app's entire memory — nothing is remembered unless you write it here. It's given to the
+          model as background context on every question (never as a citable source). Standing preferences work well:
+          "Prefer concise answers", "I'm studying for a systems-design interview", "Answer in Russian when I ask in
+          Russian".
+        </div>
+        <label className="row" style={{ gap: 8, marginBottom: 8 }}>
+          <input
+            type="checkbox"
+            checked={settings.memory_enabled}
+            onChange={(e) => editSetting("memory_enabled", e.target.checked)}
+          />
+          <span>Use my notes when answering (off = notes are kept but never sent to the model)</span>
+        </label>
+        <textarea
+          className="note-editor"
+          value={note}
+          onChange={(e) => {
+            setNote(e.target.value);
+            setNoteStatus(null);
+          }}
+          placeholder="Anything you want the model to keep in mind, in your own words…"
+          rows={12}
+        />
+        <div className="row" style={{ gap: 8, alignItems: "center", marginTop: 8 }}>
+          <button className="primary" onClick={saveNote}>
+            Save notes
+          </button>
+          <button onClick={exportNote} title="Write the notebook to a Markdown file in your artifacts folder">
+            Export .md
+          </button>
+          <span className={"muted" + (over ? " note-over" : "")} style={{ fontSize: 12 }}>
+            ~{tokens} / {NOTES_TOKEN_CAP} tokens injected{over ? " — over the cap; the end will be trimmed" : ""}
+          </span>
+          {noteStatus && (
+            <span className={noteStatus.startsWith("Error") ? "note-err" : "note-ok"} style={{ fontSize: 12 }}>
+              {noteStatus}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   function renderIndexingTab() {
     if (!settings) return null;
     return (
@@ -1862,6 +1999,7 @@ export default function App() {
                   {toolsTab === "collections" && renderCollectionsTab()}
                   {toolsTab === "synthesis" && renderSynthesisTab()}
                   {toolsTab === "retrieval" && renderRetrievalTab()}
+                  {toolsTab === "memory" && renderMemoryTab()}
                   {toolsTab === "indexing" && renderIndexingTab()}
                   {toolsTab === "general" && renderGeneralTab()}
                   {toolsTab === "help" && renderHelpTab()}
@@ -1957,6 +2095,28 @@ export default function App() {
                       <button className="mini" onClick={() => saveArtifact(idx)} title="Save this answer + sources as Markdown">
                         Save as Markdown
                       </button>
+                    )}
+                    <button
+                      className="mini"
+                      onClick={() => addToNotes(msg.content, idx)}
+                      title="Append this answer to your notebook (Settings → Memory)"
+                    >
+                      {notedIdx === idx ? "Noted ✓" : "+ Notes"}
+                    </button>
+                    {msg.ctx && (
+                      <span
+                        className="ctx-chip"
+                        title={`Context used for this answer:\n• Notes: ${
+                          msg.ctx.notes_injected
+                            ? `~${msg.ctx.notes_tokens} tokens${msg.ctx.notes_truncated ? " (truncated to fit)" : ""}`
+                            : "not used"
+                        }\n• Recent turns: ${msg.ctx.recent_turns}\n• Earlier-topics digest: ${
+                          msg.ctx.digest_lines
+                        } line(s)\n• Turns dropped: ${msg.ctx.dropped_turns}\n• Prompt ≈ ${msg.ctx.prompt_tokens} tokens`}
+                      >
+                        ⓘ context{msg.ctx.notes_injected ? " · notes ✓" : ""}
+                        {msg.ctx.notes_truncated ? " (trimmed)" : ""}
+                      </span>
                     )}
                     {savedByIdx[idx] && (
                       <span className={savedByIdx[idx].startsWith("Error") ? "note-err" : "note-ok"}>

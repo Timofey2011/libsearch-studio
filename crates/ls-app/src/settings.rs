@@ -40,6 +40,9 @@ pub struct Settings {
     /// a source. Passages below this are dropped; if none qualify the answer is
     /// "no matching passages" with no sources. Raise to be stricter.
     pub min_relevance: f32,
+    /// Whether the user's notebook (Settings → Memory) is injected into prompts
+    /// as non-citable context. The off-switch for memory.
+    pub memory_enabled: bool,
 }
 
 impl Default for Settings {
@@ -59,6 +62,7 @@ impl Default for Settings {
             hybrid_top_k: 24,
             final_top_k: 8,
             min_relevance: 0.15,
+            memory_enabled: true,
         }
     }
 }

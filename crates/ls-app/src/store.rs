@@ -49,6 +49,14 @@ CREATE TABLE IF NOT EXISTS book_state (
     content_sig   TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (collection_id, book_id)
 );
+-- User-authored memory ("Ledger, not Brain"): one editable note per scope
+-- ('global' or a collection id). The app NEVER writes this autonomously; only
+-- explicit user actions land here.
+CREATE TABLE IF NOT EXISTS notebook (
+    scope      TEXT PRIMARY KEY,
+    content    TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 "#;
 
 pub struct Db {
@@ -141,6 +149,34 @@ impl Db {
         self.conn.execute(
             "DELETE FROM book_state WHERE collection_id = ?1",
             params![id],
+        )?;
+        // And any collection-scoped notebook entry — no invisible orphans.
+        self.conn
+            .execute("DELETE FROM notebook WHERE scope = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ---- notebook (user-authored memory) ----
+
+    /// The user's note for a scope ('global' or a collection id); None if unset.
+    pub fn get_note(&self, scope: &str) -> Result<Option<String>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT content FROM notebook WHERE scope = ?1")?;
+        let mut rows = stmt.query(params![scope])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
+
+    /// Upsert the user's note for a scope (explicit user action only).
+    pub fn set_note(&self, scope: &str, content: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO notebook (scope, content, updated_at) \
+             VALUES (?1, ?2, strftime('%s','now')) \
+             ON CONFLICT(scope) DO UPDATE SET content = ?2, updated_at = strftime('%s','now')",
+            params![scope, content],
         )?;
         Ok(())
     }
@@ -394,6 +430,25 @@ mod tests {
 
         db.delete_collection("c1").unwrap();
         assert_eq!(db.list_collections().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn notebook_roundtrip_and_collection_cleanup() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.get_note("global").unwrap(), None);
+        db.set_note("global", "Prefers concise answers.").unwrap();
+        db.set_note("global", "Prefers concise answers with examples.")
+            .unwrap(); // upsert
+        assert_eq!(
+            db.get_note("global").unwrap().as_deref(),
+            Some("Prefers concise answers with examples.")
+        );
+        // A collection-scoped note dies with its collection; global survives.
+        db.upsert_collection(&coll("c1")).unwrap();
+        db.set_note("c1", "Finance shelf notes").unwrap();
+        db.delete_collection("c1").unwrap();
+        assert_eq!(db.get_note("c1").unwrap(), None);
+        assert!(db.get_note("global").unwrap().is_some());
     }
 
     #[test]

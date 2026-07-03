@@ -55,8 +55,34 @@ const MAX_TURN_CHARS: usize = 1500;
 
 /// Assemble a grounded prompt from reranked passages with citation markers.
 pub fn build_prompt(question: &str, results: &[SearchResult]) -> String {
-    build_prompt_with_history(question, results, &[])
+    build_prompt_with_history(question, results, &[], None).0
 }
+
+/// What actually went into the assembled prompt, so the UI can show honest
+/// per-ask provenance ("context used for this answer") instead of the user
+/// guessing what the model saw. Computed by the builder itself — never inferred
+/// frontend-side, where it could drift from reality.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct PromptMeta {
+    /// User notebook text was injected (memory on + note non-empty).
+    pub notes_injected: bool,
+    /// Estimated tokens of the injected (possibly truncated) notes.
+    pub notes_tokens: usize,
+    /// The note exceeded its cap and was truncated for this ask.
+    pub notes_truncated: bool,
+    /// One-liner digest lines included from turns older than the recent window.
+    pub digest_lines: usize,
+    /// Full recent turns included.
+    pub recent_turns: usize,
+    /// History turns dropped entirely (digest shed + window shed on budget).
+    pub dropped_turns: usize,
+    /// Estimated tokens of the whole assembled prompt.
+    pub prompt_tokens: usize,
+}
+
+/// Cap for injected notebook text. Small on purpose: notes are standing hints,
+/// not a second corpus — grounding sources keep the bulk of the budget.
+pub const NOTES_TOKEN_CAP: usize = 600;
 
 /// Reserve this many tokens of the context window for the model's output, so a
 /// long prompt can't crowd out the answer.
@@ -132,18 +158,44 @@ const DIGEST_TOKEN_CAP: usize = 800;
 /// resolve follow-ups ("what about X?"). Retrieval still targets the current
 /// question; history is context only, not a source to cite. Turns older than the
 /// recent window are compressed into an "Earlier in this conversation" digest of
-/// one-liners (capped) instead of vanishing. If the assembled prompt would exceed
-/// the context budget, digest lines are shed first (oldest first), then full
-/// turns — the grounding sources and the question are never trimmed.
+/// one-liners (capped) instead of vanishing. `notes` is the user's notebook —
+/// injected under an explicitly non-citable header and NEVER into the numbered
+/// Sources block, so citation contamination is structurally impossible. If the
+/// assembled prompt would exceed the context budget, digest lines are shed first
+/// (oldest first), then full turns — the grounding sources and the question are
+/// never trimmed. Returns the prompt plus a [`PromptMeta`] describing exactly
+/// what went in.
 pub fn build_prompt_with_history(
     question: &str,
     results: &[SearchResult],
     history: &[HistoryTurn],
-) -> String {
+    notes: Option<&str>,
+) -> (String, PromptMeta) {
+    let mut meta = PromptMeta::default();
+
     let mut sources = String::new();
     for r in results {
         sources.push_str(&format!("[{}] {}\n{}\n\n", r.rank, r.citation, r.text));
     }
+
+    // Notebook block: capped, truncated from the end (char-boundary-safe), and
+    // framed as context the model must not cite.
+    let notes_block = match notes.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(note) => {
+            let mut text = note.to_string();
+            while estimate_tokens(&text) > NOTES_TOKEN_CAP {
+                let keep = text.chars().count() * 9 / 10;
+                text = text.chars().take(keep).collect();
+                meta.notes_truncated = true;
+            }
+            meta.notes_injected = true;
+            meta.notes_tokens = estimate_tokens(&text);
+            format!(
+                "Reader's notes (context only — do NOT cite these; the numbered sources below take precedence):\n{text}\n\n"
+            )
+        }
+        None => String::new(),
+    };
 
     let start = history.len().saturating_sub(MAX_HISTORY_TURNS);
 
@@ -187,6 +239,7 @@ pub fn build_prompt_with_history(
 
     let assemble = |digest: &[String], turns: &[(&str, String)]| -> String {
         let mut context = String::new();
+        context.push_str(&notes_block);
         if !digest.is_empty() {
             context.push_str("Earlier in this conversation:\n");
             for line in digest {
@@ -218,7 +271,12 @@ pub fn build_prompt_with_history(
         }
         prompt = assemble(&digest, &window);
     }
-    prompt
+
+    meta.digest_lines = digest.len();
+    meta.recent_turns = window.len();
+    meta.dropped_turns = history.len() - digest.len() - window.len();
+    meta.prompt_tokens = estimate_tokens(&prompt);
+    (prompt, meta)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -882,7 +940,7 @@ mod tests {
             history.push(turn("user", &format!("follow-up {i}")));
             history.push(turn("assistant", &format!("answer {i} [1]")));
         }
-        let prompt = build_prompt_with_history("next question", &[], &history);
+        let (prompt, meta) = build_prompt_with_history("next question", &[], &history, None);
         // Old turns appear as digest one-liners, stripped of markers.
         assert!(prompt.contains("Earlier in this conversation:"));
         assert!(prompt.contains("- User: tell me about sagas"));
@@ -899,7 +957,7 @@ mod tests {
     #[test]
     fn short_history_has_no_digest() {
         let history = vec![turn("user", "q1"), turn("assistant", "a1 [1]")];
-        let prompt = build_prompt_with_history("q2", &[], &history);
+        let (prompt, _meta) = build_prompt_with_history("q2", &[], &history, None);
         assert!(!prompt.contains("Earlier in this conversation:"));
         assert!(prompt.contains("User: q1"));
         assert!(!prompt.contains("[1]")); // assistant marker stripped
@@ -1017,10 +1075,11 @@ mod tests {
                 content: "Lightweight threads [1].".into(),
             },
         ];
-        let p = build_prompt_with_history(
+        let (p, _) = build_prompt_with_history(
             "how do they differ from threads?",
             &[result(1, "Kotlin · p.5", "Coroutines suspend.")],
             &history,
+            None,
         );
         assert!(p.contains("Conversation so far:"));
         assert!(p.contains("User: what are coroutines?"));
@@ -1030,6 +1089,51 @@ mod tests {
         assert!(p.contains("how do they differ from threads?"));
         // No history -> no conversation block.
         assert!(!build_prompt("q", &[]).contains("Conversation so far"));
+    }
+
+    #[test]
+    fn notes_inject_noncitable_and_capped() {
+        // Non-empty note is injected under the non-citable header, before Sources.
+        let (p, meta) = build_prompt_with_history(
+            "q",
+            &[result(1, "Book · p.1", "Passage.")],
+            &[],
+            Some("Prefers concise answers. Focus on Rust and finance."),
+        );
+        assert!(meta.notes_injected && !meta.notes_truncated);
+        let notes_pos = p.find("Reader's notes").unwrap();
+        let sources_pos = p.find("Sources:").unwrap();
+        assert!(notes_pos < sources_pos, "notes must precede Sources");
+        assert!(p.contains("do NOT cite these"));
+        // The note never appears inside the numbered Sources block.
+        assert!(!p[sources_pos..].contains("Prefers concise answers"));
+
+        // Empty / whitespace-only notes inject nothing.
+        let (p2, meta2) = build_prompt_with_history("q", &[], &[], Some("   "));
+        assert!(!meta2.notes_injected && !p2.contains("Reader's notes"));
+        let (_, meta3) = build_prompt_with_history("q", &[], &[], None);
+        assert!(!meta3.notes_injected);
+
+        // Oversized notes get truncated to the cap (and flagged).
+        let big = "word ".repeat(3000); // ~3750 tokens
+        let (_, meta4) = build_prompt_with_history("q", &[], &[], Some(&big));
+        assert!(meta4.notes_injected && meta4.notes_truncated);
+        assert!(meta4.notes_tokens <= NOTES_TOKEN_CAP);
+    }
+
+    #[test]
+    fn prompt_meta_counts_history() {
+        let mut history = Vec::new();
+        for i in 0..5 {
+            history.push(turn("user", &format!("q{i}")));
+            history.push(turn("assistant", &format!("a{i}")));
+        }
+        // 10 turns: 6 recent, 4 digested, 0 dropped.
+        let (_, meta) = build_prompt_with_history("next", &[], &history, None);
+        assert_eq!(meta.recent_turns, 6);
+        assert_eq!(meta.digest_lines, 4);
+        assert_eq!(meta.dropped_turns, 0);
+        assert!(meta.prompt_tokens > 0);
     }
 
     fn content(s: &str) -> LineOut {

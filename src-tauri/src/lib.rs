@@ -857,6 +857,47 @@ async fn reveal_data_folder(state: State<'_, AppState>) -> Result<String, String
     Ok(dir.to_string_lossy().into_owned())
 }
 
+/// The user's notebook for a scope ("global" or a collection id). Empty string
+/// if unset, so the UI can bind a textarea directly.
+#[tauri::command]
+async fn get_note(state: State<'_, AppState>, scope: String) -> Result<String, String> {
+    Ok(state
+        .db()?
+        .get_note(&scope)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default())
+}
+
+/// Save the user's notebook for a scope. Only ever called from an explicit user
+/// action — the app never writes memory autonomously ("ledger, not brain").
+#[tauri::command]
+async fn set_note(
+    state: State<'_, AppState>,
+    scope: String,
+    content: String,
+) -> Result<(), String> {
+    state
+        .db()?
+        .set_note(&scope, &content)
+        .map_err(|e| e.to_string())
+}
+
+/// Export the notebook to a Markdown file in the artifacts folder; returns the path.
+#[tauri::command]
+async fn export_note(state: State<'_, AppState>, scope: String) -> Result<String, String> {
+    let note = state
+        .db()?
+        .get_note(&scope)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let dir = PathBuf::from(state.settings().artifacts_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("notebook.md");
+    std::fs::write(&path, format!("# LibSearch notebook ({scope})\n\n{note}\n"))
+        .map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 #[derive(serde::Serialize)]
 struct DataSafety {
     at_risk: bool,
@@ -1273,7 +1314,18 @@ async fn ask(
     } else {
         model
     };
-    let prompt = build_prompt_with_history(&question, &results, &history);
+    // The user's notebook (Settings → Memory) enters the prompt as non-citable
+    // context — never the Sources block — and only when memory is enabled.
+    let notes = if settings.memory_enabled {
+        db.get_note("global").unwrap_or_default()
+    } else {
+        None
+    };
+    let (prompt, prompt_meta) =
+        build_prompt_with_history(&question, &results, &history, notes.as_deref());
+    // Honest per-ask provenance: what actually went into this prompt (notes,
+    // digest lines, dropped turns) — computed by the builder, not inferred by UI.
+    let _ = window.emit("ask-context", &prompt_meta);
     // Whole-book / aggregative questions are answered from only a few passages, so
     // prepend an honest caveat (it streams first and is saved with the answer).
     let caveat = if is_aggregative(&question) {
@@ -1778,6 +1830,9 @@ pub fn run() {
             probe_provider,
             warm_model,
             reveal_data_folder,
+            get_note,
+            set_note,
+            export_note,
             data_safety,
             check_llm,
             get_settings,
