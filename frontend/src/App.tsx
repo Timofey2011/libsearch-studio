@@ -1846,7 +1846,13 @@ export default function App() {
             <h2>Library map</h2>
             {themeMap ? (
               <div className="muted">
-                {themeMap.book_count} books · generated {new Date(themeMap.generated_at).toLocaleString()} · {themeMap.model}
+                {/* Provenance of the CACHED map — the model that BUILT it, which can
+                    differ from the currently selected one until a Rebuild. */}
+                {themeMap.book_count} books · built {new Date(themeMap.generated_at).toLocaleString()} with{" "}
+                {themeMap.model}
+                {model && themeMap.model !== model && (
+                  <> — current model is {model}; Rebuild to refresh</>
+                )}
               </div>
             ) : (
               <div className="muted">A map of {collLabel} into themes you can explore — click an angle to launch a focused, grounded question.</div>
@@ -1859,7 +1865,12 @@ export default function App() {
                 <button className={themeView === "list" ? "on" : ""} onClick={() => setThemeView("list")}>List</button>
               </div>
             )}
-            <button className="primary" onClick={buildMap} disabled={buildingMap || !collIds.length}>
+            <button
+              className="primary"
+              onClick={buildMap}
+              disabled={buildingMap || !collIds.length}
+              title={model ? `Build the map with the current model (${model})` : "Build the map"}
+            >
               {buildingMap ? "Building…" : themeMap ? "Rebuild" : "Build map"}
             </button>
           </div>
