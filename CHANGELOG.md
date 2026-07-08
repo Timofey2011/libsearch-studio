@@ -2,6 +2,14 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.6.3 — 2026-07-08
+
+Bump manifests 0.6.2 → 0.6.3.
+- Themes: the Library-map header now labels its model as provenance ("built
+  <date> with <model>") and, when that differs from the currently selected
+  model, says so and points at Rebuild — it previously read like a live
+  setting, so a cached gemma-built map looked wrong after switching providers.
+
 ## v0.6.2 — 2026-07-02
 
 Bump manifests 0.6.1 → 0.6.2. Completes Roadmap-2's mid-term tier:
