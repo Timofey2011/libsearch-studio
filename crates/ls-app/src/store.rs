@@ -192,6 +192,18 @@ impl Db {
         })
     }
 
+    /// The note plus its last-edit time (unix secs) — for the staleness cue.
+    pub fn get_note_info(&self, scope: &str) -> Result<Option<(String, i64)>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT content, updated_at FROM notebook WHERE scope = ?1")?;
+        let mut rows = stmt.query(params![scope])?;
+        Ok(match rows.next()? {
+            Some(row) => Some((row.get(0)?, row.get(1)?)),
+            None => None,
+        })
+    }
+
     /// Upsert the user's note for a scope (explicit user action only).
     pub fn set_note(&self, scope: &str, content: &str) -> Result<(), DbError> {
         self.conn.execute(

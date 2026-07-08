@@ -29,7 +29,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # Reuse the validated Python engine (extraction, chunking, MPS embedding).
-EBOOK_KB = "/Users/timofeybeschastnov/Library/CloudStorage/Dropbox/LibSearch"
+# Override with EBOOK_KB_DIR if your ebook-kb checkout lives elsewhere.
+EBOOK_KB = os.environ.get(
+    "EBOOK_KB_DIR",
+    os.path.expanduser("~/Library/CloudStorage/Dropbox/LibSearch"),
+)
 sys.path.insert(0, EBOOK_KB)
 
 from src.chunk import ChunkParams, chunk_book, default_token_counter  # noqa: E402

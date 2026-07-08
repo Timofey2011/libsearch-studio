@@ -878,6 +878,32 @@ async fn get_note(state: State<'_, AppState>, scope: String) -> Result<String, S
         .unwrap_or_default())
 }
 
+#[derive(serde::Serialize)]
+struct NoteInfo {
+    content: String,
+    /// Unix seconds of the last edit; 0 when the note has never been set.
+    updated_at: i64,
+}
+
+/// Notebook content + last-edit time, for the Memory tab's staleness cue.
+#[tauri::command]
+async fn get_note_info(state: State<'_, AppState>, scope: String) -> Result<NoteInfo, String> {
+    let info = state
+        .db()?
+        .get_note_info(&scope)
+        .map_err(|e| e.to_string())?;
+    Ok(match info {
+        Some((content, updated_at)) => NoteInfo {
+            content,
+            updated_at,
+        },
+        None => NoteInfo {
+            content: String::new(),
+            updated_at: 0,
+        },
+    })
+}
+
 /// Save the user's notebook for a scope. Only ever called from an explicit user
 /// action — the app never writes memory autonomously ("ledger, not brain").
 #[tauri::command]
@@ -1919,6 +1945,7 @@ pub fn run() {
             warm_model,
             reveal_data_folder,
             get_note,
+            get_note_info,
             set_note,
             export_note,
             data_safety,

@@ -707,6 +707,27 @@ impl OllamaClient {
         on_token: impl FnMut(&str),
         on_reasoning: impl FnMut(&str),
     ) -> Result<(String, Usage), LlmError> {
+        self.generate_stream_opts(model, prompt, GenOpts::default(), on_token, on_reasoning)
+            .await
+    }
+
+    /// Like [`OllamaClient::generate_stream`] with explicit generation params —
+    /// the fixture harness pins `temperature: 0` + a seed for determinism.
+    pub async fn generate_stream_opts(
+        &self,
+        model: &str,
+        prompt: &str,
+        opts: GenOpts,
+        on_token: impl FnMut(&str),
+        on_reasoning: impl FnMut(&str),
+    ) -> Result<(String, Usage), LlmError> {
+        let mut options = serde_json::json!({ "num_ctx": NUM_CTX });
+        if let Some(t) = opts.temperature {
+            options["temperature"] = t.into();
+        }
+        if let Some(seed) = opts.seed {
+            options["seed"] = seed.into();
+        }
         let resp = self
             .http
             .post(format!("{}/api/generate", self.base))
@@ -714,13 +735,23 @@ impl OllamaClient {
                 "model": model,
                 "prompt": prompt,
                 "stream": true,
-                "options": { "num_ctx": NUM_CTX }
+                "options": options
             }))
             .send()
             .await?
             .error_for_status()?;
         run_stream(resp, parse_generate_line, on_token, on_reasoning).await
     }
+}
+
+/// Optional generation parameters. `None` fields leave the provider's defaults
+/// untouched (the app's normal path); the answer-fixture harness pins
+/// `temperature: 0` + a fixed seed so assertions are repeatable. Seed is honored
+/// by Ollama and OpenAI-compatible providers; Anthropic supports temperature only.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenOpts {
+    pub temperature: Option<f32>,
+    pub seed: Option<i64>,
 }
 
 /// Current Claude model ids offered when the Anthropic provider is selected.

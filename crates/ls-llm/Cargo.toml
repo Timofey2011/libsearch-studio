@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Answer-side fixture tests that call a real local Ollama model at temperature 0.
+# Off by default so `cargo test` stays fast and offline.
+fixtures = []
+
 [dependencies]
 ls-query = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

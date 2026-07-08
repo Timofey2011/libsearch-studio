@@ -205,6 +205,7 @@ export default function App() {
   // The user's global notebook (Settings → Memory); loaded when the tab opens.
   const [note, setNote] = useState("");
   const [noteStatus, setNoteStatus] = useState<string | null>(null);
+  const [noteUpdatedAt, setNoteUpdatedAt] = useState(0); // unix secs; 0 = never
   // Re-index nudge: books chunked by an older scheme in the current collection.
   const [legacyBooks, setLegacyBooks] = useState(0);
   const [nudgeDismissed, setNudgeDismissed] = useState(false);
@@ -284,7 +285,12 @@ export default function App() {
   // Load the notebook when the Memory tab opens.
   useEffect(() => {
     if (!toolsOpen || toolsTab !== "memory") return;
-    invoke<string>("get_note", { scope: "global" }).then(setNote).catch(console.error);
+    invoke<{ content: string; updated_at: number }>("get_note_info", { scope: "global" })
+      .then((i) => {
+        setNote(i.content);
+        setNoteUpdatedAt(i.updated_at);
+      })
+      .catch(console.error);
     setNoteStatus(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [toolsOpen, toolsTab]);
@@ -1472,6 +1478,7 @@ export default function App() {
   async function saveNote() {
     try {
       await invoke("set_note", { scope: "global", content: note });
+      setNoteUpdatedAt(Math.floor(Date.now() / 1000));
       setNoteStatus("Saved ✓");
     } catch (e) {
       setNoteStatus("Error: " + String(e));
@@ -1507,6 +1514,19 @@ export default function App() {
           />
           <span>Use my notes when answering (off = notes are kept but never sent to the model)</span>
         </label>
+        {(() => {
+          // Staleness cue: standing notes silently steer every answer, so nudge a
+          // review when they haven't been touched in ~3 months.
+          const days = noteUpdatedAt > 0 ? Math.floor((Date.now() / 1000 - noteUpdatedAt) / 86400) : 0;
+          return note.trim() && days > 90 ? (
+            <div className="nudge" style={{ marginBottom: 8 }}>
+              <span>
+                These notes were last updated {days} days ago and still shape every answer — worth a quick
+                re-read?
+              </span>
+            </div>
+          ) : null;
+        })()}
         <textarea
           className="note-editor"
           value={note}
