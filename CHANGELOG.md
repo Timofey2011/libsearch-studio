@@ -2,6 +2,19 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.6.4 — 2026-07-08
+
+Bump manifests 0.6.3 → 0.6.4.
+- Answer-side fixture harness (cargo test -p ls-llm --features fixtures): real
+  temperature-0 generations proving memory can't contaminate citations — no
+  [n] cited that exists only in history/notes; a contradicting note never
+  flips a sourced fact. New GenOpts (temperature/seed) on all providers.
+- Memory tab nudges a re-read when notes are >90 days old (they shape every
+  answer silently).
+- scripts/index_to_parquet.py: personal absolute path replaced with an env
+  override (repo-public audit: no secrets anywhere in history; this was the
+  only personal-info exposure).
+
 ## v0.6.3 — 2026-07-08
 
 Bump manifests 0.6.2 → 0.6.3.
