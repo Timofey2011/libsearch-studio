@@ -1,9 +1,23 @@
 name: CI
 
+# COST NOTE: macOS runners bill at 10x — CI deliberately runs ubuntu-only.
+# macOS is exercised constantly by local development and the local release
+# script (scripts/publish_release.sh); paying 10x to smoke-build it again in CI
+# added no signal and helped exhaust a 2,000-minute monthly allotment. The
+# ubuntu jobs are the only coverage a macOS dev machine can't provide.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "CHANGELOG.md"
   pull_request:
+
+# A superseded push cancels the previous in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,19 +39,10 @@ jobs:
       - run: cargo clippy --workspace --exclude app --all-targets -- -D warnings
       - run: cargo test --workspace --exclude app
 
-  # Smoke-build the desktop app (no installers, no signing) on both platforms.
-  # The bundle target is per-OS: `app` (.app) exists only on macOS; Linux offers
-  # deb/rpm/appimage — deb is the lightest smoke-build.
+  # Smoke-build the desktop app on Linux only (deb is the lightest bundle).
+  # macOS is covered by local dev + the local release build; see COST NOTE.
   bundle:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            bundles: app
-          - os: ubuntu-latest
-            bundles: deb
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -50,11 +55,7 @@ jobs:
           node-version: 20
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
       - name: Install Linux system deps
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libwebkit2gtk-4.1-dev \
@@ -62,4 +63,4 @@ jobs:
       - run: pnpm --dir frontend install --frozen-lockfile
       # Run the Tauri CLI from the repo root so src-tauri/ is discoverable.
       - name: Build app bundle
-        run: ./frontend/node_modules/.bin/tauri build --bundles ${{ matrix.bundles }}
+        run: ./frontend/node_modules/.bin/tauri build --bundles deb

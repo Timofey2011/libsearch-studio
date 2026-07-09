@@ -1,12 +1,18 @@
 name: Release
 
-# Publish a GitHub Release with the packaged .dmg whenever a version tag is pushed.
-#   git tag -a v0.5.9 -m "LibSearch Studio v0.5.9" && git push origin v0.5.9
-# The release body is the tagged commit's message + install/Gatekeeper notes + a
-# SHA-256 of the dmg. Builds on an Apple-Silicon runner (arm64 .dmg).
+# MANUAL FALLBACK ONLY. The normal release path is scripts/publish_release.sh,
+# which builds the dmg locally (free) and uploads it. This workflow used to
+# fire on every tag push, rebuilding the same dmg cold on a macOS runner —
+# at GitHub's 10x macOS billing that was ~220 billed minutes per release for
+# zero added value (it burned most of a 2,000-minute monthly allotment in one
+# session). Dispatch it by hand only when a release must be built away from a
+# Mac: Actions → Release → Run workflow → enter the tag.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to build and release (e.g. v0.7.0)"
+        required: true
 
 permissions:
   contents: write # create releases + upload assets
@@ -16,6 +22,8 @@ jobs:
     runs-on: macos-latest # Apple Silicon → arm64 build
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: pnpm/action-setup@v4
@@ -48,7 +56,7 @@ jobs:
           SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
           {
             # The tagged commit's body is the human-written release notes.
-            git tag -l --format='%(contents:body)' "${GITHUB_REF_NAME}"
+            git tag -l --format='%(contents:body)' "${{ inputs.tag }}"
             echo
             echo '### Install (macOS, Apple Silicon)'
             echo
@@ -64,6 +72,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
           files: ${{ steps.notes.outputs.dmg }}
           body_path: RELEASE_NOTES.md
           draft: false

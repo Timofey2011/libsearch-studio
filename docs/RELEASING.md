@@ -2,12 +2,15 @@
 
 How to cut a version and publish it to GitHub with the packaged `.dmg`.
 
-There are two publish paths — pick one:
+The publish path is **local**: `scripts/publish_release.sh` builds the `.dmg`
+on your Mac and uploads it. Fast, zero CI minutes, and it's the arm64 build you
+already test.
 
-- **Local** (`scripts/publish_release.sh`) — you build the `.dmg` on your Mac and
-  upload it. Fast, no CI minutes, and it's the arm64 build you already test.
-- **CI** (`.github/workflows/release.yml`) — pushing a `vN` tag builds the `.dmg`
-  on a GitHub Apple-Silicon runner and creates the release automatically.
+The CI path (`.github/workflows/release.yml`) is a **manual fallback only**,
+for releasing when away from a Mac: Actions → Release → *Run workflow* → enter
+the tag. It no longer fires on tag pushes — macOS runners bill at **10×**, and
+the automatic run used to rebuild the locally-published dmg cold (~220 billed
+minutes per release, for nothing).
 
 Both produce the same thing: a GitHub Release for tag `vN` with the `.dmg`
 attached, install/Gatekeeper notes, and a SHA-256.
@@ -67,11 +70,8 @@ owner/name; keep it in sync with the `repository` field in `Cargo.toml`.)
    scripts/publish_release.sh            # local: pushes + uploads the dmg you built
    ```
 
-   or let CI do it:
-
-   ```sh
-   git push origin main --follow-tags    # the vX.Y.Z tag triggers release.yml
-   ```
+   (Pushing the tag alone no longer publishes anything — run the script, or
+   manually dispatch the Release workflow from the Actions tab as a fallback.)
 
    Re-running `publish_release.sh` for an existing tag updates the notes and
    re-uploads the dmg (`--clobber`), so it's safe to re-run.
