@@ -878,6 +878,38 @@ async fn get_note(state: State<'_, AppState>, scope: String) -> Result<String, S
         .unwrap_or_default())
 }
 
+/// Read a text source (Markdown) for in-app rendering. Size-capped so a
+/// mis-tagged huge file can't balloon the webview.
+#[tauri::command]
+async fn read_source_text(path: String) -> Result<String, String> {
+    const CAP: u64 = 4 * 1024 * 1024;
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    if meta.len() > CAP {
+        return Err(format!(
+            "file is {:.1} MB — too large to preview in-app",
+            meta.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+/// Open a source file in the OS default application (e.g. Books/Calibre for
+/// .epub) — the fallback for formats the in-app reader can't render.
+#[tauri::command]
+async fn open_in_default_app(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(target_os = "linux")]
+    let opener = "xdg-open";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let opener = "open";
+    std::process::Command::new(opener)
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("couldn't open {path}: {e}"))?;
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 struct NoteInfo {
     content: String,
@@ -1945,6 +1977,8 @@ pub fn run() {
             warm_model,
             reveal_data_folder,
             get_note,
+            read_source_text,
+            open_in_default_app,
             get_note_info,
             set_note,
             export_note,

@@ -115,7 +115,18 @@ const ANGLES: { label: string; q: (t: string) => string }[] = [
   { label: "Critique", q: (t) => `What are the main criticisms or limitations discussed about ${t}?` },
 ];
 
-type Reader = { path: string; page: number | null; missing: boolean };
+type ReaderKind = "pdf" | "md" | "other";
+type Reader = {
+  path: string;
+  page: number | null;
+  missing: boolean;
+  kind: ReaderKind;
+  /// The cited passage (for scroll/highlight in md, and shown for non-renderable formats).
+  citeText?: string;
+  /// Loaded Markdown content (kind === "md").
+  text?: string;
+  error?: string;
+};
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
 // doesn't surface (e.g. models_dir) are preserved on save.
@@ -253,6 +264,7 @@ export default function App() {
         ? collections.find((c) => c.id === collIds[0])?.name ?? "1 collection"
         : `${collIds.length} collections`;
   const scrollRef = useRef<HTMLDivElement>(null);
+  const mdReaderRef = useRef<HTMLDivElement>(null);
   const logRef = useRef<HTMLPreElement>(null);
   const thinkRef = useRef<HTMLDivElement>(null);
 
@@ -281,6 +293,31 @@ export default function App() {
     if (key && !probe[prov]) probeProvider(prov, key);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [toolsOpen, toolsTab, settings?.llm_provider]);
+
+  // When a Markdown source loads, scroll to (and briefly highlight) the cited
+  // passage: find the first rendered text node containing the passage's prefix.
+  useEffect(() => {
+    const host = mdReaderRef.current;
+    const cite = reader?.citeText;
+    if (!host || !reader?.text || !cite) return;
+    const norm = (x: string) => x.replace(/\s+/g, " ").trim().toLowerCase();
+    const needle = norm(cite).slice(0, 60);
+    if (!needle) return;
+    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+    let node: Node | null;
+    while ((node = walker.nextNode())) {
+      if (norm(node.textContent ?? "").includes(needle.slice(0, 40))) {
+        const el = node.parentElement;
+        if (el) {
+          el.scrollIntoView({ block: "center" });
+          el.classList.add("cite-flash");
+          setTimeout(() => el.classList.remove("cite-flash"), 2500);
+        }
+        break;
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reader?.text]);
 
   // Load the notebook when the Memory tab opens.
   useEffect(() => {
@@ -831,14 +868,27 @@ export default function App() {
   }
 
   async function openSource(s: Src) {
-    setReader({ path: s.source_path, page: s.page, missing: false });
+    // The reader iframe only renders PDFs (WKWebView native); Markdown renders
+    // in-app, anything else (epub/mobi/…) gets a passage view + external open.
+    const ext = (s.source_path.split(".").pop() ?? "").toLowerCase();
+    const kind: ReaderKind = ext === "pdf" ? "pdf" : ext === "md" || ext === "markdown" || ext === "txt" ? "md" : "other";
+    setReader({ path: s.source_path, page: s.page, missing: false, kind, citeText: s.text });
     // The book may have been moved/renamed since indexing — warn instead of
     // showing a silently-blank reader.
     try {
       const ok = await invoke<boolean>("source_exists", { path: s.source_path });
       setReader((r) => (r && r.path === s.source_path ? { ...r, missing: !ok } : r));
+      if (!ok) return;
     } catch {
-      /* leave as-is; the iframe will render whatever it can */
+      /* leave as-is */
+    }
+    if (kind === "md") {
+      try {
+        const text = await invoke<string>("read_source_text", { path: s.source_path });
+        setReader((r) => (r && r.path === s.source_path ? { ...r, text } : r));
+      } catch (e) {
+        setReader((r) => (r && r.path === s.source_path ? { ...r, error: String(e) } : r));
+      }
     }
   }
 
@@ -2344,8 +2394,40 @@ export default function App() {
                 Open Settings → Collections
               </button>
             </div>
-          ) : (
+          ) : reader.kind === "pdf" ? (
             <iframe key={readerSrc} title="source" src={readerSrc} />
+          ) : reader.kind === "md" ? (
+            <div className="reader-md" ref={mdReaderRef}>
+              {reader.error ? (
+                <div className="reader-missing">
+                  <h3>Couldn't preview this file</h3>
+                  <p>{reader.error}</p>
+                  <button className="primary" onClick={() => invoke("open_in_default_app", { path: reader.path }).catch(console.error)}>
+                    Open in default app
+                  </button>
+                </div>
+              ) : reader.text ? (
+                renderRich(reader.text, [])
+              ) : (
+                <div className="muted" style={{ padding: 16 }}>Loading…</div>
+              )}
+            </div>
+          ) : (
+            <div className="reader-missing">
+              <h3>No in-app preview for this format yet</h3>
+              <p>
+                <code className="missing-path">{reader.path.split("/").pop()}</code> is an ebook format the
+                built-in reader can't display (it renders PDFs and Markdown). The cited passage:
+              </p>
+              {reader.citeText && <blockquote className="cite-quote">{reader.citeText}</blockquote>}
+              <button
+                className="primary"
+                onClick={() => invoke("open_in_default_app", { path: reader.path }).catch(console.error)}
+                title="Open with the app your system associates with this format (e.g. Books or Calibre)"
+              >
+                Open in your ebook app
+              </button>
+            </div>
           )}
         </div>
       )}
