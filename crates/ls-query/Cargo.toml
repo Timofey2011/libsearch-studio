@@ -16,3 +16,6 @@ ls-index = { workspace = true }
 ls-embed = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

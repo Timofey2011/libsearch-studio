@@ -362,7 +362,14 @@ impl Store {
 
         let clauses: Vec<(Occur, _)> = text
             .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
+            // ASCII tokens only, for two independent upstream reasons: (1) lance
+            // byte-slices the prefix anchor, panicking a worker thread on
+            // multi-byte-leading tokens; (2) fst 0.4.7's Levenshtein automaton
+            // matches NOTHING for non-ASCII queries at fuzziness ≥ 1 (verified
+            // with a minimal repro), so non-ASCII fuzzy clauses only burn latency.
+            // Non-ASCII typo tolerance is provided by ls-query's correct_query
+            // spell-repair instead, which is language-agnostic.
+            .filter(|t| !t.is_empty() && t.is_ascii())
             .map(|tok| {
                 let fz = MatchQuery::auto_fuzziness(tok);
                 let mq = MatchQuery::new(tok.to_string())
