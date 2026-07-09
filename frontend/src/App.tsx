@@ -2,6 +2,7 @@ import { Fragment, useDeferredValue, useEffect, useMemo, useRef, useState } from
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import PdfReader from "./PdfReader";
 
 type Collection = {
   id: string;
@@ -129,6 +130,8 @@ type Reader = {
   /// Loaded Markdown content (kind === "md").
   text?: string;
   error?: string;
+  /// PDF.js couldn't open this file — fall back to the native iframe viewer.
+  pdfNative?: boolean;
 };
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
@@ -2623,8 +2626,8 @@ export default function App() {
                 onClick={() => setReaderFull((f) => !f)}
                 title={
                   readerFull
-                    ? reader.kind === "pdf"
-                      ? "Back to split view" // Esc dies once the PDF iframe takes focus
+                    ? reader.kind === "pdf" && reader.pdfNative
+                      ? "Back to split view" // Esc dies once the native PDF iframe takes focus
                       : "Back to split view (Esc)"
                     : "Read full screen"
                 }
@@ -2659,7 +2662,19 @@ export default function App() {
               </button>
             </div>
           ) : reader.kind === "pdf" ? (
-            <iframe key={readerSrc} title="source" src={readerSrc} />
+            reader.pdfNative ? (
+              <iframe key={readerSrc} title="source" src={readerSrc} />
+            ) : (
+              <PdfReader
+                key={reader.path}
+                url={convertFileSrc(reader.path)}
+                page={reader.page ?? undefined}
+                full={readerFull}
+                onFail={() =>
+                  setReader((r) => (r && r.path === reader.path ? { ...r, pdfNative: true } : r))
+                }
+              />
+            )
           ) : reader.kind === "md" ? (
             <div className="reader-md" ref={mdReaderRef}>
               {reader.error ? (

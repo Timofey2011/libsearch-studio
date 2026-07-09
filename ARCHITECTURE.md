@@ -98,10 +98,22 @@ The UI shows a **single Index button** that routes to whichever engine is availa
 
 ## The reader
 
-Clicking a citation opens the source PDF in a split pane. The pane is an `<iframe>` pointing at
-`convertFileSrc(path) + "#page=N"` — the system WebView's built-in PDF viewer honors the
-`#page` fragment to jump to the cited page. The Tauri **asset protocol** is enabled with scope
-`$HOME/**` so local files render. (EPUB/MOBI rendering is out of scope for v1.)
+Clicking a citation opens the source in a split pane; a **⛶ Reader view** button expands it
+full-window. PDFs render through `PdfReader.tsx`, a custom **PDF.js** (pdfjs-dist v6) viewer:
+virtualized page rasterization (IntersectionObserver renders only pages near the viewport and
+evicts far ones, plus `page.cleanup()` to drop pdf.js's decoded-image caches), fit-width /
+fit-page / zoom, a current-page/total counter with go-to-page, and document-wide find with
+per-item highlight via the selectable text layer. The document is fetched from the Tauri
+**asset protocol** (scope `$HOME/**`); the system WebView's native PDF `<iframe>` is kept only
+as a fallback when PDF.js can't open a file. Markdown renders in-app; EPUB/MOBI show the cited
+passage with an open-externally button.
+
+Two WKWebView traps worth remembering: custom-scheme handlers do **not** intercept fetches
+made inside Web Workers (so pdfjs asset fetches use `useWorkerFetch: false` to stay on the
+main thread), and JavaScriptCore has no async iteration over `ReadableStream` (so text is read
+with a manual `getReader()` pump instead of `getTextContent()`, which internally does
+`for await`). The pdfjs cmaps / standard fonts / wasm decoders are copied into `public/pdfjs/`
+by `frontend/scripts/copy-pdfjs-assets.mjs` (predev/prebuild hooks; gitignored).
 
 ## Models & inference
 
