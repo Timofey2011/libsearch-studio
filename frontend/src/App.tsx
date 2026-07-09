@@ -254,6 +254,7 @@ export default function App() {
   const [catalogFor, setCatalogFor] = useState("");
   const [catFilter, setCatFilter] = useState("");
   const [indexLetter, setIndexLetter] = useState("A");
+  const [mapProgress, setMapProgress] = useState<string | null>(null);
   const [exploreTree, setExploreTree] = useState<BNode[]>([]);
   const [focusPath, setFocusPath] = useState<number[]>([]);
   const [deepening, setDeepening] = useState(false);
@@ -449,12 +450,15 @@ export default function App() {
         return copy;
       })
     );
+    // Live progress for the (potentially multi-minute) theme-map build.
+    const unMap = listen<string>("map-progress", (e) => setMapProgress(e.payload));
     return () => {
       unTok.then((f) => f());
       unThink.then((f) => f());
       unUsage.then((f) => f());
       unProv.then((f) => f());
       unCtx.then((f) => f());
+      unMap.then((f) => f());
     };
   }, []);
 
@@ -805,6 +809,7 @@ export default function App() {
     if (!collIds.length || buildingMap) return;
     setBuildingMap(true);
     setMapError(null);
+    setMapProgress(null);
     try {
       const m = await invoke<ThemeMap>("build_theme_map", { collectionIds: collIds, model });
       setThemeMap(m);
@@ -2082,7 +2087,7 @@ export default function App() {
             )}
           </div>
           <div className="row">
-            {!buildingMap && collIds.length > 0 && (
+            {collIds.length > 0 && (
               <div className="seg">
                 <button className={themeView === "explore" ? "on" : ""} onClick={() => setThemeView("explore")}>Explore</button>
                 <button className={themeView === "list" ? "on" : ""} onClick={() => setThemeView("list")}>List</button>
@@ -2105,16 +2110,25 @@ export default function App() {
 
         {!collIds.length && <div className="empty">Select a library in the Conversation tab first.</div>}
 
-        {collIds.length > 0 && buildingMap && (
-          <div className="empty">Reading your library and organizing it into themes… this uses your current model and can take a moment.</div>
+        {collIds.length > 0 && buildingMap && (themeView === "explore" || themeView === "list") && (
+          <div className="empty">
+            <div>Reading your library and organizing it into themes… slow models can take several minutes.</div>
+            {mapProgress && <div className="muted" style={{ marginTop: 6 }}>{mapProgress}</div>}
+            <div style={{ marginTop: 10 }}>
+              <button onClick={() => invoke("cancel_map").catch(console.error)}>■ Cancel build</button>
+            </div>
+            <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>
+              Titles and Index (above) work instantly — no need to wait.
+            </div>
+          </div>
         )}
 
         {collIds.length > 0 && !themeMap && !buildingMap && (themeView === "explore" || themeView === "list") && (
           <div className="empty">No map yet — click <b>Build map</b> to organize {collLabel} into browsable themes.</div>
         )}
 
-        {collIds.length > 0 && !buildingMap && themeView === "titles" && renderTitles()}
-        {collIds.length > 0 && !buildingMap && themeView === "index" && renderIndex()}
+        {collIds.length > 0 && themeView === "titles" && renderTitles()}
+        {collIds.length > 0 && themeView === "index" && renderIndex()}
 
         {themeMap && !buildingMap && themeView === "explore" && renderExplore()}
 

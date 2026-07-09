@@ -65,6 +65,8 @@ struct AppState {
     cancel: Arc<AtomicBool>,
     /// Set by `cancel_ask` (the Stop button) to abort an in-flight generation.
     ask_cancel: Arc<AtomicBool>,
+    /// Set by `cancel_map` to abort an in-flight theme-map build.
+    map_cancel: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -293,6 +295,14 @@ async fn cancel_indexing(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn cancel_ask(state: State<'_, AppState>) -> Result<(), String> {
     state.ask_cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Cancel an in-flight Library-map build (a multi-minute LLM generation on
+/// slow/reasoning models — without this it reads as a hang).
+#[tauri::command]
+async fn cancel_map(state: State<'_, AppState>) -> Result<(), String> {
+    state.map_cancel.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -1784,9 +1794,13 @@ async fn get_theme_map(
 #[tauri::command]
 async fn build_theme_map(
     state: State<'_, AppState>,
+    window: WebviewWindow,
     collection_ids: Vec<String>,
     model: String,
 ) -> Result<ThemeMap, String> {
+    // Fresh cancel flag FIRST, so a Cancel pressed during the title scan (before
+    // generation starts) is honored, never wiped (same lesson as the ask Stop).
+    state.map_cancel.store(false, Ordering::SeqCst);
     // Resolve collections (drop the !Send DB handle before any await).
     let colls: Vec<Collection> = {
         let db = state.db()?;
@@ -1883,11 +1897,52 @@ async fn build_theme_map(
     } else {
         model
     };
-    let (text, _usage) = state
-        .llm()
-        .generate_stream(&model, &prompt, |_| {}, |_| {})
-        .await
-        .map_err(|e| e.to_string())?;
+    // Stream with live progress (so a multi-minute build is visibly alive) and
+    // poll the cancel flag; dropping the future aborts the HTTP stream. A cancel
+    // that already arrived (during the title scan) skips generation entirely.
+    let map_cancel = state.map_cancel.clone();
+    if map_cancel.load(Ordering::SeqCst) {
+        return Err("map build cancelled".into());
+    }
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (p_tok, p_think) = (progress.clone(), progress.clone());
+    let (w_tok, w_think) = (window.clone(), window.clone());
+    let emit_every = 400usize;
+    let llm = state.llm();
+    let gen_fut = llm.generate_stream(
+        &model,
+        &prompt,
+        move |tok| {
+            let n = p_tok.fetch_add(tok.chars().count(), Ordering::Relaxed);
+            if n % emit_every < tok.chars().count() {
+                let _ = w_tok.emit("map-progress", format!("~{} chars generated…", n));
+            }
+        },
+        move |think| {
+            let n = p_think.fetch_add(think.chars().count(), Ordering::Relaxed);
+            if n % emit_every < think.chars().count() {
+                let _ = w_think.emit(
+                    "map-progress",
+                    format!("model is reasoning… (~{} chars)", n),
+                );
+            }
+        },
+    );
+    tokio::pin!(gen_fut);
+    let gen = loop {
+        tokio::select! {
+            r = &mut gen_fut => break Some(r),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                if map_cancel.load(Ordering::SeqCst) {
+                    break None;
+                }
+            }
+        }
+    };
+    let Some(gen) = gen else {
+        return Err("map build cancelled".into());
+    };
+    let (text, _usage) = gen.map_err(|e| e.to_string())?;
 
     let json = extract_json_array(&text).ok_or_else(|| {
         format!(
@@ -1911,7 +1966,7 @@ async fn build_theme_map(
 
     let map = ThemeMap {
         generated_at: now_millis(),
-        model,
+        model: model.clone(),
         book_count,
         themes,
     };
@@ -2008,6 +2063,7 @@ fn init_state() -> AppState {
         engine: Mutex::new(None),
         cancel: Arc::new(AtomicBool::new(false)),
         ask_cancel: Arc::new(AtomicBool::new(false)),
+        map_cancel: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -2061,6 +2117,7 @@ pub fn run() {
             fast_index_collection,
             cancel_indexing,
             cancel_ask,
+            cancel_map,
             setup_gpu_indexing,
             list_conversations,
             create_conversation,
