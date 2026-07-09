@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -254,6 +254,9 @@ export default function App() {
   const [catalogFor, setCatalogFor] = useState("");
   const [catFilter, setCatFilter] = useState("");
   const [indexLetter, setIndexLetter] = useState("A");
+  // The input stays instant; filtering runs against a deferred value so a
+  // keystroke never blocks on re-filtering/rendering 62k index entries.
+  const catQuery = useDeferredValue(catFilter);
   const [mapProgress, setMapProgress] = useState<string | null>(null);
   const [exploreTree, setExploreTree] = useState<BNode[]>([]);
   const [focusPath, setFocusPath] = useState<number[]>([]);
@@ -1952,6 +1955,29 @@ export default function App() {
     );
   }
 
+  // Lowercased search fields computed ONCE per catalog load — not per keystroke
+  // (62k entries × 2 toLowerCase per keystroke froze the Index search).
+  const searchableIndex = useMemo(
+    () =>
+      (catalog?.index ?? []).map((e) => ({
+        e,
+        low: e.label.toLowerCase() + "\u0000" + e.book.toLowerCase(),
+      })),
+    [catalog]
+  );
+  const searchableBooks = useMemo(
+    () =>
+      (catalog?.books ?? []).map((b) => ({
+        b,
+        low: b.title.toLowerCase() + "\u0000" + b.author.toLowerCase(),
+      })),
+    [catalog]
+  );
+
+  // Never render more than this many rows — a broad query ("a") matches tens of
+  // thousands of entries and mounting them all freezes the webview.
+  const RESULT_CAP = 800;
+
   // First grouping letter for A–Z browsing (non-letters bucket under '#').
   function groupLetter(x: string): string {
     const c = (x.trim()[0] ?? "#").toUpperCase();
@@ -1960,10 +1986,15 @@ export default function App() {
 
   function renderTitles() {
     if (!catalog) return <div className="empty">Loading titles…</div>;
-    const q = catFilter.trim().toLowerCase();
-    const books = catalog.books.filter(
-      (b) => !q || b.title.toLowerCase().includes(q) || b.author.toLowerCase().includes(q)
-    );
+    const q = catQuery.trim().toLowerCase();
+    const books: CatalogBook[] = [];
+    let matched = 0;
+    for (const { b, low } of searchableBooks) {
+      if (!q || low.includes(q)) {
+        matched++;
+        if (books.length < RESULT_CAP) books.push(b);
+      }
+    }
     let lastLetter = "";
     return (
       <div className="catalog">
@@ -1972,8 +2003,13 @@ export default function App() {
             placeholder={`Filter ${catalog.books.length} titles…`}
             value={catFilter}
             onChange={(e) => setCatFilter(e.target.value)}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
           />
-          <span className="muted">{books.length} shown</span>
+          <span className="muted">
+            {matched > books.length ? `first ${books.length} of ${matched} — type to narrow` : `${matched} shown`}
+          </span>
         </div>
         <div className="catalog-list">
           {books.map((b) => {
@@ -2019,13 +2055,19 @@ export default function App() {
   function renderIndex() {
     if (!catalog) return <div className="empty">Building the index…</div>;
     const letters = Array.from(new Set(catalog.index.map((e) => groupLetter(e.label)))).sort();
-    const q = catFilter.trim().toLowerCase();
+    const q = catQuery.trim().toLowerCase();
     // Like a book's index: flip to a letter — or search across all of it.
-    const entries = catalog.index.filter((e) =>
-      q
-        ? e.label.toLowerCase().includes(q) || e.book.toLowerCase().includes(q)
-        : groupLetter(e.label) === indexLetter
-    );
+    // Early-exit single pass, hard-capped: broad queries match tens of
+    // thousands of entries and rendering them all froze the view.
+    const entries: CatalogEntry[] = [];
+    let matched = 0;
+    for (const { e, low } of searchableIndex) {
+      const hit = q ? low.includes(q) : groupLetter(e.label) === indexLetter;
+      if (hit) {
+        matched++;
+        if (entries.length < RESULT_CAP) entries.push(e);
+      }
+    }
     return (
       <div className="catalog">
         <div className="catalog-bar">
@@ -2033,8 +2075,13 @@ export default function App() {
             placeholder={`Search ${catalog.index.length} index entries…`}
             value={catFilter}
             onChange={(e) => setCatFilter(e.target.value)}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
           />
-          <span className="muted">{entries.length} shown</span>
+          <span className="muted">
+            {matched > entries.length ? `first ${entries.length} of ${matched} — type to narrow` : `${matched} shown`}
+          </span>
         </div>
         {!q && (
           <div className="letter-rail">
