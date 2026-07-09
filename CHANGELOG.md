@@ -2,6 +2,18 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.7.0 — 2026-07-08
+
+Bump manifests 0.6.6 → 0.7.0.
+- Themes gains two new views: **Titles** — an A–Z browser over every book in
+  the selected collections (filter, Ask, Open) — and **Index** — a
+  back-of-book-style index spanning the whole library, built from chapter
+  headings (A–Z + А–Я letter rail, search, click → open the book at the
+  chapter's first page). No LLM involved; instant.
+- The library selector moved to the top of the sidebar and now scopes
+  everything, including the conversation list (chats belong to the library
+  they were asked in).
+
 ## v0.6.6 — 2026-07-08
 
 Bump manifests 0.6.5 → 0.6.6.
