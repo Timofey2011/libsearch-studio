@@ -2,6 +2,20 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.6.5 — 2026-07-08
+
+Bump manifests 0.6.4 → 0.6.5.
+- Fix: every Russian/Cyrillic query panicked a background worker thread since
+  v0.5.5 (lance byte-slices the fuzzy-search prefix anchor) — the failure was
+  swallowed silently, dropping the typo-tolerant keyword signal for RU. Fuzzy
+  keyword expansion is now ASCII-only (fst 0.4.7's Levenshtein automaton can't
+  match non-ASCII at distance ≥ 1 upstream anyway); Russian typo tolerance is
+  carried by query spell-repair, proven end-to-end.
+- New golden-set retrieval harness (cargo test -p ls-query --features models
+  --test golden_set): 8-book EN+RU fixture corpus, 16 cases — direct keywords,
+  paraphrase, cross-lingual both ways, typos, follow-up fusion, noise probe.
+  It caught the bug above on its first run.
+
 ## v0.6.4 — 2026-07-08
 
 Bump manifests 0.6.3 → 0.6.4.
