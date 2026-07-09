@@ -2,6 +2,22 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.8.0 — 2026-07-09
+
+Bump manifests 0.7.3 → 0.8.0.
+- The PDF preview is now a real reader (custom PDF.js viewer replacing the
+  system webview widget). Reader view opens fit-to-window-width with a
+  toolbar: **⇔ Width** / **⬒ Page** fit, **− / +** zoom, a live
+  **current page / total** counter (type a number to jump), and **find in
+  document** (Cmd+F) with match highlighting, next/previous stepping, and
+  find-forward from the page you're reading.
+- Rendering is virtualized — only pages near the viewport are rasterized —
+  so 900-page books stay light on memory; scanned PDFs (JBIG2/CCITT/JPX)
+  decode too.
+- Text is selectable on rendered pages. Esc now exits Reader view even
+  after clicking into the document (the old native viewer swallowed it).
+- If PDF.js can't open a file, the old native viewer is used automatically.
+
 ## v0.7.3 — 2026-07-09
 
 Bump manifests 0.7.2 → 0.7.3.
