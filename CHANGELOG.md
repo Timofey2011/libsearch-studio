@@ -2,6 +2,15 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.7.1 — 2026-07-08
+
+Bump manifests 0.7.0 → 0.7.1.
+- Rebuilding the Library map on a slow/reasoning model could take several
+  minutes with no feedback and no way out — it looked like a hang. The build
+  now shows live progress ("model is reasoning… ~N chars"), has a Cancel
+  button, and no longer blocks the Themes tab: Titles and Index stay fully
+  usable while it runs.
+
 ## v0.7.0 — 2026-07-08
 
 Bump manifests 0.6.6 → 0.7.0.
