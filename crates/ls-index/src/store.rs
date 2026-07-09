@@ -265,6 +265,85 @@ impl Store {
         Ok(v)
     }
 
+    /// One scan powering the library catalog: per book (title, author,
+    /// source_path, format, chunk count) and per (book, chapter) the first page —
+    /// the raw material for the Titles browser and the library-wide Index.
+    #[allow(clippy::type_complexity)]
+    pub async fn book_catalog(
+        &self,
+    ) -> Result<
+        (
+            Vec<(String, String, String, String, usize)>,
+            Vec<(String, String, Option<u32>, String)>,
+        ),
+        StoreError,
+    > {
+        let mut stream = self
+            .table
+            .query()
+            .select(Select::columns(&[
+                "book_id".to_string(),
+                "title".to_string(),
+                "author".to_string(),
+                "source_path".to_string(),
+                "format".to_string(),
+                "chapter".to_string(),
+                "page".to_string(),
+            ]))
+            .execute()
+            .await?;
+        // book_id -> (title, author, source_path, format, chunks)
+        let mut books: std::collections::HashMap<String, (String, String, String, String, usize)> =
+            std::collections::HashMap::new();
+        // (title, chapter) -> (min page, source_path)
+        let mut chapters: std::collections::HashMap<(String, String), (Option<u32>, String)> =
+            std::collections::HashMap::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| StoreError::Stream(e.to_string()))?;
+            let id = str_col(&batch, "book_id")?;
+            let title = str_col(&batch, "title")?;
+            let author = str_col(&batch, "author")?;
+            let path = str_col(&batch, "source_path")?;
+            let format = str_col(&batch, "format")?;
+            let chapter = str_col(&batch, "chapter")?;
+            let page = int_col(&batch, "page")?;
+            for i in 0..id.len() {
+                let t = title.value(i).to_string();
+                let e = books.entry(id.value(i).to_string()).or_insert_with(|| {
+                    (
+                        t.clone(),
+                        author.value(i).to_string(),
+                        path.value(i).to_string(),
+                        format.value(i).to_string(),
+                        0,
+                    )
+                });
+                e.4 += 1;
+                let ch = chapter.value(i).trim();
+                if !ch.is_empty() {
+                    let pg = match page.value(i) {
+                        p if p >= 0 => Some(p as u32),
+                        _ => None,
+                    };
+                    let entry = chapters
+                        .entry((t, ch.to_string()))
+                        .or_insert((pg, path.value(i).to_string()));
+                    if let (Some(new), Some(cur)) = (pg, entry.0) {
+                        if new < cur {
+                            entry.0 = Some(new);
+                        }
+                    }
+                }
+            }
+        }
+        let books_v = books.into_values().collect();
+        let chapters_v = chapters
+            .into_iter()
+            .map(|((book, ch), (pg, path))| (ch, book, pg, path))
+            .collect();
+        Ok((books_v, chapters_v))
+    }
+
     /// Distinct `(book_id, source_path)` pairs in the index — used to backfill the
     /// fingerprint manifest for an imported index so future re-indexes dedup it.
     pub async fn book_paths(&self) -> Result<Vec<(String, String)>, StoreError> {

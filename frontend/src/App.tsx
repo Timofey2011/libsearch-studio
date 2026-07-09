@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -79,6 +79,9 @@ function estimateTokens(s: string): number {
 type SubTheme = { name: string; blurb: string };
 type Theme = { name: string; subthemes: SubTheme[] };
 type ThemeMap = { generated_at: number; model: string; book_count: number; themes: Theme[] };
+type CatalogBook = { title: string; author: string; source_path: string; format: string; chunks: number };
+type CatalogEntry = { label: string; book: string; page: number | null; source_path: string };
+type LibraryCatalog = { books: CatalogBook[]; index: CatalogEntry[] };
 
 // A node in the explorable bubble tree (lazily deepened up to MAX_DEPTH levels).
 type BNode = { name: string; blurb?: string; children?: BNode[] };
@@ -245,7 +248,12 @@ export default function App() {
   const [buildingMap, setBuildingMap] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
   const [openThemes, setOpenThemes] = useState<Record<number, boolean>>({});
-  const [themeView, setThemeView] = useState<"explore" | "list">("explore");
+  const [themeView, setThemeView] = useState<"explore" | "list" | "titles" | "index">("explore");
+  // Library catalog (Titles browser + library-wide Index), cached per selection.
+  const [catalog, setCatalog] = useState<LibraryCatalog | null>(null);
+  const [catalogFor, setCatalogFor] = useState("");
+  const [catFilter, setCatFilter] = useState("");
+  const [indexLetter, setIndexLetter] = useState("A");
   const [exploreTree, setExploreTree] = useState<BNode[]>([]);
   const [focusPath, setFocusPath] = useState<number[]>([]);
   const [deepening, setDeepening] = useState(false);
@@ -257,6 +265,12 @@ export default function App() {
   // instead of the dead "ask a question" empty-state (the composer is disabled
   // with nothing to search, which is a dead end otherwise).
   const hasUsableLibrary = collections.some((c) => c.source_paths.length > 0);
+  // Conversation history is scoped to the selected library: show only chats
+  // that involve at least one selected collection (legacy chats with no
+  // collections recorded stay visible everywhere).
+  const visibleConvs = conversations.filter(
+    (c) => !c.collection_ids.length || c.collection_ids.some((id) => collIds.includes(id))
+  );
   const collLabel =
     collIds.length === 0
       ? "Select collections"
@@ -331,6 +345,31 @@ export default function App() {
     setNoteStatus(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [toolsOpen, toolsTab]);
+
+  // Switching library hides conversations outside it — if the active one is
+  // hidden, drop to a fresh chat so the transcript matches the list.
+  useEffect(() => {
+    if (!convId) return;
+    const cur = conversations.find((c) => c.id === convId);
+    if (cur && cur.collection_ids.length && !cur.collection_ids.some((id) => collIds.includes(id))) {
+      newChat();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [collIds]);
+
+  // Load the library catalog when the Titles/Index views open (cached per selection).
+  useEffect(() => {
+    const key = collIds.join(",");
+    if (mainTab !== "themes" || (themeView !== "titles" && themeView !== "index")) return;
+    if (!collIds.length || (catalog && catalogFor === key)) return;
+    invoke<LibraryCatalog>("library_catalog", { collectionIds: collIds })
+      .then((c) => {
+        setCatalog(c);
+        setCatalogFor(key);
+      })
+      .catch(console.error);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mainTab, themeView, collIds]);
 
   // Index health for the passive re-index nudge (manifest-only, no folder scan).
   useEffect(() => {
@@ -1908,6 +1947,120 @@ export default function App() {
     );
   }
 
+  // First grouping letter for A–Z browsing (non-letters bucket under '#').
+  function groupLetter(x: string): string {
+    const c = (x.trim()[0] ?? "#").toUpperCase();
+    return /[A-ZА-ЯЁ]/.test(c) ? c : "#";
+  }
+
+  function renderTitles() {
+    if (!catalog) return <div className="empty">Loading titles…</div>;
+    const q = catFilter.trim().toLowerCase();
+    const books = catalog.books.filter(
+      (b) => !q || b.title.toLowerCase().includes(q) || b.author.toLowerCase().includes(q)
+    );
+    let lastLetter = "";
+    return (
+      <div className="catalog">
+        <div className="catalog-bar">
+          <input
+            placeholder={`Filter ${catalog.books.length} titles…`}
+            value={catFilter}
+            onChange={(e) => setCatFilter(e.target.value)}
+          />
+          <span className="muted">{books.length} shown</span>
+        </div>
+        <div className="catalog-list">
+          {books.map((b) => {
+            const letter = groupLetter(b.title);
+            const header = letter !== lastLetter;
+            lastLetter = letter;
+            return (
+              <Fragment key={b.title}>
+                {header && <div className="cat-letter">{letter}</div>}
+                <div className="cat-row">
+                  <span className="cat-title" title={b.source_path}>
+                    {b.title}
+                    {b.author && <span className="muted"> — {b.author}</span>}
+                  </span>
+                  <span className="muted cat-meta">
+                    {b.format} · {b.chunks} passages
+                  </span>
+                  <button
+                    className="mini"
+                    onClick={() => askNew(`Give me an overview of "${b.title}" — what does it cover and what are its key ideas?`)}
+                    disabled={busy}
+                    title="Ask the library about this book"
+                  >
+                    Ask
+                  </button>
+                  <button
+                    className="mini"
+                    onClick={() => openSource({ rank: 0, citation: b.title, source_path: b.source_path, page: 1 })}
+                    title="Open the book"
+                  >
+                    Open
+                  </button>
+                </div>
+              </Fragment>
+            );
+          })}
+          {books.length === 0 && <div className="muted" style={{ padding: 12 }}>No titles match.</div>}
+        </div>
+      </div>
+    );
+  }
+
+  function renderIndex() {
+    if (!catalog) return <div className="empty">Building the index…</div>;
+    const letters = Array.from(new Set(catalog.index.map((e) => groupLetter(e.label)))).sort();
+    const q = catFilter.trim().toLowerCase();
+    // Like a book's index: flip to a letter — or search across all of it.
+    const entries = catalog.index.filter((e) =>
+      q
+        ? e.label.toLowerCase().includes(q) || e.book.toLowerCase().includes(q)
+        : groupLetter(e.label) === indexLetter
+    );
+    return (
+      <div className="catalog">
+        <div className="catalog-bar">
+          <input
+            placeholder={`Search ${catalog.index.length} index entries…`}
+            value={catFilter}
+            onChange={(e) => setCatFilter(e.target.value)}
+          />
+          <span className="muted">{entries.length} shown</span>
+        </div>
+        {!q && (
+          <div className="letter-rail">
+            {letters.map((l) => (
+              <button key={l} className={l === indexLetter ? "on" : ""} onClick={() => setIndexLetter(l)}>
+                {l}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="catalog-list">
+          {entries.map((e, i) => (
+            <div
+              key={`${e.label}·${e.book}·${i}`}
+              className="cat-row idx"
+              onClick={() => openSource({ rank: 0, citation: `${e.book} · ${e.label}`, source_path: e.source_path, page: e.page })}
+              title="Open the book at this chapter"
+            >
+              <span className="cat-title">{e.label}</span>
+              <span className="muted cat-meta">
+                {e.book}
+                {e.page ? ` · p.${e.page}` : ""}
+              </span>
+            </div>
+          ))}
+          {entries.length === 0 && <div className="muted" style={{ padding: 12 }}>Nothing here.</div>}
+        </div>
+      </div>
+    );
+  }
+
   function renderThemesView() {
     return (
       <div className="themes">
@@ -1929,10 +2082,12 @@ export default function App() {
             )}
           </div>
           <div className="row">
-            {themeMap && !buildingMap && (
+            {!buildingMap && collIds.length > 0 && (
               <div className="seg">
                 <button className={themeView === "explore" ? "on" : ""} onClick={() => setThemeView("explore")}>Explore</button>
                 <button className={themeView === "list" ? "on" : ""} onClick={() => setThemeView("list")}>List</button>
+                <button className={themeView === "titles" ? "on" : ""} onClick={() => setThemeView("titles")}>Titles</button>
+                <button className={themeView === "index" ? "on" : ""} onClick={() => setThemeView("index")}>Index</button>
               </div>
             )}
             <button
@@ -1954,9 +2109,12 @@ export default function App() {
           <div className="empty">Reading your library and organizing it into themes… this uses your current model and can take a moment.</div>
         )}
 
-        {collIds.length > 0 && !themeMap && !buildingMap && (
+        {collIds.length > 0 && !themeMap && !buildingMap && (themeView === "explore" || themeView === "list") && (
           <div className="empty">No map yet — click <b>Build map</b> to organize {collLabel} into browsable themes.</div>
         )}
+
+        {collIds.length > 0 && !buildingMap && themeView === "titles" && renderTitles()}
+        {collIds.length > 0 && !buildingMap && themeView === "index" && renderIndex()}
 
         {themeMap && !buildingMap && themeView === "explore" && renderExplore()}
 
@@ -2051,6 +2209,25 @@ export default function App() {
       {/* Sidebar (collapsible): conversations, or theme outline */}
       {sidebarOpen && (
       <div className="sidebar">
+        {/* Library selector — scopes chat, themes, and the conversation list. */}
+        <div className="sidebar-lib">
+          <div className="coll-picker">
+            <button onClick={() => setShowCollPicker((v) => !v)} title="Choose one or more collections to work with">
+              📚 {collLabel} ▾
+            </button>
+            {showCollPicker && (
+              <div className="coll-menu" onMouseLeave={() => setShowCollPicker(false)}>
+                {collections.length === 0 && <div className="muted" style={{ padding: 6 }}>No collections.</div>}
+                {collections.map((c) => (
+                  <label key={c.id} className="coll-opt">
+                    <input type="checkbox" checked={collIds.includes(c.id)} onChange={() => toggleColl(c.id)} />
+                    {c.name}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
         <div className="sidebar-head">
           <b>Conversations</b>
           <button className="ghost" onClick={newChat} title="Start a new conversation">
@@ -2058,8 +2235,10 @@ export default function App() {
           </button>
         </div>
         <div className="conv-list">
-          {conversations.length === 0 && <div className="muted" style={{ padding: "4px 10px" }}>No conversations yet.</div>}
-          {conversations.map((c) =>
+          {visibleConvs.length === 0 && (
+            <div className="muted" style={{ padding: "4px 10px" }}>No conversations in this library yet.</div>
+          )}
+          {visibleConvs.map((c) =>
             editingId === c.id ? (
               <div key={c.id} className="conv">
                 <input
@@ -2304,25 +2483,8 @@ export default function App() {
             </button>
           </div>
           <div className="composer-bar">
-            {/* Left: which library/collections to search */}
-            <div className="bar-left">
-              <div className="coll-picker">
-                <button onClick={() => setShowCollPicker((v) => !v)} title="Choose one or more collections to search">
-                  📚 {collLabel} ▴
-                </button>
-                {showCollPicker && (
-                  <div className="coll-menu up" onMouseLeave={() => setShowCollPicker(false)}>
-                    {collections.length === 0 && <div className="muted" style={{ padding: 6 }}>No collections.</div>}
-                    {collections.map((c) => (
-                      <label key={c.id} className="coll-opt">
-                        <input type="checkbox" checked={collIds.includes(c.id)} onChange={() => toggleColl(c.id)} />
-                        {c.name}
-                      </label>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
+            {/* Library selection lives at the top of the sidebar now. */}
+            <div className="bar-left" />
 
             {/* Right: provider, model, status, tokens, panels */}
             <div className="bar-right">

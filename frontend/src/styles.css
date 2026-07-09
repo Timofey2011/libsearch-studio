@@ -1395,3 +1395,100 @@ button.mini:hover:not(:disabled) {
   max-height: 40vh;
   overflow-y: auto;
 }
+
+/* Library selector pinned at the top of the sidebar. */
+.sidebar-lib {
+  padding: 10px 10px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.sidebar-lib .coll-picker > button {
+  width: 100%;
+  text-align: left;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sidebar-lib .coll-menu {
+  left: 0;
+  right: 0;
+  min-width: 0;
+}
+
+/* Titles browser + library-wide Index (Themes tab). */
+.catalog {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.catalog-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.catalog-bar input {
+  flex: 0 1 340px;
+}
+.letter-rail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-bottom: 8px;
+}
+.letter-rail button {
+  padding: 2px 8px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+.letter-rail button.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.catalog-list {
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.cat-letter {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  padding: 3px 12px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.cat-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.cat-row:last-child {
+  border-bottom: none;
+}
+.cat-row.idx {
+  cursor: pointer;
+}
+.cat-row.idx:hover {
+  background: var(--panel-2);
+}
+.cat-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cat-meta {
+  flex-shrink: 0;
+  font-size: 11.5px;
+}

@@ -1002,6 +1002,101 @@ async fn reset_chunker_state(
 }
 
 #[derive(serde::Serialize)]
+struct CatalogBook {
+    title: String,
+    author: String,
+    source_path: String,
+    format: String,
+    chunks: usize,
+}
+
+#[derive(serde::Serialize)]
+struct CatalogEntry {
+    /// Chapter title — the author-curated subject heading used as the index entry.
+    label: String,
+    book: String,
+    page: Option<u32>,
+    source_path: String,
+}
+
+#[derive(serde::Serialize)]
+struct LibraryCatalog {
+    books: Vec<CatalogBook>,
+    index: Vec<CatalogEntry>,
+}
+
+/// Titles + library-wide index for the selected collections: every book (A–Z in
+/// the UI) and every chapter as an index entry with its opening page — chapters
+/// are the author-curated subject headings, so this reads like a back-of-book
+/// index spanning the whole library. Pure scan, no LLM.
+#[tauri::command]
+async fn library_catalog(
+    state: State<'_, AppState>,
+    collection_ids: Vec<String>,
+) -> Result<LibraryCatalog, String> {
+    let colls: Vec<Collection> = {
+        let db = state.db()?;
+        db.list_collections()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|c| collection_ids.contains(&c.id))
+            .collect()
+    };
+    if colls.is_empty() {
+        return Err("no valid collection selected".into());
+    }
+    // Merge across collections; dedup books by title (imports can carry MEAP/copy
+    // variants) keeping the most-indexed one, and index entries by (label, book).
+    let mut books: std::collections::HashMap<String, CatalogBook> =
+        std::collections::HashMap::new();
+    let mut entries: std::collections::HashMap<(String, String), CatalogEntry> =
+        std::collections::HashMap::new();
+    for c in &colls {
+        let store = Store::open(&c.db_path, "chunks")
+            .await
+            .map_err(|e| e.to_string())?;
+        let (bs, chs) = store.book_catalog().await.map_err(|e| e.to_string())?;
+        for (title, author, source_path, format, chunks) in bs {
+            let e = books.entry(title.clone()).or_insert(CatalogBook {
+                title,
+                author,
+                source_path: source_path.clone(),
+                format,
+                chunks: 0,
+            });
+            if chunks > e.chunks {
+                e.chunks = chunks;
+                e.source_path = source_path;
+            }
+        }
+        for (label, book, page, source_path) in chs {
+            let key = (label.clone(), book.clone());
+            let e = entries.entry(key).or_insert(CatalogEntry {
+                label,
+                book,
+                page,
+                source_path,
+            });
+            if let (Some(new), Some(cur)) = (page, e.page) {
+                if new < cur {
+                    e.page = Some(new);
+                }
+            }
+        }
+    }
+    let mut books: Vec<CatalogBook> = books.into_values().collect();
+    books.sort_by_cached_key(|b| b.title.to_lowercase());
+    let mut index: Vec<CatalogEntry> = entries.into_values().collect();
+    index.sort_by(|a, b| {
+        a.label
+            .to_lowercase()
+            .cmp(&b.label.to_lowercase())
+            .then_with(|| a.book.to_lowercase().cmp(&b.book.to_lowercase()))
+    });
+    Ok(LibraryCatalog { books, index })
+}
+
+#[derive(serde::Serialize)]
 struct DataSafety {
     at_risk: bool,
     provider: String,
@@ -1983,6 +2078,7 @@ pub fn run() {
             set_note,
             export_note,
             data_safety,
+            library_catalog,
             index_health,
             reset_chunker_state,
             check_llm,
