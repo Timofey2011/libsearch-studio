@@ -2,6 +2,17 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.7.2 — 2026-07-08
+
+Bump manifests 0.7.1 → 0.7.2.
+- Typing (or deleting) in the Index/Titles search no longer freezes the app.
+  Broad queries used to render every one of tens of thousands of matches on
+  each keystroke; filtering now runs over precomputed search strings, input
+  is decoupled from list rendering (useDeferredValue), and results are capped
+  at 800 rows with a "first 800 of N — type to narrow" count so nothing is
+  silently hidden.
+- Index/Titles search fields no longer trigger the macOS autocorrect popup.
+
 ## v0.7.1 — 2026-07-08
 
 Bump manifests 0.7.0 → 0.7.1.
