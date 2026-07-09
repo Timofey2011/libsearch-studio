@@ -2,6 +2,16 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.7.3 — 2026-07-09
+
+Bump manifests 0.7.2 → 0.7.3.
+- The source preview gains a **⛶ Reader view** button: the document expands
+  to fill the whole window for distraction-free reading; "⤡ Exit reader
+  view" (or Esc) returns to the split view. PDFs keep their page and scroll
+  position across the toggle, and Markdown sources get a centered reading
+  column at a larger font. Works for all preview kinds (PDF, Markdown, and
+  the cited-passage panel for epub/mobi).
+
 ## v0.7.2 — 2026-07-08
 
 Bump manifests 0.7.1 → 0.7.2.
