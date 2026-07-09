@@ -2,6 +2,14 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.6.6 — 2026-07-08
+
+Bump manifests 0.6.5 → 0.6.6.
+- Reader: clicking an .epub or .md citation no longer shows a blank pane.
+  Markdown sources render in-app (with best-effort scroll to the cited
+  passage); ebook formats the reader can't display show the cited passage and
+  an "Open in your ebook app" button. PDFs unchanged.
+
 ## v0.6.5 — 2026-07-08
 
 Bump manifests 0.6.4 → 0.6.5.
