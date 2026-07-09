@@ -65,7 +65,7 @@ fn title_from_path(path: &Path) -> String {
 pub fn extract_pdf(path: &Path) -> Result<BookDoc, ExtractError> {
     let doc = lopdf::Document::load(path)?;
     let mut blocks = Vec::new();
-    for (&page_num, _) in doc.get_pages().iter() {
+    for &page_num in doc.get_pages().keys() {
         let raw = doc.extract_text(&[page_num]).unwrap_or_default();
         let cleaned = clean_text(&raw);
         if !cleaned.is_empty() {
