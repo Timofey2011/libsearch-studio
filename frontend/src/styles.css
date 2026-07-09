@@ -1318,6 +1318,31 @@ button.mini:hover:not(:disabled) {
   flex-direction: column;
   min-width: 0;
 }
+/* Reader view: the same element goes full-window (a class toggle, not a
+   remount, so the PDF iframe keeps its scroll position). Below the Tools
+   modal (z 50) so Settings can still open on top. */
+.reader.full {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  border-left: none;
+  background: var(--bg);
+}
+.reader:focus {
+  outline: none;
+}
+.reader.full .reader-md {
+  max-width: 860px;
+  width: 100%;
+  margin: 0 auto;
+  font-size: 15px;
+}
+.reader-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
 .reader-head {
   display: flex;
   justify-content: space-between;

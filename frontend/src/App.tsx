@@ -199,6 +199,7 @@ export default function App() {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const [busy, setBusy] = useState(false);
   const [reader, setReader] = useState<Reader | null>(null);
+  const [readerFull, setReaderFull] = useState(false);
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [convId, setConvId] = useState("");
@@ -336,6 +337,24 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reader?.text]);
+
+  // Reader view (full screen): leave it when the reader closes; Esc exits.
+  // WKWebView only delivers Escape when a focusable element has focus, so on
+  // entry we focus the reader element itself (tabIndex=-1) and listen there;
+  // the window listener is a fallback.
+  const readerElRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!reader) setReaderFull(false);
+  }, [reader]);
+  useEffect(() => {
+    if (!readerFull) return;
+    readerElRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setReaderFull(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [readerFull]);
 
   // Load the notebook when the Memory tab opens.
   useEffect(() => {
@@ -2585,15 +2604,37 @@ export default function App() {
 
       {/* Reader */}
       {reader && (
-        <div className="reader">
+        <div
+          className={readerFull ? "reader full" : "reader"}
+          ref={readerElRef}
+          tabIndex={-1}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && readerFull) setReaderFull(false);
+          }}
+        >
           <div className="reader-head">
             <span className="name">
               {reader.path.split("/").pop()}
               {reader.page ? ` · p.${reader.page}` : ""}
             </span>
-            <button className="ghost" onClick={() => setReader(null)}>
-              ✕
-            </button>
+            <span className="reader-actions">
+              <button
+                className="ghost"
+                onClick={() => setReaderFull((f) => !f)}
+                title={
+                  readerFull
+                    ? reader.kind === "pdf"
+                      ? "Back to split view" // Esc dies once the PDF iframe takes focus
+                      : "Back to split view (Esc)"
+                    : "Read full screen"
+                }
+              >
+                {readerFull ? "⤡ Exit reader view" : "⛶ Reader view"}
+              </button>
+              <button className="ghost" onClick={() => setReader(null)}>
+                ✕
+              </button>
+            </span>
           </div>
           {reader.missing ? (
             <div className="reader-missing">
