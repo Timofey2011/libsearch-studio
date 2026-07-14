@@ -39,6 +39,7 @@ fn variant_rank(path: &str) -> Option<u8> {
         Some("fb2") | Some("fb2.zip") => Some(2),
         Some("mobi") => Some(3),
         Some("azw3") => Some(4),
+        Some("djvu") => Some(5),
         _ => None,
     }
 }
@@ -101,7 +102,8 @@ mod tests {
         std::fs::write(root.join("archive.tar.gz"), b"x").unwrap(); // unknown stays out
         std::fs::write(root.join("book.epub"), b"x").unwrap(); // M2: epub is ingested
         std::fs::write(root.join("book.docx"), b"x").unwrap(); // M4: docx is ingested
-        std::fs::write(root.join("book.pages"), b"x").unwrap(); // M5 format: not yet
+        std::fs::write(root.join("book.pages"), b"x").unwrap(); // M5: pages is ingested
+        std::fs::write(root.join("help.chm"), b"x").unwrap(); // gated out (0 in library)
         std::fs::create_dir(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/b.PDF"), b"x").unwrap();
         std::fs::write(root.join("sub/l.MD"), b"x").unwrap();
@@ -112,7 +114,7 @@ mod tests {
             root.join("a.pdf").to_string_lossy().into_owned(),
         ];
         let found = discover_books(&paths);
-        assert_eq!(found.len(), 6, "got {found:?}");
+        assert_eq!(found.len(), 7, "got {found:?}");
         assert!(found.iter().any(|p| p.ends_with("a.pdf")));
         assert!(found.iter().any(|p| p.ends_with("sub/b.PDF")));
         assert!(found.iter().any(|p| p.ends_with("notes.txt")));
@@ -120,7 +122,8 @@ mod tests {
         assert!(found.iter().any(|p| p.ends_with("book.epub")));
         assert!(found.iter().any(|p| p.ends_with("book.docx")));
         assert!(!found.iter().any(|p| p.ends_with("archive.tar.gz")));
-        assert!(!found.iter().any(|p| p.ends_with("book.pages")));
+        assert!(found.iter().any(|p| p.ends_with("book.pages")));
+        assert!(!found.iter().any(|p| p.ends_with("help.chm")));
     }
 
     #[test]
@@ -138,9 +141,14 @@ mod tests {
         std::fs::write(root.join("sub/guide.pdf"), b"x").unwrap();
         // Text formats are never variant-deduped.
         std::fs::write(root.join("guide.md"), b"x").unwrap();
+        // M5: a djvu twin loses to any better format; a lone djvu stays.
+        std::fs::write(root.join("guide.djvu"), b"x").unwrap();
+        std::fs::write(root.join("scan.djvu"), b"x").unwrap();
 
         let found = discover_books(&[root.to_string_lossy().into_owned()]);
         assert!(found.iter().any(|p| p.ends_with("guide.epub")));
+        assert!(!found.iter().any(|p| p.ends_with("guide.djvu")));
+        assert!(found.iter().any(|p| p.ends_with("scan.djvu")));
         assert!(!found
             .iter()
             .any(|p| p.ends_with("/guide.pdf") && !p.contains("sub")));
@@ -148,7 +156,7 @@ mod tests {
         assert!(found.iter().any(|p| p.ends_with("only.mobi")));
         assert!(found.iter().any(|p| p.ends_with("sub/guide.pdf")));
         assert!(found.iter().any(|p| p.ends_with("guide.md")));
-        assert_eq!(found.len(), 4, "got {found:?}");
+        assert_eq!(found.len(), 5, "got {found:?}");
     }
 
     #[test]

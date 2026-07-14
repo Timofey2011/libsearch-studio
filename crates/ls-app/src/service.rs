@@ -333,6 +333,9 @@ impl Service {
         // sources, and compute this run's CPU capabilities hash (§2.8).
         let _ = self.db.gc_skips(&collection.id, &collection.source_paths);
         let caps_ver = cpu_caps_ver();
+        // Best-effort formats (§7) convert into the app-owned cache; the
+        // original file keeps identity (§0.b).
+        let conv_dir = self.data_dir.join("converted");
 
         // The shared dedup pre-filter (also used by the GPU fast-index path):
         // decides skip / remap / refresh / embed per candidate, writing nothing.
@@ -438,7 +441,7 @@ impl Service {
                 total,
                 path: path.clone(),
             });
-            let doc = match ls_extract::extract(p) {
+            let doc = match ls_extract::extract_with_cache(p, &conv_dir) {
                 Ok(d) => d,
                 Err(e) => {
                     stats.books_failed += 1;

@@ -102,10 +102,14 @@ async fn run_ingest(paths: &[String]) -> Result<()> {
     let mut embedder = Embedder::load(models.join("bge-m3")).context("load embedder")?;
     let counter = BgeTokenCounter::load(models.join("bge-m3")).context("load tokenizer")?;
     let params = ChunkParams::default();
+    let conv_dir = Path::new(&db)
+        .parent()
+        .map(|p| p.join("converted"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".converted"));
 
     let mut total = 0usize;
     for (n, path) in paths.iter().enumerate() {
-        let doc = match ls_extract::extract(Path::new(path)) {
+        let doc = match ls_extract::extract_with_cache(Path::new(path), &conv_dir) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("[{}/{}] FAILED {path}: {e}", n + 1, paths.len());

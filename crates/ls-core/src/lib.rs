@@ -71,8 +71,31 @@ pub const KNOWN_EXTS: &[&str] = &[
 /// text family; M2 the ebook family; M4 (v0.11.0) office; the best-effort
 /// tier (M5: doc/pages/webarchive/djvu) flips here later.
 pub const INGEST_EXTS: &[&str] = &[
-    "pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm",
-    "epub", "fb2", "fb2.zip", "mobi", "azw3", "xps", "docx", "rtf", "odt",
+    "pdf",
+    "md",
+    "markdown",
+    "txt",
+    "text",
+    "rst",
+    "adoc",
+    "org",
+    "tex",
+    "ipynb",
+    "html",
+    "htm",
+    "epub",
+    "fb2",
+    "fb2.zip",
+    "mobi",
+    "azw3",
+    "xps",
+    "docx",
+    "rtf",
+    "odt",
+    "doc",
+    "pages",
+    "webarchive",
+    "djvu",
 ];
 
 /// The one extension-derivation rule (ROADMAP-3 invariant #8): lowercase the
