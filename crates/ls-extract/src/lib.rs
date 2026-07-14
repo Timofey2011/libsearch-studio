@@ -13,8 +13,10 @@ use ls_core::{Block, BookDoc, Format};
 use regex::Regex;
 
 pub mod ebook;
+pub mod office;
 pub mod text;
 pub use ebook::{cpu_directed_skip, extract_ebook};
+pub use office::extract_office;
 pub use text::extract_text_family;
 
 /// Below this many characters of extracted text, treat the book as empty
@@ -115,6 +117,9 @@ pub fn extract(path: &Path) -> Result<BookDoc, ExtractError> {
         // Ebook family (ROADMAP-3 M2): epub TOC chapters, fb2 sections+author,
         // mobi best-effort with a GPU-fallback skip reason. MIN_BOOK_CHARS inside.
         Some(Format::Epub | Format::Fb2 | Format::Mobi) => ebook::extract_ebook(path),
+        // Office family (ROADMAP-3 M4): docx/odt hand-rolled zip+XML, rtf via
+        // rtf-parser with a codepage pre-pass. MIN_BOOK_CHARS inside.
+        Some(Format::Docx | Format::Odt | Format::Rtf) => office::extract_office(path),
         _ => Err(ExtractError::Unsupported(
             path.to_string_lossy().to_string(),
         )),

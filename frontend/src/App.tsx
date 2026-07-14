@@ -122,7 +122,7 @@ const ANGLES: { label: string; q: (t: string) => string }[] = [
   { label: "Critique", q: (t) => `What are the main criticisms or limitations discussed about ${t}?` },
 ];
 
-type ReaderKind = "pdf" | "md" | "book" | "other";
+type ReaderKind = "pdf" | "md" | "book" | "html" | "other";
 type Reader = {
   path: string;
   page: number | null;
@@ -140,6 +140,11 @@ type Reader = {
   totalBytes?: number;
   /// Chapter of the cited chunk (book reader cite-jump).
   chapter?: string | null;
+  /// Sanitized HTML for the "html" kind (docx via mammoth, .html files,
+  /// textutil-converted rtf/odt).
+  html?: string;
+  /// Provenance note shown above converted/fallback content.
+  convNote?: string;
 };
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
@@ -338,7 +343,7 @@ export default function App() {
   useEffect(() => {
     const host = mdReaderRef.current;
     const cite = reader?.citeText;
-    if (!host || !reader?.text || !cite) return;
+    if (!host || !(reader?.text || reader?.html) || !cite) return;
     const norm = (x: string) => x.replace(/\s+/g, " ").trim().toLowerCase();
     const needle = norm(cite).slice(0, 60);
     if (!needle) return;
@@ -356,7 +361,7 @@ export default function App() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reader?.text, mdTick]);
+  }, [reader?.text, reader?.html, mdTick]);
 
   // Slice boundaries for progressive rendering: files over 2 MiB render in
   // ~512 KiB paragraph-aligned steps per idle callback so the WKWebView main
@@ -1040,7 +1045,9 @@ export default function App() {
           ? "md"
           : family === "epub" || family === "mobi" || family === "fb2"
             ? "book"
-            : "other";
+            : family === "html" || family === "docx" || family === "rtf" || family === "odt"
+              ? "html"
+              : "other";
     setReader({
       path: s.source_path,
       page: s.page,
@@ -1072,6 +1079,99 @@ export default function App() {
       } catch (e) {
         setReader((r) => (r && r.path === s.source_path ? { ...r, error: String(e) } : r));
       }
+    }
+    if (kind === "html") {
+      await loadHtmlKind(s.source_path, family);
+    }
+  }
+
+  /// Sanitization allowlist: no scripts/styles/handlers, links become plain
+  /// text (no href), images only as data: URIs — the offline guarantee.
+  async function sanitizeHtml(html: string): Promise<string> {
+    const { default: DOMPurify } = await import("dompurify");
+    return DOMPurify.sanitize(html, {
+      ALLOWED_TAGS: [
+        "p", "div", "span", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li",
+        "strong", "em", "b", "i", "u", "s", "blockquote", "pre", "code", "table",
+        "thead", "tbody", "tr", "td", "th", "br", "hr", "img", "a", "sup", "sub",
+        "figure", "figcaption", "section", "article",
+      ],
+      ALLOWED_ATTR: ["src", "alt", "colspan", "rowspan"],
+      ALLOWED_URI_REGEXP: /^data:/i,
+    });
+  }
+
+  /// Load the "html" reader kind (§6.2): .html files read+sanitize; .docx via
+  /// lazy mammoth; .rtf/.odt via the textutil conversion cache where
+  /// available. Over 4 MiB — or on any failure — falls back to the
+  /// progressive extracted-text reader (never a synchronous many-MiB
+  /// innerHTML on the main thread).
+  async function loadHtmlKind(path: string, family: string) {
+    const HTML_CAP = 4 * 1024 * 1024;
+    const fallbackToText = async (note: string) => {
+      try {
+        const st = await invoke<{ text: string; truncated: boolean; total_bytes: number }>(
+          "extract_preview_text",
+          { path }
+        );
+        setReader((r) =>
+          r && r.path === path
+            ? { ...r, kind: "md", text: st.text, truncated: st.truncated, totalBytes: st.total_bytes, convNote: note }
+            : r
+        );
+      } catch (e) {
+        setReader((r) => (r && r.path === path ? { ...r, error: String(e) } : r));
+      }
+    };
+    try {
+      if (family === "docx") {
+        const res = await fetch(convertFileSrc(path));
+        if (!res.ok) throw new Error(`read failed (${res.status})`);
+        const arrayBuffer = await res.arrayBuffer();
+        const mammoth = await import("mammoth");
+        const out = await mammoth.convertToHtml({ arrayBuffer });
+        if (out.value.length > HTML_CAP) {
+          await fallbackToText("Document too large for styled view — showing extracted text.");
+          return;
+        }
+        const clean = await sanitizeHtml(out.value);
+        setReader((r) => (r && r.path === path ? { ...r, html: clean } : r));
+        return;
+      }
+      if (family === "rtf" || family === "odt") {
+        const dp = await invoke<{ display_path: string; converted: boolean; converter: string | null }>(
+          "resolve_display_path",
+          { path }
+        );
+        if (!dp.converted) {
+          await fallbackToText("No styled converter on this system — showing extracted text.");
+          return;
+        }
+        const st = await invoke<{ text: string; truncated: boolean }>("read_source_text", {
+          path: dp.display_path,
+        });
+        if (st.truncated || st.text.length > HTML_CAP) {
+          await fallbackToText("Document too large for styled view — showing extracted text.");
+          return;
+        }
+        const clean = await sanitizeHtml(st.text);
+        setReader((r) =>
+          r && r.path === path
+            ? { ...r, html: clean, convNote: `Converted via ${dp.converter ?? "system tools"}.` }
+            : r
+        );
+        return;
+      }
+      // Plain .html/.htm source file.
+      const st = await invoke<{ text: string; truncated: boolean }>("read_source_text", { path });
+      if (st.truncated || st.text.length > HTML_CAP) {
+        await fallbackToText("Page too large for styled view — showing extracted text.");
+        return;
+      }
+      const clean = await sanitizeHtml(st.text);
+      setReader((r) => (r && r.path === path ? { ...r, html: clean } : r));
+    } catch (e) {
+      await fallbackToText(`Styled view failed (${e}) — showing extracted text.`);
     }
   }
 
@@ -2873,6 +2973,21 @@ export default function App() {
                 setReader((r) => (r && r.path === reader.path ? { ...r, kind: "other" } : r))
               }
             />
+          ) : reader.kind === "html" ? (
+            <div className="reader-md" ref={mdReaderRef}>
+              {reader.convNote && <div className="trunc-banner">{reader.convNote}</div>}
+              {reader.html ? (
+                // Sanitized above (tight allowlist, data:-only URIs).
+                <div dangerouslySetInnerHTML={{ __html: reader.html }} />
+              ) : reader.error ? (
+                <div className="reader-missing">
+                  <h3>Couldn't preview this file</h3>
+                  <p>{reader.error}</p>
+                </div>
+              ) : (
+                <div className="muted" style={{ padding: 16 }}>Converting…</div>
+              )}
+            </div>
           ) : reader.kind === "md" ? (
             <div className="reader-md" ref={mdReaderRef}>
               {reader.error ? (
