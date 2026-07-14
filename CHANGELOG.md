@@ -2,6 +2,21 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.11.0 — 2026-07-14
+
+Bump manifests 0.10.0 → 0.11.0. Office documents.
+
+- **New indexable formats**: Word (.docx, headings become chapters), RTF
+  (Russian windows-1251 handled), and OpenDocument (.odt) — pure Rust on the
+  standard engine (full Linux parity); the Fast/GPU engine uses optional
+  Python packages and tells you exactly what to `pip install` if missing,
+  retrying automatically once installed.
+- **Styled in-app display**: .docx renders with formatting (headings, lists,
+  tables) via a sanitized offline converter; saved .html pages now render
+  styled instead of text-only; .rtf/.odt convert through macOS textutil with
+  a provenance note. Everything falls back to the extracted-text reader when
+  a converter isn't available — citation jump works in all of them.
+
 ## v0.10.0 — 2026-07-14
 
 Bump manifests 0.9.0 → 0.10.0. Ebooks: searchable AND readable.
