@@ -42,6 +42,7 @@ fn to_citation(r: &SearchResult) -> Citation {
         citation: r.citation.clone(),
         source_path: r.source_path.clone(),
         page: r.page,
+        chapter: r.chapter.clone(),
         text: r.text.clone(),
     }
 }
@@ -1135,6 +1136,62 @@ async fn read_source_text(path: String) -> Result<SourceText, String> {
         }
         Ok(SourceText {
             text: decoded[..cut].to_string(),
+            truncated: true,
+            total_bytes,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Universal extracted-text preview (§5.3): run the CPU extractor for ANY
+/// supported format and return its text with chapter titles inlined as
+/// headings — every ingested format gets in-app display + citation jump
+/// through the existing text reader. CPU-bound (a large epub is seconds), so
+/// it runs under spawn_blocking; capped at 8 MiB on a char boundary.
+#[tauri::command]
+async fn extract_preview_text(path: String) -> Result<SourceText, String> {
+    tokio::task::spawn_blocking(move || {
+        const CAP: usize = 8 * 1024 * 1024;
+        let doc = ls_extract::extract(Path::new(&path)).map_err(|e| e.to_string())?;
+        if doc.blocks.is_empty() {
+            return Err("no extractable text in this file".into());
+        }
+        let mut out = String::new();
+        let mut last_ch: Option<String> = None;
+        for b in &doc.blocks {
+            if b.chapter.is_some() && b.chapter != last_ch {
+                out.push_str(&format!(
+                    "
+
+## {}
+
+",
+                    b.chapter.as_deref().unwrap_or("")
+                ));
+                last_ch = b.chapter.clone();
+            }
+            out.push_str(&b.text);
+            out.push_str(
+                "
+
+",
+            );
+        }
+        let total_bytes = out.len() as u64;
+        if out.len() <= CAP {
+            return Ok(SourceText {
+                text: out,
+                truncated: false,
+                total_bytes,
+            });
+        }
+        let mut cut = CAP;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        Ok(SourceText {
+            text: out[..cut].to_string(),
             truncated: true,
             total_bytes,
         })
@@ -2423,6 +2480,7 @@ pub fn run() {
             data_safety,
             library_catalog,
             reindex_book,
+            extract_preview_text,
             index_health,
             reset_chunker_state,
             check_llm,

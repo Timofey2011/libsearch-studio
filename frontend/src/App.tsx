@@ -3,6 +3,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import PdfReader from "./PdfReader";
+import BookReader from "./BookReader";
 import { extOf, EXT_FAMILY } from "./generated/supportedExts";
 
 type Collection = {
@@ -19,12 +20,13 @@ type SearchResult = {
   citation: string;
   title: string;
   page: number | null;
+  chapter?: string | null;
   source_path: string;
   text: string;
 };
 
 // A cited source, in the shape shared by live results, stored citations, and artifacts.
-type Src = { rank: number; citation: string; source_path: string; page: number | null; text?: string };
+type Src = { rank: number; citation: string; source_path: string; page: number | null; chapter?: string | null; text?: string };
 // Mirrors ls_llm::PromptMeta — what actually went into the prompt for one ask.
 type PromptMeta = {
   notes_injected: boolean;
@@ -120,7 +122,7 @@ const ANGLES: { label: string; q: (t: string) => string }[] = [
   { label: "Critique", q: (t) => `What are the main criticisms or limitations discussed about ${t}?` },
 ];
 
-type ReaderKind = "pdf" | "md" | "other";
+type ReaderKind = "pdf" | "md" | "book" | "other";
 type Reader = {
   path: string;
   page: number | null;
@@ -136,6 +138,8 @@ type Reader = {
   /// Text source exceeded the read cap; only the first window is shown.
   truncated?: boolean;
   totalBytes?: number;
+  /// Chapter of the cited chunk (book reader cite-jump).
+  chapter?: string | null;
 };
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
@@ -193,6 +197,7 @@ const toSrc = (r: SearchResult): Src => ({
   citation: r.citation,
   source_path: r.source_path,
   page: r.page,
+  chapter: r.chapter,
   text: r.text,
 });
 
@@ -298,6 +303,7 @@ export default function App() {
   // the slice containing the citation has rendered.
   const [mdSlices, setMdSlices] = useState(1);
   const [mdTick, setMdTick] = useState(0);
+  const [extracting, setExtracting] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
   const thinkRef = useRef<HTMLDivElement>(null);
 
@@ -1027,8 +1033,22 @@ export default function App() {
     // PDFs render in PdfReader; Markdown/plain text in-app; anything else
     // (epub/mobi/…) gets a passage view + external open.
     const family = EXT_FAMILY[extOf(s.source_path) ?? ""] ?? "other";
-    const kind: ReaderKind = family === "pdf" ? "pdf" : family === "md" || family === "txt" ? "md" : "other";
-    setReader({ path: s.source_path, page: s.page, missing: false, kind, citeText: s.text });
+    const kind: ReaderKind =
+      family === "pdf"
+        ? "pdf"
+        : family === "md" || family === "txt"
+          ? "md"
+          : family === "epub" || family === "mobi" || family === "fb2"
+            ? "book"
+            : "other";
+    setReader({
+      path: s.source_path,
+      page: s.page,
+      missing: false,
+      kind,
+      citeText: s.text,
+      chapter: s.chapter ?? null,
+    });
     // The book may have been moved/renamed since indexing — warn instead of
     // showing a silently-blank reader.
     try {
@@ -2841,6 +2861,18 @@ export default function App() {
                 }
               />
             )
+          ) : reader.kind === "book" ? (
+            <BookReader
+              key={reader.path}
+              url={convertFileSrc(reader.path)}
+              citeText={reader.citeText}
+              chapter={reader.chapter}
+              full={readerFull}
+              onFail={() =>
+                // Downgrade to the passage panel (PdfReader→pdfNative pattern).
+                setReader((r) => (r && r.path === reader.path ? { ...r, kind: "other" } : r))
+              }
+            />
           ) : reader.kind === "md" ? (
             <div className="reader-md" ref={mdReaderRef}>
               {reader.error ? (
@@ -2880,19 +2912,47 @@ export default function App() {
             </div>
           ) : (
             <div className="reader-missing">
-              <h3>No in-app preview for this format yet</h3>
+              <h3>No pretty preview for this format yet</h3>
               <p>
-                <code className="missing-path">{reader.path.split("/").pop()}</code> is an ebook format the
-                built-in reader can't display (it renders PDFs and Markdown). The cited passage:
+                <code className="missing-path">{reader.path.split("/").pop()}</code> has no dedicated
+                in-app renderer. The cited passage:
               </p>
               {reader.citeText && <blockquote className="cite-quote">{reader.citeText}</blockquote>}
-              <button
-                className="primary"
-                onClick={() => invoke("open_in_default_app", { path: reader.path }).catch(console.error)}
-                title="Open with the app your system associates with this format (e.g. Books or Calibre)"
-              >
-                Open in your ebook app
-              </button>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  className="primary"
+                  disabled={extracting}
+                  onClick={async () => {
+                    // §5.3 universal fallback: extract with the engine's own
+                    // extractor and reuse the text reader (incl. cite-jump).
+                    setExtracting(true);
+                    try {
+                      const st = await invoke<{ text: string; truncated: boolean; total_bytes: number }>(
+                        "extract_preview_text",
+                        { path: reader.path }
+                      );
+                      setReader((r) =>
+                        r && r.path === reader.path
+                          ? { ...r, kind: "md", text: st.text, truncated: st.truncated, totalBytes: st.total_bytes }
+                          : r
+                      );
+                    } catch (e) {
+                      setReader((r) => (r && r.path === reader.path ? { ...r, error: String(e) } : r));
+                    } finally {
+                      setExtracting(false);
+                    }
+                  }}
+                >
+                  {extracting ? "Extracting…" : "Show extracted text"}
+                </button>
+                <button
+                  className="ghost"
+                  onClick={() => invoke("open_in_default_app", { path: reader.path }).catch(console.error)}
+                  title="Open with the app your system associates with this format"
+                >
+                  Open in your default app
+                </button>
+              </div>
             </div>
           )}
         </div>

@@ -49,6 +49,10 @@ pub struct Citation {
     pub citation: String,
     pub source_path: String,
     pub page: Option<u32>,
+    /// Chapter label of the cited chunk (M3): powers the book reader's
+    /// chapter-scoped cite-jump. Old persisted messages load as None.
+    #[serde(default)]
+    pub chapter: Option<String>,
     pub text: String,
 }
 

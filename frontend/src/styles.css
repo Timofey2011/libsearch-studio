@@ -1419,6 +1419,43 @@ button.mini:hover:not(:disabled) {
   justify-content: center;
   color: var(--muted);
 }
+/* ---- book reader (foliate-js) ---- */
+.book-reader {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
+}
+.book-host {
+  flex: 1;
+  min-height: 0;
+  background: var(--bg);
+}
+.book-toc {
+  max-width: 260px;
+}
+.cite-miss {
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+  padding: 8px 12px;
+  font-size: 12.5px;
+}
+.cite-miss-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.cite-miss blockquote {
+  margin: 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--border);
+  max-height: 108px;
+  overflow-y: auto;
+}
+
 /* pdfjs text layer: invisible selectable text positioned over the canvas. */
 .pdf-text {
   position: absolute;
