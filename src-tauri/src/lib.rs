@@ -1275,6 +1275,52 @@ struct LibraryCatalog {
     index: Vec<CatalogEntry>,
 }
 
+/// §4.2 "Re-index this book": delete the book's store rows and every piece of
+/// manifest/skip state for its path so the NEXT index run re-extracts it with
+/// the current extractor (TOC chapters, correct format stamp, current chunker
+/// version). Keyed on source_path — three id schemes may reference the file.
+#[tauri::command]
+async fn reindex_book(
+    state: State<'_, AppState>,
+    collection_ids: Vec<String>,
+    source_path: String,
+) -> Result<usize, String> {
+    let colls: Vec<ls_app::Collection> = {
+        let db = state.db()?;
+        db.list_collections()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|c| collection_ids.contains(&c.id))
+            .collect()
+    };
+    let path_id = ls_app::stable_book_id(Path::new(&source_path));
+    let mut removed = 0usize;
+    for coll in colls {
+        let store = match Store::open(&coll.db_path, "chunks").await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Delete store rows under EVERY id that holds this path (legacy
+        // Python id, gpu sha1 id, cpu id — whichever indexed it).
+        let ids: Vec<String> = store
+            .book_paths()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, p)| p == &source_path)
+            .map(|(id, _)| id)
+            .collect();
+        for id in &ids {
+            store.delete_book(id).await.ok();
+            removed += 1;
+        }
+        let db = state.db()?;
+        let _ = db.clear_book_state_by_path(&coll.id, &source_path, &path_id);
+        let _ = db.erase_skips(&coll.id, &source_path);
+    }
+    Ok(removed)
+}
+
 /// Titles + library-wide index for the selected collections: every book (A–Z in
 /// the UI) and every chapter as an index entry with its opening page — chapters
 /// are the author-curated subject headings, so this reads like a back-of-book
@@ -2376,6 +2422,7 @@ pub fn run() {
             export_note,
             data_safety,
             library_catalog,
+            reindex_book,
             index_health,
             reset_chunker_state,
             check_llm,
@@ -2421,16 +2468,19 @@ mod lockstep {
             // (a) Format mapping exists.
             let fmt = ls_core::Format::from_ext(ext)
                 .unwrap_or_else(|| panic!("{ext}: no Format::from_ext mapping"));
-            // (b) CPU extractor has an arm: dispatch on a missing file of this
-            // ext must fail with an IO/parse error, never Unsupported.
-            let err = ls_extract::extract(std::path::Path::new(&format!(
-                "/nonexistent-lockstep-probe/x.{ext}"
-            )))
-            .unwrap_err();
-            assert!(
-                !matches!(err, ls_extract::ExtractError::Unsupported(_)),
-                "{ext}: ls-extract has no dispatch arm"
-            );
+            // (b) CPU extractor has an arm (probe: dispatch on a missing file
+            // must fail with an IO/parse error, never Unsupported) OR the ext
+            // is a recorded directed CPU skip (e.g. xps → GPU-only).
+            if ls_extract::cpu_directed_skip(ext).is_none() {
+                let err = ls_extract::extract(std::path::Path::new(&format!(
+                    "/nonexistent-lockstep-probe/x.{ext}"
+                )))
+                .unwrap_err();
+                assert!(
+                    !matches!(err, ls_extract::ExtractError::Unsupported(_)),
+                    "{ext}: ls-extract has neither a dispatch arm nor a directed skip"
+                );
+            }
             // (c) The GPU script handles or explicitly skips it.
             assert!(
                 handled.iter().any(|h| h == ext) || directed.iter().any(|d| d == ext),

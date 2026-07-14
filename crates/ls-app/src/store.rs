@@ -663,6 +663,24 @@ impl Db {
         Ok(())
     }
 
+    /// Clear manifest rows for one file across ALL id schemes (§4.2): rows
+    /// whose `source_path` column matches (seeded legacy ids, gpu ids), plus
+    /// the row keyed by the path-derived id explicitly (pre-M0a rows whose
+    /// column is still ''). Returns rows removed.
+    pub fn clear_book_state_by_path(
+        &self,
+        collection_id: &str,
+        source_path: &str,
+        path_derived_id: &str,
+    ) -> Result<usize, DbError> {
+        let n = self.conn.execute(
+            "DELETE FROM book_state
+             WHERE collection_id = ?1 AND (source_path = ?2 OR book_id = ?3)",
+            params![collection_id, source_path, path_derived_id],
+        )?;
+        Ok(n)
+    }
+
     /// A successful index of a file erases its skip records across BOTH
     /// pipelines (plain path-keyed delete).
     pub fn erase_skips(&self, collection_id: &str, source_path: &str) -> Result<(), DbError> {

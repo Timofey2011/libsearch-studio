@@ -414,6 +414,23 @@ impl Service {
             let p = Path::new(path);
             let (fp, csig) = (&item.fingerprint, &item.content_sig);
 
+            // Formats the CPU pipeline deliberately does not handle (e.g. xps)
+            // are recorded once with a platform-honest reason; the GPU helper
+            // picks them up where it exists (§4.1).
+            if let Some(reason) = ls_core::ext_of(path).and_then(ls_extract::cpu_directed_skip) {
+                stats.books_skipped += 1;
+                stats.count_format(path, false);
+                self.db
+                    .upsert_skip(&collection.id, path, "cpu", fp, reason, &caps_ver)?;
+                on_event(IndexEvent::Skipped {
+                    n,
+                    total,
+                    path: path.clone(),
+                    reason: reason.into(),
+                });
+                continue;
+            }
+
             // Announce the file before the (potentially slow) extract so a large
             // or problematic PDF is visible instead of the bar looking frozen.
             on_event(IndexEvent::Working {

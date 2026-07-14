@@ -68,9 +68,10 @@ pub const KNOWN_EXTS: &[&str] = &[
 ];
 
 /// Extensions ingest actually accepts TODAY. M1 (v0.9.0) turned on the plain
-/// text family; ebooks (M2) and office (M4) flip here later.
+/// text family; M2 the ebook family; office (M4) flips here later.
 pub const INGEST_EXTS: &[&str] = &[
     "pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm",
+    "epub", "fb2", "fb2.zip", "mobi", "azw3", "xps",
 ];
 
 /// The one extension-derivation rule (ROADMAP-3 invariant #8): lowercase the

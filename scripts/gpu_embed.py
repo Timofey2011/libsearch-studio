@@ -31,17 +31,22 @@ import pathlib
 import sys
 import time
 
-SCRIPT_VERSION = 3
+SCRIPT_VERSION = 4
 
 # The extension universe this script handles / deliberately skips. The Rust
 # lockstep test parses these literals out of the embedded script and asserts
 # they cover ls-core INGEST_EXTS exactly — keep them as plain literals.
-HANDLED_EXTS = {"pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm"}
+HANDLED_EXTS = {"pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm", "epub", "fb2", "fb2.zip", "mobi", "azw3", "xps"}
 DIRECTED_SKIPS = {}  # ext -> user-facing reason; never reaches fitz.open()
 
 # ext -> format family stamped into the parquet `format` column. Mirrors
 # ls-core Format::from_ext for every handled ext (lockstep-tested).
-FAMILY = {"pdf": "pdf", "md": "md", "markdown": "md", "ipynb": "md", "txt": "txt", "text": "txt", "rst": "txt", "adoc": "txt", "org": "txt", "tex": "txt", "html": "html", "htm": "html"}
+FAMILY = {"pdf": "pdf", "md": "md", "markdown": "md", "ipynb": "md", "txt": "txt", "text": "txt", "rst": "txt", "adoc": "txt", "org": "txt", "tex": "txt", "html": "html", "htm": "html", "epub": "epub", "fb2": "fb2", "fb2.zip": "fb2", "mobi": "mobi", "azw3": "mobi", "xps": "xps"}
+
+# Formats fitz opens natively (fb2.zip is unzipped to a temp .fb2 first).
+FITZ_EXTS = {"pdf", "epub", "fb2", "fb2.zip", "mobi", "azw3", "xps"}
+# Ebook formats where the document TOC (top two levels) labels chapters.
+TOC_CHAPTER_EXTS = {"epub", "fb2", "fb2.zip", "mobi", "azw3", "xps"}
 
 # Python deps probed by --caps (importlib.util.find_spec — no import execution,
 # a broken package cannot crash the probe). Installing one changes the caps
@@ -422,10 +427,54 @@ def main() -> None:
                 continue
             book_id = hashlib.sha1(str(path.resolve()).encode()).hexdigest()[:16]
             try:
-                if ext == "pdf":
-                    full, page_offsets = build_full_text(extract_pages(path))
+                if ext in FITZ_EXTS:
+                    fitz_path = path
+                    tmp_fb2 = None
+                    if ext == "fb2.zip":
+                        # fitz can't read the zip wrapper: unzip the single
+                        # .fb2 entry to a temp file first.
+                        import tempfile
+                        import zipfile
+                        with zipfile.ZipFile(path) as zf:
+                            inner = next((n for n in zf.namelist()
+                                          if n.lower().endswith(".fb2")), zf.namelist()[0])
+                            data = zf.read(inner)
+                        tmp_fb2 = tempfile.NamedTemporaryFile(suffix=".fb2", delete=False)
+                        tmp_fb2.write(data)
+                        tmp_fb2.close()
+                        fitz_path = pathlib.Path(tmp_fb2.name)
+                    try:
+                        with fitz.open(fitz_path) as doc:
+                            if doc.needs_pass or doc.is_encrypted:
+                                outcomes.append({"i": idx, "status": "skipped",
+                                                 "reason": "DRM-protected — cannot index"})
+                                print(f"[{i}/{n}] skip (DRM) {p}", file=sys.stderr)
+                                continue
+                            pages = [(k, page.get_text("text"))
+                                     for k, page in enumerate(doc, 1)]
+                            # Top-two-level TOC entries label chapters by page.
+                            toc_pages = []
+                            if ext in TOC_CHAPTER_EXTS:
+                                for lvl, toc_title, pg in (doc.get_toc() or []):
+                                    if lvl <= 2 and pg > 0 and toc_title.strip():
+                                        toc_pages.append((pg, toc_title.strip()))
+                                toc_pages.sort(key=lambda x: x[0])
+                    finally:
+                        if tmp_fb2 is not None:
+                            pathlib.Path(tmp_fb2.name).unlink(missing_ok=True)
+
+                    def chapter_at(page_no):
+                        best = ""
+                        for pg, toc_title in toc_pages:
+                            if pg <= page_no:
+                                best = toc_title
+                            else:
+                                break
+                        return best
+
+                    full, page_offsets = build_full_text(pages)
                     # (loc_start, loc_end, page, chapter, text)
-                    pieces = [(ls, le, pg, "") + (t,)
+                    pieces = [(ls, le, pg, chapter_at(pg), t)
                               for (ls, le, pg, t) in chunk_book(full, page_offsets, tokenizer)]
                 else:
                     # Text family: window each heading section separately so
