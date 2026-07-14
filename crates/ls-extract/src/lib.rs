@@ -12,9 +12,11 @@ use std::sync::OnceLock;
 use ls_core::{Block, BookDoc, Format};
 use regex::Regex;
 
+pub mod convert;
 pub mod ebook;
 pub mod office;
 pub mod text;
+pub use convert::{extract_with_cache, pages_display_pdf, webarchive_html, CONVERTED_EXTS};
 pub use ebook::{cpu_directed_skip, extract_ebook};
 pub use office::extract_office;
 pub use text::extract_text_family;

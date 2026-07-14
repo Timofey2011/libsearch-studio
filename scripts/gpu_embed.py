@@ -31,13 +31,13 @@ import pathlib
 import sys
 import time
 
-SCRIPT_VERSION = 5
+SCRIPT_VERSION = 6
 
 # The extension universe this script handles / deliberately skips. The Rust
 # lockstep test parses these literals out of the embedded script and asserts
 # they cover ls-core INGEST_EXTS exactly — keep them as plain literals.
 HANDLED_EXTS = {"pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm", "epub", "fb2", "fb2.zip", "mobi", "azw3", "xps", "docx", "rtf", "odt"}
-DIRECTED_SKIPS = {}  # ext -> user-facing reason; never reaches fitz.open()
+DIRECTED_SKIPS = {"doc": ".doc: handled by standard indexing where a converter is available", "pages": ".pages: handled by standard indexing \u2014 needs an embedded PDF preview", "webarchive": ".webarchive: handled by standard indexing", "djvu": "djvu/chm: handled by standard indexing where djvutxt/7z is installed"}  # ext -> user-facing reason; never reaches fitz.open()
 
 # ext -> format family stamped into the parquet `format` column. Mirrors
 # ls-core Format::from_ext for every handled ext (lockstep-tested).

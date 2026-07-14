@@ -21,3 +21,4 @@ zip = { version = "7", default-features = false, features = ["deflate"] }
 mobi = "0.8.0"
 quick-xml = { version = "0.41", features = ["encoding"] }
 rtf-parser = "0.4.3"
+plist = "1.8.0"

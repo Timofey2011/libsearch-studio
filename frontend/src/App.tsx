@@ -145,6 +145,9 @@ type Reader = {
   html?: string;
   /// Provenance note shown above converted/fallback content.
   convNote?: string;
+  /// Converted artifact rendered INSTEAD of `path` (.pages -> its cached
+  /// embedded Preview.pdf). Identity/actions still use `path`.
+  displayPath?: string;
 };
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
@@ -1045,7 +1048,8 @@ export default function App() {
           ? "md"
           : family === "epub" || family === "mobi" || family === "fb2"
             ? "book"
-            : family === "html" || family === "docx" || family === "rtf" || family === "odt"
+            : family === "html" || family === "docx" || family === "rtf" ||
+                family === "odt" || family === "doc" || family === "webarchive"
               ? "html"
               : "other";
     setReader({
@@ -1082,6 +1086,25 @@ export default function App() {
     }
     if (kind === "html") {
       await loadHtmlKind(s.source_path, family);
+    }
+    if (family === "pages") {
+      // .pages renders via its embedded Preview.pdf where one exists;
+      // otherwise the passage panel stays up.
+      try {
+        const dp = await invoke<{ display_path: string; converted: boolean }>(
+          "resolve_display_path",
+          { path: s.source_path }
+        );
+        if (dp.converted) {
+          setReader((r) =>
+            r && r.path === s.source_path
+              ? { ...r, kind: "pdf", displayPath: dp.display_path }
+              : r
+          );
+        }
+      } catch {
+        /* stays on the passage panel */
+      }
     }
   }
 
@@ -1138,7 +1161,7 @@ export default function App() {
         setReader((r) => (r && r.path === path ? { ...r, html: clean } : r));
         return;
       }
-      if (family === "rtf" || family === "odt") {
+      if (family === "rtf" || family === "odt" || family === "doc" || family === "webarchive") {
         const dp = await invoke<{ display_path: string; converted: boolean; converter: string | null }>(
           "resolve_display_path",
           { path }
@@ -1536,7 +1559,7 @@ export default function App() {
   }
 
   // WKWebView honors the #page fragment to jump to a page.
-  const readerSrc = reader ? convertFileSrc(reader.path) + (reader.page ? `#page=${reader.page}` : "") : "";
+  const readerSrc = reader ? convertFileSrc(reader.displayPath ?? reader.path) + (reader.page ? `#page=${reader.page}` : "") : "";
 
   // ---- Tools modal tabs (rendered as plain calls so inputs keep focus) ----
 
@@ -2953,7 +2976,7 @@ export default function App() {
             ) : (
               <PdfReader
                 key={reader.path}
-                url={convertFileSrc(reader.path)}
+                url={convertFileSrc(reader.displayPath ?? reader.path)}
                 page={reader.page ?? undefined}
                 full={readerFull}
                 onFail={() =>

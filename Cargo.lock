@@ -5076,6 +5076,7 @@ dependencies = [
  "lopdf",
  "ls-core",
  "mobi",
+ "plist",
  "quick-xml 0.41.0",
  "rbook",
  "regex",

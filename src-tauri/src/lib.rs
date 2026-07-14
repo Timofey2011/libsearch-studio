@@ -1150,10 +1150,15 @@ async fn read_source_text(path: String) -> Result<SourceText, String> {
 /// through the existing text reader. CPU-bound (a large epub is seconds), so
 /// it runs under spawn_blocking; capped at 8 MiB on a char boundary.
 #[tauri::command]
-async fn extract_preview_text(path: String) -> Result<SourceText, String> {
+async fn extract_preview_text(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<SourceText, String> {
+    let conv_dir = state.data_dir.join("converted");
     tokio::task::spawn_blocking(move || {
         const CAP: usize = 8 * 1024 * 1024;
-        let doc = ls_extract::extract(Path::new(&path)).map_err(|e| e.to_string())?;
+        let doc = ls_extract::extract_with_cache(Path::new(&path), &conv_dir)
+            .map_err(|e| e.to_string())?;
         if doc.blocks.is_empty() {
             return Err("no extractable text in this file".into());
         }
@@ -1227,7 +1232,39 @@ async fn resolve_display_path(
             converter: None,
         };
         let ext = ls_core::ext_of(&path).unwrap_or("");
-        if !matches!(ext, "rtf" | "odt") {
+        let dir = data_dir.join("converted");
+        // .pages displays via its embedded Preview.pdf (cached by convert.rs);
+        // no preview -> original (the caller falls back to the passage view).
+        if ext == "pages" {
+            return match ls_extract::pages_display_pdf(Path::new(&path), &dir) {
+                Ok(pdf) => Ok(DisplayPath {
+                    display_path: pdf.to_string_lossy().into_owned(),
+                    converted: true,
+                    converter: Some("embedded preview".into()),
+                }),
+                Err(_) => Ok(original),
+            };
+        }
+        // .webarchive IS html — unwrap the plist and cache the page.
+        if ext == "webarchive" {
+            let csig = ls_app::content_signature(Path::new(&path));
+            if ls_app::is_sig_sentinel(&csig) {
+                return Err("file is unreadable".into());
+            }
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let cache = dir.join(format!("{csig}.html"));
+            if !cache.exists() {
+                let html =
+                    ls_extract::webarchive_html(Path::new(&path)).map_err(|e| e.to_string())?;
+                std::fs::write(&cache, html).map_err(|e| e.to_string())?;
+            }
+            return Ok(DisplayPath {
+                display_path: cache.to_string_lossy().into_owned(),
+                converted: true,
+                converter: Some("webarchive".into()),
+            });
+        }
+        if !matches!(ext, "rtf" | "odt" | "doc") {
             return Ok(original);
         }
         let have_textutil = std::process::Command::new("which")
@@ -1242,7 +1279,6 @@ async fn resolve_display_path(
         if ls_app::is_sig_sentinel(&csig) {
             return Err("file is unreadable".into());
         }
-        let dir = data_dir.join("converted");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let cache = dir.join(format!("{csig}.html"));
         if !cache.exists() {
@@ -2597,10 +2633,16 @@ mod lockstep {
             // must fail with an IO/parse error, never Unsupported) OR the ext
             // is a recorded directed CPU skip (e.g. xps → GPU-only).
             if ls_extract::cpu_directed_skip(ext).is_none() {
-                let err = ls_extract::extract(std::path::Path::new(&format!(
-                    "/nonexistent-lockstep-probe/x.{ext}"
-                )))
-                .unwrap_err();
+                // Best-effort formats dispatch through the converter ladder;
+                // everything else through plain extract().
+                let probe = format!("/nonexistent-lockstep-probe/x.{ext}");
+                let err = if ls_extract::CONVERTED_EXTS.contains(ext) {
+                    let cache = std::env::temp_dir().join("lockstep-conv-cache");
+                    ls_extract::extract_with_cache(std::path::Path::new(&probe), &cache)
+                        .unwrap_err()
+                } else {
+                    ls_extract::extract(std::path::Path::new(&probe)).unwrap_err()
+                };
                 assert!(
                     !matches!(err, ls_extract::ExtractError::Unsupported(_)),
                     "{ext}: ls-extract has neither a dispatch arm nor a directed skip"

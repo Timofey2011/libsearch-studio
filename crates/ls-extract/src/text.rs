@@ -211,7 +211,7 @@ fn scan_ipynb(raw: &str) -> Result<Vec<Section>, ExtractError> {
 
 /// HTML: DOM walk collecting visible text; `<h1>/<h2>` open sections;
 /// script/style/nav/head chrome is dropped.
-fn scan_html(raw: &str) -> Vec<Section> {
+pub(crate) fn scan_html(raw: &str) -> Vec<Section> {
     use scraper::{Html, Node};
 
     let doc = Html::parse_document(raw);
