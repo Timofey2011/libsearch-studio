@@ -2,6 +2,27 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.10.0 — 2026-07-14
+
+Bump manifests 0.9.0 → 0.10.0. Ebooks: searchable AND readable.
+
+- **New indexable formats**: EPUB, FB2 (including .fb2.zip, windows-1251
+  handled, author extracted), MOBI/AZW3 (non-DRM; DRM detected and reported),
+  and XPS (Fast/GPU indexing). Chapters come from the book's own TOC and feed
+  Titles/Index.
+- **In-app book reader**: clicking an epub/fb2/mobi citation now opens the
+  book in a real reader (foliate-js) — paginated or scrolled, TOC navigation,
+  font size — and **jumps to the cited passage** (chapter-scoped search with a
+  whole-book fallback; a miss shows the passage in a dismissible strip, never
+  silently). Reader view makes it full-window.
+- One book, several files: when the same book sits next to itself as
+  epub + pdf + mobi, only the preferred format is indexed (epub first) —
+  no more duplicate sources in answers.
+- **↻ Re-index this book** (Titles view): re-embeds a single book with the
+  current extractor — the way to give an old book proper chapters.
+- "Show extracted text" on any format without a pretty renderer — every
+  indexed file gets an in-app view with citation jump.
+
 ## v0.9.0 — 2026-07-10
 
 Bump manifests 0.8.0 → 0.9.0. "Index your notes": the first release of the
