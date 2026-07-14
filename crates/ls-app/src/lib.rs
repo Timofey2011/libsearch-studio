@@ -3,6 +3,7 @@
 //! calls; it depends on the engine crates but contains no UI code.
 
 pub mod discover;
+pub mod plan;
 pub mod service;
 pub mod settings;
 pub mod store;
@@ -10,11 +11,15 @@ pub mod types;
 
 pub use discover::discover_books;
 pub use ls_extract::stable_book_id;
+pub use plan::{
+    plan_index_run, EmbedItem, IndexPlan, PlanCtx, RemapAction, SkipReason, StateRefresh,
+};
 pub use service::{
-    content_signature, file_fingerprint, IndexEvent, IndexStats, Service, ServiceError,
+    content_signature, file_fingerprint, is_sig_sentinel, IndexEvent, IndexStats, Service,
+    ServiceError, CONTENT_SIG_MISSING,
 };
 pub use settings::{ProviderCreds, Settings, SettingsError};
-pub use store::{Db, DbError};
+pub use store::{BookStateHit, Db, DbError};
 pub use types::{Citation, Collection, Conversation, Message, Role};
 
 use std::path::PathBuf;

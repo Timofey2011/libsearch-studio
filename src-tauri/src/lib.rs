@@ -491,66 +491,73 @@ async fn fast_index_collection(
         .await
         .map_err(|e| e.to_string())?;
     let indexed = store.indexed_book_ids().await.unwrap_or_default();
-    let mut to_embed: Vec<String> = Vec::new();
-    let mut preskipped = 0usize;
-    let mut remaps: Vec<(String, String, String)> = Vec::new();
-    {
+    let paths_by_id: std::collections::HashMap<String, String> = store
+        .book_paths()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    // The shared dedup pre-filter (same planner as the CPU path): decides
+    // skip / remap / refresh / embed per candidate; all guard logic —
+    // path-equality short-circuit, fingerprint-collision confirmation,
+    // sentinel poisoning — lives in ls_app::plan.
+    let (to_embed, preskipped, unreadable, remaps) = {
         let db = state.db()?;
-        // Content signatures queued this run, so duplicate files in the same batch
-        // are embedded only once.
-        let mut seen_content: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for f in &files {
-            let p = Path::new(f);
-            let book_id = ls_app::stable_book_id(p);
-            let fp = ls_app::file_fingerprint(p);
-            if db
-                .book_fingerprint(&coll.id, &book_id)
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(fp.as_str())
-            {
-                preskipped += 1;
-                continue;
-            }
-            if let Some(old) = db.book_id_for_fingerprint(&coll.id, &fp).ok().flatten() {
-                if old != book_id {
-                    let _ = db.delete_book_state(&coll.id, &old);
-                    let _ = db.set_book_fingerprint(&coll.id, &book_id, &fp);
-                    remaps.push((old, book_id, f.clone()));
-                    preskipped += 1;
-                    continue;
-                }
-            }
-            if indexed.contains(&book_id) {
-                let _ = db.set_book_fingerprint(&coll.id, &book_id, &fp);
-                preskipped += 1;
-                continue;
-            }
-            // Content-checksum dedup: same bytes under a new path / changed mtime,
-            // or a duplicate already queued this run — skip re-embedding.
-            let csig = ls_app::content_signature(p);
-            if seen_content.contains_key(&csig) {
-                preskipped += 1;
-                continue;
-            }
-            if let Some(old) = db.book_id_for_content(&coll.id, &csig).ok().flatten() {
-                if old != book_id {
-                    let _ = db.delete_book_state(&coll.id, &old);
-                    let _ = db.set_book_state(&coll.id, &book_id, &fp, &csig);
-                    remaps.push((old, book_id, f.clone()));
-                    preskipped += 1;
-                    continue;
-                }
-            }
-            seen_content.insert(csig, book_id);
-            to_embed.push(f.clone());
+        let _ = db.backfill_source_paths(&coll.id, &paths_by_id);
+        let candidates: Vec<std::path::PathBuf> =
+            files.iter().map(std::path::PathBuf::from).collect();
+        let ctx = ls_app::PlanCtx {
+            collection_id: &coll.id,
+            db: &db,
+            indexed_ids: &indexed,
+            paths_by_id: &paths_by_id,
+            fp_fn: &|p| ls_app::file_fingerprint(p),
+            csig_fn: &|p| ls_app::content_signature(p),
+        };
+        let plan = ls_app::plan_index_run(&candidates, &ctx).map_err(|e| e.to_string())?;
+        for r in &plan.state_refreshes {
+            let _ = db.refresh_book_state(
+                &coll.id,
+                &r.book_id,
+                &r.fingerprint,
+                r.content_sig.as_deref(),
+                &r.path,
+            );
         }
-    }
+        for m in &plan.remaps {
+            let _ = db.delete_book_state(&coll.id, &m.old_id);
+            let _ = db.set_book_state_ver(
+                &coll.id,
+                &m.new_id,
+                &m.fingerprint,
+                m.content_sig.as_deref().unwrap_or(""),
+                &m.path,
+                m.chunker_ver,
+            );
+        }
+        let unreadable: Vec<String> = plan
+            .preskips
+            .iter()
+            .filter(|(_, r)| *r == ls_app::SkipReason::Unreadable)
+            .map(|(p, _)| p.clone())
+            .collect();
+        (
+            plan.to_embed,
+            plan.preskips.len() - unreadable.len(),
+            unreadable,
+            plan.remaps,
+        )
+    };
     // Apply any path re-points now that the DB handle is dropped.
-    for (old, new, path) in &remaps {
-        store.remap_book(old, new, path).await.ok();
+    for m in &remaps {
+        store.remap_book(&m.old_id, &m.new_id, &m.path).await.ok();
+    }
+    // Unreadable files get an explicit once-per-run event, never silence.
+    for p in &unreadable {
+        let _ = window.emit(
+            "index-log",
+            format!("skipped (unreadable — permissions, or an offline cloud placeholder?): {p}"),
+        );
     }
 
     if to_embed.is_empty() {
@@ -558,7 +565,7 @@ async fn fast_index_collection(
             books_indexed: 0,
             books_unchanged: preskipped,
             books_skipped: 0,
-            books_failed: 0,
+            books_failed: unreadable.len(),
             chunks_written: 0,
         };
         let _ = window.emit(
@@ -595,6 +602,7 @@ async fn fast_index_collection(
             break;
         }
         let parquet = tmp_dir.join(format!("fastindex-{collection_id}-{bi}.parquet"));
+        let batch_paths: Vec<String> = batch.iter().map(|it| it.path.clone()).collect();
         match run_py_batch(
             &window,
             &state.cancel,
@@ -602,7 +610,7 @@ async fn fast_index_collection(
             &py,
             &script,
             &parquet,
-            batch,
+            &batch_paths,
             &mut gi,
             total,
         )
@@ -616,15 +624,18 @@ async fn fast_index_collection(
                 chunks_written += chunks;
                 indexed += idx;
                 skipped += skip;
-                // Commit this batch's fingerprints so it's not re-embedded on resume.
+                // Commit this batch's manifest state so it's not re-embedded on
+                // resume — from the fp/csig captured at plan time (no recompute,
+                // no re-read of possibly-changed files).
                 let db = state.db()?;
-                for f in batch {
-                    let p = Path::new(f);
+                for it in batch {
+                    let p = Path::new(&it.path);
                     let _ = db.set_book_state(
                         &coll.id,
                         &ls_app::stable_book_id(p),
-                        &ls_app::file_fingerprint(p),
-                        &ls_app::content_signature(p),
+                        &it.fingerprint,
+                        &it.content_sig,
+                        &it.path,
                     );
                 }
             }
@@ -641,7 +652,7 @@ async fn fast_index_collection(
         books_indexed: indexed,
         books_unchanged: preskipped,
         books_skipped: skipped,
-        books_failed: 0,
+        books_failed: unreadable.len(),
         chunks_written,
     };
     let _ = window.emit(
