@@ -59,6 +59,22 @@ CREATE TABLE IF NOT EXISTS notebook (
     content    TEXT NOT NULL,
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
+-- Pipeline-scoped skip records (ROADMAP-3 §2.8). Deliberately NOT book_state:
+-- a skip must never be found by the dedup reverse lookups and masquerade as a
+-- success. Keyed by PATH (fingerprints collide between distinct files — the
+-- fingerprint column is a STALENESS check only, never identity, never the
+-- 'missing' sentinel). caps_ver is the per-pipeline runtime-capabilities hash:
+-- when tools/deps/device change, old skips stop matching and are retried.
+CREATE TABLE IF NOT EXISTS skip_state (
+    collection_id TEXT NOT NULL,
+    source_path   TEXT NOT NULL,
+    pipeline      TEXT NOT NULL,
+    fingerprint   TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    caps_ver      TEXT NOT NULL,
+    created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (collection_id, source_path, pipeline)
+);
 "#;
 
 pub struct Db {
@@ -595,6 +611,96 @@ impl Db {
             }
         }
         Ok(filled)
+    }
+
+    // ---- pipeline-scoped skip records (ROADMAP-3 §2.8) ----
+
+    /// Stage-0.5 lookup: the (fingerprint, caps_ver) recorded when this path
+    /// was last skipped by this pipeline, if any. The caller short-circuits
+    /// ONLY when both still match the current run.
+    pub fn skip_state_hit(
+        &self,
+        collection_id: &str,
+        source_path: &str,
+        pipeline: &str,
+    ) -> Result<Option<(String, String)>, DbError> {
+        let r = self.conn.query_row(
+            "SELECT fingerprint, caps_ver FROM skip_state
+             WHERE collection_id = ?1 AND source_path = ?2 AND pipeline = ?3",
+            params![collection_id, source_path, pipeline],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        );
+        match r {
+            Ok(hit) => Ok(Some(hit)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Record a skip. Refused when the fingerprint is the failure sentinel:
+    /// an unreadable file gets an event only, no state, and is retried every
+    /// run by construction (invariant #6).
+    pub fn upsert_skip(
+        &self,
+        collection_id: &str,
+        source_path: &str,
+        pipeline: &str,
+        fingerprint: &str,
+        reason: &str,
+        caps_ver: &str,
+    ) -> Result<(), DbError> {
+        if crate::is_sig_sentinel(fingerprint) {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO skip_state (collection_id, source_path, pipeline, fingerprint, reason, caps_ver)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(collection_id, source_path, pipeline)
+             DO UPDATE SET fingerprint=excluded.fingerprint, reason=excluded.reason,
+                           caps_ver=excluded.caps_ver, created_at=strftime('%s','now')",
+            params![collection_id, source_path, pipeline, fingerprint, reason, caps_ver],
+        )?;
+        Ok(())
+    }
+
+    /// A successful index of a file erases its skip records across BOTH
+    /// pipelines (plain path-keyed delete).
+    pub fn erase_skips(&self, collection_id: &str, source_path: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM skip_state WHERE collection_id = ?1 AND source_path = ?2",
+            params![collection_id, source_path],
+        )?;
+        Ok(())
+    }
+
+    /// Opportunistic sweep at index start: drop skip rows whose path no longer
+    /// lives under any of the collection's source paths (moved/removed files
+    /// simply get a fresh attempt at their new location).
+    pub fn gc_skips(
+        &self,
+        collection_id: &str,
+        source_prefixes: &[String],
+    ) -> Result<usize, DbError> {
+        let paths: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT source_path FROM skip_state WHERE collection_id = ?1")?;
+            let rows = stmt.query_map(params![collection_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut swept = 0usize;
+        for p in paths {
+            let covered = source_prefixes
+                .iter()
+                .any(|pre| p == *pre || p.starts_with(&format!("{}/", pre.trim_end_matches('/'))));
+            if !covered {
+                swept += self.conn.execute(
+                    "DELETE FROM skip_state WHERE collection_id = ?1 AND source_path = ?2",
+                    params![collection_id, p],
+                )?;
+            }
+        }
+        Ok(swept)
     }
 
     /// How many of a collection's indexed books were chunked by an OLDER scheme

@@ -38,6 +38,9 @@ pub enum SkipReason {
     Unreadable,
     /// Identical content already queued earlier in this same run.
     DuplicateInRun,
+    /// A recorded skip (same file, same pipeline capabilities) — stage 0.5.
+    /// Silent by contract (§2.8): counted, never re-announced per run.
+    Silenced,
 }
 
 /// A moved file: re-point existing chunks instead of re-embedding.
@@ -92,6 +95,13 @@ pub struct PlanCtx<'a> {
     /// `book_id -> source_path` from the same scan; powers both the §2.1.3
     /// path-membership check and the empty-`source_path` row fallback.
     pub paths_by_id: &'a HashMap<String, String>,
+    /// 'cpu' | 'gpu' — skip records are pipeline-scoped (§2.8): one pipeline's
+    /// inability must never hide a file from the other.
+    pub pipeline: &'a str,
+    /// This run's capabilities hash for this pipeline; a recorded skip is
+    /// honored only while it still matches (tool installs/device changes
+    /// retry past old skips).
+    pub caps_ver: &'a str,
     pub fp_fn: &'a dyn Fn(&Path) -> String,
     pub csig_fn: &'a dyn Fn(&Path) -> String,
 }
@@ -140,6 +150,21 @@ pub fn plan_index_run(candidates: &[PathBuf], ctx: &PlanCtx) -> Result<IndexPlan
         if is_sig_sentinel(&fp) {
             plan.preskips.push((path_str, SkipReason::Unreadable));
             continue;
+        }
+
+        // Stage 0.5: previously skipped by THIS pipeline, file unchanged AND
+        // capabilities unchanged → silent short-circuit (no re-announcement).
+        // Any mismatch (file changed, tools/deps/device changed) falls
+        // through: the skip is retried and its row overwritten by the retry's
+        // outcome.
+        if let Some((skip_fp, skip_caps)) =
+            ctx.db
+                .skip_state_hit(ctx.collection_id, &path_str, ctx.pipeline)?
+        {
+            if skip_fp == fp && skip_caps == ctx.caps_ver {
+                plan.preskips.push((path_str, SkipReason::Silenced));
+                continue;
+            }
         }
 
         // Stage 1: unchanged file under its own path-derived id.

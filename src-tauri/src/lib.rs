@@ -234,7 +234,10 @@ async fn index_collection(
 
     let files = ls_app::discover_books(&coll.source_paths);
     if files.is_empty() {
-        return Err("no PDF files found under the collection's source paths".into());
+        return Err(format!(
+            "no supported files ({}) found under the collection's source paths",
+            ls_core::supported_exts_display()
+        ));
     }
 
     let models_dir = state.models_dir();
@@ -351,19 +354,53 @@ fn parse_py_progress(line: &str) -> PyProgress {
 /// and reacts to cancellation by killing the helper. Returns `(chunks, indexed,
 /// skipped)`, or `Ok(None)` if the user cancelled mid-batch.
 #[allow(clippy::too_many_arguments)]
+/// One file's outcome from the helper's sidecar (ROADMAP-3 §2.10) — the ONLY
+/// channel state decisions come from; stderr is display-only.
+#[derive(serde::Deserialize)]
+struct SidecarOutcome {
+    i: usize,
+    status: String,
+    #[serde(default)]
+    #[allow(dead_code)] // display counts come from stderr; chunks kept for future use
+    chunks: usize,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SidecarFile {
+    v: u32,
+    outcomes: Vec<SidecarOutcome>,
+}
+
+struct BatchResult {
+    chunks: usize,
+    outcomes: Vec<SidecarOutcome>,
+}
+
+/// Run one helper batch: spawn → stream progress → validate the sidecar →
+/// import the parquet. `Err` is a BATCH failure (no state committed; the run
+/// continues with later batches) — except a spawn failure, which the caller
+/// treats as fatal. `Ok(None)` = cancelled.
+#[allow(clippy::too_many_arguments)] // mirrors the batch inputs by design
 async fn run_py_batch(
     window: &WebviewWindow,
     cancel: &AtomicBool,
     store: &Store,
     py: &str,
     script: &str,
+    device: &str,
     parquet: &Path,
     batch: &[String],
     gi: &mut usize,
     total: usize,
-) -> Result<Option<(usize, usize, usize)>, String> {
+) -> Result<Option<BatchResult>, String> {
     let mut cmd = tokio::process::Command::new(py);
-    cmd.arg(script).arg("--out").arg(parquet);
+    cmd.arg(script)
+        .arg("--out")
+        .arg(parquet)
+        .arg("--device")
+        .arg(device);
     for f in batch {
         cmd.arg(f);
     }
@@ -386,8 +423,6 @@ async fn run_py_batch(
         });
     }
 
-    let mut indexed = 0usize;
-    let mut skipped = 0usize;
     let mut tail = String::new();
     let mut cancelled = false;
     loop {
@@ -396,14 +431,13 @@ async fn run_py_batch(
                 let line = match maybe { Ok(Some(l)) => l, _ => break };
                 let _ = window.emit("index-log", line.clone());
                 match parse_py_progress(&line) {
+                    // Display only — authoritative outcomes come from the sidecar.
                     PyProgress::Book { title, chunks } => {
                         *gi += 1;
-                        indexed += 1;
                         let _ = window.emit("index-progress", IndexEvent::Indexed { n: *gi, total, title, chunks });
                     }
                     PyProgress::Skip { path, reason } => {
                         *gi += 1;
-                        skipped += 1;
                         let _ = window.emit("index-progress", IndexEvent::Skipped { n: *gi, total, path, reason });
                     }
                     PyProgress::Other => {}
@@ -422,25 +456,74 @@ async fn run_py_batch(
         }
     }
     let status = child.wait().await.map_err(|e| e.to_string())?;
+    let sidecar_path = parquet.with_file_name(format!(
+        "{}.outcomes.json",
+        parquet.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let cleanup = || {
+        let _ = std::fs::remove_file(parquet);
+        let _ = std::fs::remove_file(&sidecar_path);
+    };
 
     if cancelled {
-        let _ = std::fs::remove_file(parquet);
+        cleanup();
         return Ok(None);
     }
     if !status.success() {
-        let _ = std::fs::remove_file(parquet);
+        cleanup();
         return Err(format!(
             "Python helper failed (exit {}):\n{}",
             status.code().unwrap_or(-1),
             tail.trim_end()
         ));
     }
-    let chunks = store
-        .import_parquet(parquet)
-        .await
-        .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(parquet);
-    Ok(Some((chunks, indexed, skipped)))
+    // The sidecar is the state-decision channel (§2.10): every argv file must
+    // appear exactly once. Missing/invalid/incomplete → the whole batch is
+    // treated as failed (also the compatibility path for custom scripts that
+    // predate the sidecar) — never fabricated per-file success.
+    let outcomes = std::fs::read_to_string(&sidecar_path)
+        .map_err(|e| {
+            format!(
+                "helper wrote no outcomes sidecar ({e}) — custom indexer script \
+                 predating gpu_embed v2? Batch not committed."
+            )
+        })
+        .and_then(|txt| {
+            serde_json::from_str::<SidecarFile>(&txt).map_err(|e| format!("bad sidecar: {e}"))
+        })
+        .and_then(|f| {
+            if f.v != 1 {
+                return Err(format!("unsupported sidecar version {}", f.v));
+            }
+            let mut seen = vec![false; batch.len()];
+            for oc in &f.outcomes {
+                if oc.i >= batch.len() || seen[oc.i] {
+                    return Err("sidecar indexes out of range or duplicated".into());
+                }
+                seen[oc.i] = true;
+            }
+            if !seen.iter().all(|s| *s) {
+                return Err("sidecar incomplete: not every batch file has an outcome".into());
+            }
+            Ok(f.outcomes)
+        });
+    let outcomes = match outcomes {
+        Ok(o) => o,
+        Err(e) => {
+            cleanup();
+            return Err(e);
+        }
+    };
+    // Import errors (incl. the §2.4 unknown-format hard error) void the batch.
+    let chunks = match store.import_parquet(parquet).await {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup();
+            return Err(e.to_string());
+        }
+    };
+    cleanup();
+    Ok(Some(BatchResult { chunks, outcomes }))
 }
 
 /// Fast index a collection by offloading bulk embedding to the configured
@@ -479,7 +562,10 @@ async fn fast_index_collection(
         .ok_or_else(|| format!("collection {collection_id} not found"))?;
     let files = ls_app::discover_books(&coll.source_paths);
     if files.is_empty() {
-        return Err("no PDF files found under the collection's source paths".into());
+        return Err(format!(
+            "no supported files ({}) found under the collection's source paths",
+            ls_core::supported_exts_display()
+        ));
     }
 
     let _ = window.emit("index-progress", IndexEvent::Loading);
@@ -501,9 +587,40 @@ async fn fast_index_collection(
     // skip / remap / refresh / embed per candidate; all guard logic —
     // path-equality short-circuit, fingerprint-collision confirmation,
     // sentinel poisoning — lives in ls_app::plan.
-    let (to_embed, preskipped, unreadable, remaps) = {
+    // This run's GPU capabilities hash (§2.8): the helper's stdlib-only
+    // --caps JSON ⊕ the configured device. A helper predating --caps (custom
+    // script) falls back to a script-bytes hash with a logged note.
+    let gpu_caps = {
+        let probe = tokio::process::Command::new(&py)
+            .arg(&script)
+            .arg("--caps")
+            .output()
+            .await;
+        match probe {
+            Ok(o) if o.status.success() => ls_app::service::caps_hash(&[
+                "gpu",
+                String::from_utf8_lossy(&o.stdout).trim(),
+                &settings.gpu_device,
+            ]),
+            _ => {
+                let _ = window.emit(
+                    "index-log",
+                    "helper does not support --caps (custom indexer script predating gpu_embed v2?) — using script-bytes hash for skip retries",
+                );
+                let bytes = std::fs::read(&script).unwrap_or_default();
+                let byte_hash = ls_app::service::caps_hash(&[
+                    &format!("{}", bytes.len()),
+                    &String::from_utf8_lossy(&bytes),
+                ]);
+                ls_app::service::caps_hash(&["gpu-legacy", &byte_hash, &settings.gpu_device])
+            }
+        }
+    };
+
+    let (to_embed, preskipped, silenced, unreadable, remaps) = {
         let db = state.db()?;
         let _ = db.backfill_source_paths(&coll.id, &paths_by_id);
+        let _ = db.gc_skips(&coll.id, &coll.source_paths);
         let candidates: Vec<std::path::PathBuf> =
             files.iter().map(std::path::PathBuf::from).collect();
         let ctx = ls_app::PlanCtx {
@@ -511,6 +628,8 @@ async fn fast_index_collection(
             db: &db,
             indexed_ids: &indexed,
             paths_by_id: &paths_by_id,
+            pipeline: "gpu",
+            caps_ver: &gpu_caps,
             fp_fn: &|p| ls_app::file_fingerprint(p),
             csig_fn: &|p| ls_app::content_signature(p),
         };
@@ -541,9 +660,15 @@ async fn fast_index_collection(
             .filter(|(_, r)| *r == ls_app::SkipReason::Unreadable)
             .map(|(p, _)| p.clone())
             .collect();
+        let silenced = plan
+            .preskips
+            .iter()
+            .filter(|(_, r)| *r == ls_app::SkipReason::Silenced)
+            .count();
         (
             plan.to_embed,
-            plan.preskips.len() - unreadable.len(),
+            plan.preskips.len() - unreadable.len() - silenced,
+            silenced,
             unreadable,
             plan.remaps,
         )
@@ -564,7 +689,7 @@ async fn fast_index_collection(
         let stats = IndexStats {
             books_indexed: 0,
             books_unchanged: preskipped,
-            books_skipped: 0,
+            books_skipped: silenced,
             books_failed: unreadable.len(),
             chunks_written: 0,
         };
@@ -594,6 +719,7 @@ async fn fast_index_collection(
     let mut gi = 0usize; // global book counter for progress numbering
     let mut indexed = 0usize;
     let mut skipped = 0usize;
+    let mut failed = 0usize;
     let mut chunks_written = 0usize;
     let mut cancelled = false;
     for (bi, batch) in to_embed.chunks(CHECKPOINT_N).enumerate() {
@@ -609,34 +735,71 @@ async fn fast_index_collection(
             &store,
             &py,
             &script,
+            &settings.gpu_device,
             &parquet,
             &batch_paths,
             &mut gi,
             total,
         )
-        .await?
+        .await
         {
-            None => {
+            Err(msg) => {
+                // Batch containment (§2.4): rows discarded, NO state committed
+                // for any file in this batch, run continues with later batches
+                // — except a spawn failure, which would fail them all.
+                let fatal = msg.starts_with("failed to start Python helper");
+                let _ = window.emit(
+                    "index-log",
+                    format!(
+                        "batch {} failed — no state committed, its files retry next run: {msg}",
+                        bi + 1
+                    ),
+                );
+                if fatal {
+                    return Err(msg);
+                }
+                failed += batch.len();
+                gi += batch.len();
+                continue;
+            }
+            Ok(None) => {
                 cancelled = true;
                 break;
             }
-            Some((chunks, idx, skip)) => {
-                chunks_written += chunks;
-                indexed += idx;
-                skipped += skip;
-                // Commit this batch's manifest state so it's not re-embedded on
-                // resume — from the fp/csig captured at plan time (no recompute,
-                // no re-read of possibly-changed files).
+            Ok(Some(res)) => {
+                chunks_written += res.chunks;
+                // Outcome-aware commit (§2.10): state per the sidecar, never
+                // blanket success. fp/csig come from plan time (no recompute).
                 let db = state.db()?;
-                for it in batch {
-                    let p = Path::new(&it.path);
-                    let _ = db.set_book_state(
-                        &coll.id,
-                        &ls_app::stable_book_id(p),
-                        &it.fingerprint,
-                        &it.content_sig,
-                        &it.path,
-                    );
+                for oc in &res.outcomes {
+                    let it = &batch[oc.i];
+                    match oc.status.as_str() {
+                        "indexed" => {
+                            indexed += 1;
+                            let p = Path::new(&it.path);
+                            let _ = db.set_book_state(
+                                &coll.id,
+                                &ls_app::stable_book_id(p),
+                                &it.fingerprint,
+                                &it.content_sig,
+                                &it.path,
+                            );
+                            let _ = db.erase_skips(&coll.id, &it.path);
+                        }
+                        "skipped" => {
+                            skipped += 1;
+                            let _ = db.upsert_skip(
+                                &coll.id,
+                                &it.path,
+                                "gpu",
+                                &it.fingerprint,
+                                &oc.reason,
+                                &gpu_caps,
+                            );
+                        }
+                        // "error": transient — no state at all, retried next run.
+                        _ => failed += 1,
+                    }
                 }
             }
         }
@@ -651,8 +814,8 @@ async fn fast_index_collection(
     let stats = IndexStats {
         books_indexed: indexed,
         books_unchanged: preskipped,
-        books_skipped: skipped,
-        books_failed: unreadable.len(),
+        books_skipped: skipped + silenced,
+        books_failed: unreadable.len() + failed,
         chunks_written,
     };
     let _ = window.emit(
@@ -2161,6 +2324,89 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod lockstep {
+    //! ROADMAP-3 §2.5: every ingest extension must be covered by (a) a Format
+    //! mapping, (b) an ls-extract arm or directed CPU skip, and (c) the
+    //! embedded GPU script's HANDLED_EXTS / DIRECTED_SKIPS — parsed from the
+    //! script's literals so the two languages cannot drift silently.
+    use super::GPU_EMBED_PY;
+
+    /// Extract the string items of a one-line python set/dict literal.
+    fn py_literal_strings(script: &str, name: &str) -> Vec<String> {
+        let line = script
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{name} = ")))
+            .unwrap_or_else(|| panic!("{name} literal not found in gpu_embed.py"));
+        line.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_ingest_ext_is_covered_everywhere() {
+        let handled = py_literal_strings(GPU_EMBED_PY, "HANDLED_EXTS");
+        let directed = py_literal_strings(GPU_EMBED_PY, "DIRECTED_SKIPS");
+        for ext in ls_core::INGEST_EXTS {
+            // (a) Format mapping exists.
+            let fmt = ls_core::Format::from_ext(ext)
+                .unwrap_or_else(|| panic!("{ext}: no Format::from_ext mapping"));
+            // (b) CPU extractor has an arm: dispatch on a missing file of this
+            // ext must fail with an IO/parse error, never Unsupported.
+            let err = ls_extract::extract(std::path::Path::new(&format!(
+                "/nonexistent-lockstep-probe/x.{ext}"
+            )))
+            .unwrap_err();
+            assert!(
+                !matches!(err, ls_extract::ExtractError::Unsupported(_)),
+                "{ext}: ls-extract has no dispatch arm"
+            );
+            // (c) The GPU script handles or explicitly skips it.
+            assert!(
+                handled.iter().any(|h| h == ext) || directed.iter().any(|d| d == ext),
+                "{ext}: gpu_embed.py neither handles nor directed-skips it"
+            );
+            // (d) Handled exts stamp the same family the Rust side expects.
+            if handled.iter().any(|h| h == ext) {
+                let family = py_literal_strings(GPU_EMBED_PY, "FAMILY");
+                let pos = family
+                    .iter()
+                    .position(|k| k == ext)
+                    .unwrap_or_else(|| panic!("{ext}: missing from gpu_embed.py FAMILY map"));
+                assert_eq!(
+                    family[pos + 1],
+                    fmt.as_str(),
+                    "{ext}: FAMILY stamp disagrees with Format::from_ext"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn caps_probe_is_stdlib_only() {
+        // The module top must never import torch & co: --caps has to answer in
+        // milliseconds even in a venv with a broken torch install.
+        let top = GPU_EMBED_PY
+            .split("def ")
+            .next()
+            .expect("script has a module top");
+        for heavy in [
+            "torch",
+            "sentence_transformers",
+            "transformers",
+            "pyarrow",
+            "fitz",
+        ] {
+            assert!(
+                !top.contains(&format!("import {heavy}")),
+                "module top imports {heavy}; --caps would pay for it"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -55,7 +55,17 @@ async fn main() -> Result<()> {
             let coll = args.next().unwrap_or_else(|| "default".into());
             run_backfill_state(&app_dir, &coll).await
         }
-        _ => bail!("usage: ls-cli <search|ingest|import|backfill-state|ask> ..."),
+        Some("gen-exts") => {
+            // Regenerate the frontend's extension map from the ls-core
+            // canonical list; a freshness test keeps the copy honest.
+            let out = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../frontend/src/generated/supportedExts.ts");
+            std::fs::create_dir_all(out.parent().unwrap()).context("mkdir generated/")?;
+            std::fs::write(&out, ls_core::gen_supported_exts_ts()).context("write ts")?;
+            eprintln!("wrote {}", out.display());
+            Ok(())
+        }
+        _ => bail!("usage: ls-cli <search|ingest|import|backfill-state|gen-exts|ask> ..."),
     }
 }
 

@@ -12,6 +12,10 @@ pub struct ProviderCreds {
     pub model: String,
 }
 
+fn default_gpu_device() -> String {
+    "mps".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -33,6 +37,11 @@ pub struct Settings {
     /// the app can offload bulk embedding to the GPU instead of the CPU path.
     pub python_bin: String,
     pub indexer_script: String,
+    /// Device passed to the GPU helper as `--device` (mps | cuda | cpu).
+    /// Folded into the GPU capabilities hash, so changing it retries past
+    /// device-dependent skips.
+    #[serde(default = "default_gpu_device")]
+    pub gpu_device: String,
     /// Retrieval breadth: hybrid candidate pool and final reranked count.
     pub hybrid_top_k: usize,
     pub final_top_k: usize,
@@ -56,6 +65,7 @@ impl Default for Settings {
             providers: BTreeMap::new(),
             python_bin: String::new(),
             indexer_script: String::new(),
+            gpu_device: default_gpu_device(),
             // Candidates reranked per query. The cross-encoder runs on CPU, so this
             // is the main per-query latency knob; 24 keeps recall high while being
             // ~2x faster than 50. (int8-quantizing the reranker is the next lever.)

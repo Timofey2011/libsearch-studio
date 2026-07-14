@@ -82,14 +82,12 @@ pub fn extract_pdf(path: &Path) -> Result<BookDoc, ExtractError> {
     })
 }
 
-/// Dispatch on file extension. Returns a BookDoc whose `blocks` may be empty when
-/// extraction yielded no usable text (scanned PDF) — the caller should skip it.
+/// Dispatch on the canonical extension rule (`ls_core::ext_of` — compound
+/// extensions like `.fb2.zip` resolve correctly). Returns a BookDoc whose
+/// `blocks` may be empty when extraction yielded no usable text (scanned
+/// PDF) — the caller should skip it.
 pub fn extract(path: &Path) -> Result<BookDoc, ExtractError> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .and_then(Format::from_ext)
-    {
+    match Format::from_path(&path.to_string_lossy()) {
         Some(Format::Pdf) => {
             let doc = extract_pdf(path)?;
             let chars: usize = doc.blocks.iter().map(|b| b.text.chars().count()).sum();

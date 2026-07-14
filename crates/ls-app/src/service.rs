@@ -163,6 +163,39 @@ pub fn content_signature(path: &Path) -> String {
 /// refuse to persist it, and in-run dedup maps never key on it.
 pub const CONTENT_SIG_MISSING: &str = "missing";
 
+/// Stable hex hash for capabilities fingerprints.
+pub fn caps_hash(parts: &[&str]) -> String {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        h.write(p.as_bytes());
+        h.write_u8(0);
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// The CPU pipeline's runtime-capabilities hash (§2.8): compile-time ingest
+/// surface ⊕ the probed external-converter set. Installing/removing a
+/// converter changes the hash, so skips recorded under the old hash are
+/// retried automatically.
+pub fn cpu_caps_ver() -> String {
+    const TOOLS: &[&str] = &["textutil", "antiword", "soffice", "djvutxt", "7z"];
+    let probed: Vec<String> = TOOLS
+        .iter()
+        .filter(|t| {
+            std::process::Command::new("which")
+                .arg(t)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .map(|t| t.to_string())
+        .collect();
+    let ingest = ls_core::INGEST_EXTS.join(",");
+    let tools = probed.join(",");
+    caps_hash(&["cpu-v1", &ingest, &tools])
+}
+
 /// Outcome of [`backfill_book_state`].
 #[derive(Debug, Default)]
 pub struct BackfillOutcome {
@@ -279,6 +312,11 @@ impl Service {
         self.db
             .backfill_source_paths(&collection.id, &paths_by_id)?;
 
+        // Skip-record hygiene: sweep rows whose paths left the collection's
+        // sources, and compute this run's CPU capabilities hash (§2.8).
+        let _ = self.db.gc_skips(&collection.id, &collection.source_paths);
+        let caps_ver = cpu_caps_ver();
+
         // The shared dedup pre-filter (also used by the GPU fast-index path):
         // decides skip / remap / refresh / embed per candidate, writing nothing.
         let candidates: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
@@ -287,6 +325,8 @@ impl Service {
             db: &self.db,
             indexed_ids: &indexed,
             paths_by_id: &paths_by_id,
+            pipeline: "cpu",
+            caps_ver: &caps_ver,
             fp_fn: &|p| file_fingerprint(p),
             csig_fn: &|p| content_signature(p),
         };
@@ -329,6 +369,11 @@ impl Service {
                         reason: "unreadable (permissions, or an offline cloud placeholder?)".into(),
                     });
                 }
+                // A recorded skip with unchanged file + capabilities: counted,
+                // never re-announced (§2.8).
+                crate::plan::SkipReason::Silenced => {
+                    stats.books_skipped += 1;
+                }
                 _ => {
                     stats.books_unchanged += 1;
                     on_event(IndexEvent::Unchanged {
@@ -362,6 +407,16 @@ impl Service {
                 Ok(d) => d,
                 Err(e) => {
                     stats.books_failed += 1;
+                    // Recorded so the next run is silent about it — retried
+                    // when the file's bytes or this pipeline's caps change.
+                    self.db.upsert_skip(
+                        &collection.id,
+                        path,
+                        "cpu",
+                        fp,
+                        &e.to_string(),
+                        &caps_ver,
+                    )?;
                     on_event(IndexEvent::Skipped {
                         n,
                         total,
@@ -374,8 +429,17 @@ impl Service {
 
             if doc.blocks.is_empty() {
                 stats.books_skipped += 1;
-                self.db
-                    .set_book_state(&collection.id, &doc.book_id, fp, csig, path)?;
+                // Behavior change (§2.8): "no extractable text" is a SKIP, not
+                // success-shaped book_state — an extractor upgrade (new caps
+                // hash) automatically re-attempts these books.
+                self.db.upsert_skip(
+                    &collection.id,
+                    path,
+                    "cpu",
+                    fp,
+                    "no extractable text",
+                    &caps_ver,
+                )?;
                 on_event(IndexEvent::Skipped {
                     n,
                     total,
@@ -420,6 +484,8 @@ impl Service {
             wrote = true;
             self.db
                 .set_book_state(&collection.id, &doc.book_id, fp, csig, path)?;
+            // Success erases past skip records for this path — both pipelines.
+            self.db.erase_skips(&collection.id, path)?;
             on_event(IndexEvent::Indexed {
                 n,
                 total,
