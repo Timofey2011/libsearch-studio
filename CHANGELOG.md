@@ -2,6 +2,27 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.12.0 — 2026-07-14
+
+Bump manifests 0.11.0 → 0.12.0. Best-effort formats — ROADMAP-3 complete.
+
+- **New indexable formats**: legacy Word (.doc, converted via textutil /
+  antiword / LibreOffice — whichever is installed), Apple Pages (.pages,
+  through the document's own embedded PDF preview), Safari saved pages
+  (.webarchive, pure Rust), and DjVu (.djvu via djvulibre's djvutxt).
+- **Honest skips, automatic retries**: when a converter is missing the file
+  is skipped once with the exact fix ("install antiword or LibreOffice",
+  "brew install djvulibre") and retried automatically after you install it —
+  no re-index button hunting.
+- **Display**: .pages opens in the PDF reader (its embedded preview);
+  .doc and .webarchive render styled in-app with the usual sanitized
+  offline conversion; everything falls back to extracted text.
+- Converted artifacts live in an app-owned cache; the original file keeps
+  its identity — moved-file detection, dedup, and "Open in default app"
+  still point at your document.
+- One book as pdf + djvu side by side no longer indexes twice (the better
+  format wins).
+
 ## v0.11.0 — 2026-07-14
 
 Bump manifests 0.10.0 → 0.11.0. Office documents.
