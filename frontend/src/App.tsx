@@ -133,6 +133,9 @@ type Reader = {
   error?: string;
   /// PDF.js couldn't open this file — fall back to the native iframe viewer.
   pdfNative?: boolean;
+  /// Text source exceeded the read cap; only the first window is shown.
+  truncated?: boolean;
+  totalBytes?: number;
 };
 
 // Mirrors ls_app::Settings. Loaded whole and spread on edit so fields this UI
@@ -177,6 +180,7 @@ type IndexEvent =
   | { kind: "finished"; stats: IndexStats };
 
 type IndexStats = {
+  by_format?: Record<string, [number, number]>;
   books_indexed: number;
   books_unchanged: number;
   books_skipped: number;
@@ -289,6 +293,11 @@ export default function App() {
         : `${collIds.length} collections`;
   const scrollRef = useRef<HTMLDivElement>(null);
   const mdReaderRef = useRef<HTMLDivElement>(null);
+  // Progressive text rendering (M1b): how many slices of the current md
+  // source are mounted, and a tick that re-arms the cite-scroll effect once
+  // the slice containing the citation has rendered.
+  const [mdSlices, setMdSlices] = useState(1);
+  const [mdTick, setMdTick] = useState(0);
   const logRef = useRef<HTMLPreElement>(null);
   const thinkRef = useRef<HTMLDivElement>(null);
 
@@ -341,7 +350,67 @@ export default function App() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reader?.text, mdTick]);
+
+  // Slice boundaries for progressive rendering: files over 2 MiB render in
+  // ~512 KiB paragraph-aligned steps per idle callback so the WKWebView main
+  // thread never builds a many-MiB DOM synchronously.
+  const MD_PROGRESSIVE_MIN = 2 * 1024 * 1024;
+  const MD_SLICE = 512 * 1024;
+  const mdSliceOffsets = useMemo(() => {
+    const text = reader?.text ?? "";
+    if (text.length <= MD_PROGRESSIVE_MIN) return null;
+    const offs: number[] = [0];
+    let at = MD_SLICE;
+    while (at < text.length) {
+      const nl = text.indexOf("\n\n", at);
+      const cut = nl === -1 ? text.length : nl;
+      offs.push(cut);
+      at = cut + MD_SLICE;
+    }
+    offs.push(text.length);
+    return offs;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reader?.text]);
+  useEffect(() => {
+    // Reset slice progress when a new text source loads; fast-forward past
+    // the slice containing the cited passage so the cite-jump can land.
+    if (!mdSliceOffsets) {
+      setMdSlices(1);
+      return;
+    }
+    let initial = 1;
+    const cite = reader?.citeText;
+    if (cite && reader?.text) {
+      const probe = cite.slice(0, 40).trim();
+      const at = probe ? reader.text.indexOf(probe) : -1;
+      if (at >= 0) {
+        while (initial < mdSliceOffsets.length - 1 && mdSliceOffsets[initial] < at) initial++;
+      }
+    }
+    setMdSlices(initial);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mdSliceOffsets]);
+  useEffect(() => {
+    if (!mdSliceOffsets || mdSlices >= mdSliceOffsets.length - 1) {
+      setMdTick((t) => t + 1);
+      return;
+    }
+    // requestIdleCallback where available; WebKitGTK builds may lack it.
+    const ric: (cb: () => void) => number =
+      "requestIdleCallback" in window
+        ? (cb) => (window as unknown as { requestIdleCallback: (cb: () => void) => number }).requestIdleCallback(cb)
+        : (cb) => window.setTimeout(cb, 0);
+    const id = ric(() => setMdSlices((n) => n + 1));
+    return () => {
+      if ("cancelIdleCallback" in window) {
+        (window as unknown as { cancelIdleCallback: (id: number) => void }).cancelIdleCallback(id);
+      } else {
+        clearTimeout(id);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mdSliceOffsets, mdSlices]);
 
   // Reader view (full screen): leave it when the reader closes; Esc exits.
   // WKWebView only delivers Escape when a focusable element has focus, so on
@@ -514,8 +583,22 @@ export default function App() {
         setIdxCount((c) => ({ ...c, done: ev.n, total: ev.total }));
       } else if (ev.kind === "finished") {
         const s = ev.stats;
+        // Per-format legibility for the first post-upgrade re-scope run:
+        // "indexed 12 md, 3 txt · skipped 480 pdf (up-to-date)".
+        const fmt = Object.entries(s.by_format ?? {});
+        const indexedBits = fmt.filter(([, v]) => v[0] > 0).map(([k, v]) => `${v[0]} ${k}`);
+        const skippedBits = fmt.filter(([, v]) => v[1] > 0).map(([k, v]) => `${v[1]} ${k}`);
+        const detail =
+          indexedBits.length || skippedBits.length
+            ? ` (${[
+                indexedBits.length ? `indexed ${indexedBits.join(", ")}` : "",
+                skippedBits.length ? `skipped ${skippedBits.join(", ")}` : "",
+              ]
+                .filter(Boolean)
+                .join(" · ")})`
+            : "";
         setIndexNote(
-          `Done — ${s.books_indexed} indexed, ${s.books_unchanged} unchanged, ${s.books_skipped + s.books_failed} skipped, ${s.chunks_written} chunks written.`
+          `Done — ${s.books_indexed} indexed, ${s.books_unchanged} unchanged, ${s.books_skipped + s.books_failed} skipped, ${s.chunks_written} chunks written.${detail}`
         );
       }
     });
@@ -957,8 +1040,15 @@ export default function App() {
     }
     if (kind === "md") {
       try {
-        const text = await invoke<string>("read_source_text", { path: s.source_path });
-        setReader((r) => (r && r.path === s.source_path ? { ...r, text } : r));
+        const st = await invoke<{ text: string; truncated: boolean; total_bytes: number }>(
+          "read_source_text",
+          { path: s.source_path }
+        );
+        setReader((r) =>
+          r && r.path === s.source_path
+            ? { ...r, text: st.text, truncated: st.truncated, totalBytes: st.total_bytes }
+            : r
+        );
       } catch (e) {
         setReader((r) => (r && r.path === s.source_path ? { ...r, error: String(e) } : r));
       }
@@ -966,7 +1056,7 @@ export default function App() {
   }
 
   async function pickFolder(): Promise<string | null> {
-    const dir = await open({ directory: true, multiple: false, title: "Choose a folder of PDFs" });
+    const dir = await open({ directory: true, multiple: false, title: "Choose a folder of books & documents" });
     return typeof dir === "string" ? dir : null;
   }
 
@@ -1240,10 +1330,15 @@ export default function App() {
 
   // Block-level: paragraphs (blank-line separated) and bullet / numbered lists.
   function renderRich(text: string, sources: Src[]) {
-    type Block = { type: "p"; text: string } | { type: "ul" | "ol"; items: string[] };
+    type Block =
+      | { type: "p"; text: string }
+      | { type: "ul" | "ol"; items: string[] }
+      | { type: "h"; level: number; text: string }
+      | { type: "code"; text: string };
     const blocks: Block[] = [];
     let para: string[] = [];
     let list: { type: "ul" | "ol"; items: string[] } | null = null;
+    let code: string[] | null = null;
     const flushPara = () => {
       if (para.length) blocks.push({ type: "p", text: para.join(" ") });
       para = [];
@@ -1254,9 +1349,30 @@ export default function App() {
     };
     for (const raw of text.split("\n")) {
       const line = raw.trimEnd();
+      // Fenced code: verbatim until the closing fence (monospace, no highlight).
+      if (code !== null) {
+        if (line.trim().startsWith("```")) {
+          blocks.push({ type: "code", text: code.join("\n") });
+          code = null;
+        } else {
+          code.push(raw);
+        }
+        continue;
+      }
+      if (line.trim().startsWith("```")) {
+        flushPara();
+        flushList();
+        code = [];
+        continue;
+      }
+      const heading = line.match(/^\s*(#{1,4})\s+(.*)$/);
       const bullet = line.match(/^\s*[-*]\s+(.*)$/);
       const numbered = line.match(/^\s*\d+\.\s+(.*)$/);
-      if (bullet) {
+      if (heading) {
+        flushPara();
+        flushList();
+        blocks.push({ type: "h", level: heading[1].length, text: heading[2] });
+      } else if (bullet) {
         flushPara();
         if (!list || list.type !== "ul") {
           flushList();
@@ -1278,10 +1394,21 @@ export default function App() {
         para.push(line);
       }
     }
+    if (code !== null) blocks.push({ type: "code", text: code.join("\n") });
     flushPara();
     flushList();
 
     return blocks.map((b, i) => {
+      if (b.type === "h") {
+        const H = (["h1", "h2", "h3", "h4"] as const)[b.level - 1];
+        return <H key={i}>{renderInline(b.text, sources)}</H>;
+      }
+      if (b.type === "code")
+        return (
+          <pre key={i} className="rich-code">
+            <code>{b.text}</code>
+          </pre>
+        );
       if (b.type === "p") return <p key={i}>{renderInline(b.text, sources)}</p>;
       const items = b.items.map((it, j) => <li key={j}>{renderInline(it, sources)}</li>);
       return b.type === "ul" ? <ul key={i}>{items}</ul> : <ol key={i}>{items}</ol>;
@@ -2697,7 +2824,28 @@ export default function App() {
                   </button>
                 </div>
               ) : reader.text ? (
-                renderRich(reader.text, [])
+                <>
+                  {reader.truncated && (
+                    <div className="trunc-banner">
+                      Showing the first 8 MB of{" "}
+                      {((reader.totalBytes ?? 0) / (1024 * 1024)).toFixed(1)} MB.{" "}
+                      <button
+                        className="ghost"
+                        onClick={() =>
+                          invoke("open_in_default_app", { path: reader.path }).catch(console.error)
+                        }
+                      >
+                        Open the full file in your default app
+                      </button>
+                    </div>
+                  )}
+                  {mdSliceOffsets
+                    ? renderRich(reader.text.slice(0, mdSliceOffsets[mdSlices] ?? reader.text.length), [])
+                    : renderRich(reader.text, [])}
+                  {mdSliceOffsets && mdSlices < mdSliceOffsets.length - 1 && (
+                    <div className="muted" style={{ padding: 8 }}>rendering…</div>
+                  )}
+                </>
               ) : (
                 <div className="muted" style={{ padding: 16 }}>Loading…</div>
               )}

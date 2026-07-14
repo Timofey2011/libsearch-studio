@@ -1505,6 +1505,24 @@ button.mini:hover:not(:disabled) {
   line-height: 1.6;
 }
 .reader-md h1, .reader-md h2, .reader-md h3 { margin: 14px 0 6px; }
+.rich-code {
+  background: color-mix(in srgb, var(--muted) 12%, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.trunc-banner {
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
 .cite-flash {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
   border-radius: 4px;

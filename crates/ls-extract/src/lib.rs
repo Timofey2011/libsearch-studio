@@ -12,6 +12,9 @@ use std::sync::OnceLock;
 use ls_core::{Block, BookDoc, Format};
 use regex::Regex;
 
+pub mod text;
+pub use text::extract_text_family;
+
 /// Below this many characters of extracted text, treat the book as empty
 /// (scanned/image-only PDF) — the caller logs and skips.
 pub const MIN_BOOK_CHARS: usize = 200;
@@ -20,6 +23,10 @@ pub const MIN_BOOK_CHARS: usize = 200;
 pub enum ExtractError {
     #[error("pdf: {0}")]
     Pdf(#[from] lopdf::Error),
+    #[error("read: {0}")]
+    Io(String),
+    #[error("parse: {0}")]
+    Parse(String),
     #[error("unsupported format for {0}")]
     Unsupported(String),
 }
@@ -100,6 +107,9 @@ pub fn extract(path: &Path) -> Result<BookDoc, ExtractError> {
                 Ok(doc)
             }
         }
+        // Text family (ROADMAP-3 M1): heading-aware sections, section floor,
+        // H1-H2 depth cap — see text.rs. MIN_BOOK_CHARS applied inside.
+        Some(Format::Md | Format::Txt | Format::Html) => text::extract_text_family(path),
         _ => Err(ExtractError::Unsupported(
             path.to_string_lossy().to_string(),
         )),

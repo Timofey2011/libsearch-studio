@@ -617,7 +617,7 @@ async fn fast_index_collection(
         }
     };
 
-    let (to_embed, preskipped, silenced, unreadable, remaps) = {
+    let (to_embed, preskipped, silenced, unreadable, remaps, preskip_paths) = {
         let db = state.db()?;
         let _ = db.backfill_source_paths(&coll.id, &paths_by_id);
         let _ = db.gc_skips(&coll.id, &coll.source_paths);
@@ -665,17 +665,36 @@ async fn fast_index_collection(
             .iter()
             .filter(|(_, r)| *r == ls_app::SkipReason::Silenced)
             .count();
+        let preskip_paths: Vec<String> = plan.preskips.iter().map(|(p, _)| p.clone()).collect();
         (
             plan.to_embed,
             plan.preskips.len() - unreadable.len() - silenced,
             silenced,
             unreadable,
             plan.remaps,
+            preskip_paths,
         )
     };
     // Apply any path re-points now that the DB handle is dropped.
     for m in &remaps {
         store.remap_book(&m.old_id, &m.new_id, &m.path).await.ok();
+    }
+    let mut by_format: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    let count_fmt = move |map: &mut std::collections::BTreeMap<String, (usize, usize)>,
+                          path: &str,
+                          indexed: bool| {
+        let e = map
+            .entry(ls_core::ext_of(path).unwrap_or("other").to_string())
+            .or_default();
+        if indexed {
+            e.0 += 1
+        } else {
+            e.1 += 1
+        }
+    };
+    for p in &preskip_paths {
+        count_fmt(&mut by_format, p, false);
     }
     // Unreadable files get an explicit once-per-run event, never silence.
     for p in &unreadable {
@@ -686,12 +705,21 @@ async fn fast_index_collection(
     }
 
     if to_embed.is_empty() {
+        let mut by_format: std::collections::BTreeMap<String, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for p in &preskip_paths {
+            let e = by_format
+                .entry(ls_core::ext_of(p).unwrap_or("other").to_string())
+                .or_default();
+            e.1 += 1;
+        }
         let stats = IndexStats {
             books_indexed: 0,
             books_unchanged: preskipped,
             books_skipped: silenced,
             books_failed: unreadable.len(),
             chunks_written: 0,
+            by_format,
         };
         let _ = window.emit(
             "index-progress",
@@ -776,6 +804,7 @@ async fn fast_index_collection(
                     match oc.status.as_str() {
                         "indexed" => {
                             indexed += 1;
+                            count_fmt(&mut by_format, &it.path, true);
                             let p = Path::new(&it.path);
                             let _ = db.set_book_state(
                                 &coll.id,
@@ -788,6 +817,7 @@ async fn fast_index_collection(
                         }
                         "skipped" => {
                             skipped += 1;
+                            count_fmt(&mut by_format, &it.path, false);
                             let _ = db.upsert_skip(
                                 &coll.id,
                                 &it.path,
@@ -817,6 +847,7 @@ async fn fast_index_collection(
         books_skipped: skipped + silenced,
         books_failed: unreadable.len() + failed,
         chunks_written,
+        by_format,
     };
     let _ = window.emit(
         "index-progress",
@@ -1062,19 +1093,54 @@ async fn get_note(state: State<'_, AppState>, scope: String) -> Result<String, S
         .unwrap_or_default())
 }
 
-/// Read a text source (Markdown) for in-app rendering. Size-capped so a
-/// mis-tagged huge file can't balloon the webview.
+#[derive(serde::Serialize)]
+struct SourceText {
+    text: String,
+    /// True when the file exceeded the cap and only the first window is
+    /// returned (the frontend shows a truncation banner).
+    truncated: bool,
+    total_bytes: u64,
+}
+
+/// Read a text source for in-app rendering. Decodes non-UTF-8 (RU cp1251 txt)
+/// via charset detection; capped at 8 MiB — beyond that the FIRST 8 MiB is
+/// returned with `truncated: true`, cut on a char boundary so multi-byte text
+/// at the edge can't produce a mangled character. Runs under spawn_blocking:
+/// an 8 MiB read+decode must not stall the async runtime.
 #[tauri::command]
-async fn read_source_text(path: String) -> Result<String, String> {
-    const CAP: u64 = 4 * 1024 * 1024;
-    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-    if meta.len() > CAP {
-        return Err(format!(
-            "file is {:.1} MB — too large to preview in-app",
-            meta.len() as f64 / (1024.0 * 1024.0)
-        ));
-    }
-    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+async fn read_source_text(path: String) -> Result<SourceText, String> {
+    tokio::task::spawn_blocking(move || {
+        const CAP: usize = 8 * 1024 * 1024;
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let total_bytes = bytes.len() as u64;
+        let decoded: String = if let Ok(s) = String::from_utf8(bytes.clone()) {
+            s
+        } else {
+            let mut det = chardetng::EncodingDetector::new();
+            det.feed(&bytes, true);
+            let (decoded, _, _) = det.guess(None, true).decode(&bytes);
+            decoded.into_owned()
+        };
+        if decoded.len() <= CAP {
+            return Ok(SourceText {
+                text: decoded,
+                truncated: false,
+                total_bytes,
+            });
+        }
+        // Floor the cut to a char boundary.
+        let mut cut = CAP;
+        while cut > 0 && !decoded.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        Ok(SourceText {
+            text: decoded[..cut].to_string(),
+            truncated: true,
+            total_bytes,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Open a source file in the OS default application (e.g. Books/Calibre for
