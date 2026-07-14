@@ -24,3 +24,4 @@ src-tauri/gen/
 # Local Claude settings
 .claude/settings.local.json
 bench/
+__pycache__/

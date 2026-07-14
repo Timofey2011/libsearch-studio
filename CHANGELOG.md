@@ -2,6 +2,31 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.9.0 — 2026-07-10
+
+Bump manifests 0.8.0 → 0.9.0. "Index your notes": the first release of the
+ROADMAP-3 format expansion.
+
+- **New indexable formats**: Markdown (.md), plain text (.txt — including
+  Russian windows-1251), reStructuredText, AsciiDoc, Org, LaTeX, Jupyter
+  notebooks (.ipynb), and saved HTML pages. Both indexing engines (CPU and
+  Fast/GPU) handle all of them, with headings becoming chapters (feeding
+  Titles/Index) — capped at the top two levels, with small sections merged,
+  so heading-dense notes don't flood the index with fragments.
+- The indexing summary now reports per-format counts ("indexed 12 md, 3 txt
+  · skipped 480 pdf"), so the first re-scope run over existing folders is
+  legible.
+- Text preview: reads up to 8 MB (was 4), decodes non-UTF-8 files, renders
+  big files progressively without freezing, and shows headings and code
+  blocks properly. Files beyond 8 MB show a truncation banner with an
+  open-externally button.
+- Under the hood (shipped dark in this cycle, active now): a hardened
+  dedup/identity layer that guarantees existing libraries never re-embed
+  when new formats appear — verified against the real 815-book library
+  (231 legacy Markdown books all skip; only genuinely new files index).
+  Skips are recorded per-pipeline and retried automatically when the file,
+  installed tools, or the GPU device change.
+
 ## v0.8.0 — 2026-07-09
 
 Bump manifests 0.7.3 → 0.8.0.
