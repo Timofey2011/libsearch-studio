@@ -20,6 +20,8 @@ pub struct Source {
     pub source_path: String,
     #[serde(default)]
     pub page: Option<u32>,
+    #[serde(default)]
+    pub chapter: Option<String>,
 }
 
 /// Everything needed to render an artifact from one assistant turn.
@@ -171,6 +173,7 @@ mod tests {
                 citation: "Practical Microservices — Ethan Garofolo · Ch. Idempotent, p.75".into(),
                 source_path: "/books/practical-microservices.pdf".into(),
                 page: Some(75),
+                chapter: Some("Idempotent".into()),
             }],
         }
     }

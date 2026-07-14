@@ -843,6 +843,7 @@ mod tests {
                 citation: "X · p.5".into(),
                 source_path: "/b/x.pdf".into(),
                 page: Some(5),
+                chapter: None,
                 text: "cited".into(),
             }],
             in_tokens: 12,
@@ -856,6 +857,20 @@ mod tests {
         assert_eq!(msgs[1].citations.len(), 1);
         assert_eq!(msgs[1].citations[0].page, Some(5));
         assert_eq!((msgs[1].in_tokens, msgs[1].out_tokens), (12, 34));
+    }
+
+    #[test]
+    fn pre_upgrade_citations_load_without_chapter() {
+        // A messages-table row persisted BEFORE the chapter field existed
+        // must deserialize with chapter: None and round-trip cleanly (§5.4).
+        let old_json =
+            r#"[{"rank":1,"citation":"X · p.5","source_path":"/b/x.pdf","page":5,"text":"cited"}]"#;
+        let cites: Vec<Citation> = serde_json::from_str(old_json).unwrap();
+        assert_eq!(cites[0].chapter, None);
+        assert_eq!(cites[0].page, Some(5));
+        let again = serde_json::to_string(&cites).unwrap();
+        let back: Vec<Citation> = serde_json::from_str(&again).unwrap();
+        assert_eq!(back, cites);
     }
 
     #[test]
