@@ -55,6 +55,17 @@ async fn main() -> Result<()> {
             let coll = args.next().unwrap_or_else(|| "default".into());
             run_backfill_state(&app_dir, &coll).await
         }
+        Some("plan-soak") => {
+            // ROADMAP-3 §2.1.5 release-gate step: run the shared dedup
+            // pre-filter over a REAL collection and report what it would do.
+            // Read-only apart from the source_path column backfill.
+            let app_dir = args.next().unwrap_or_default();
+            if app_dir.is_empty() {
+                bail!("usage: ls-cli plan-soak <app-data-dir> [collection_id]");
+            }
+            let coll = args.next().unwrap_or_else(|| "default".into());
+            run_plan_soak(&app_dir, &coll).await
+        }
         Some("gen-exts") => {
             // Regenerate the frontend's extension map from the ls-core
             // canonical list; a freshness test keeps the copy honest.
@@ -156,6 +167,82 @@ async fn run_import(parquet: &str) -> Result<()> {
         "imported {n} chunks; index now has {} rows",
         store.count().await?
     );
+    Ok(())
+}
+
+/// The M0 dark-soak / release-gate check (ROADMAP-3 §12): run the shared
+/// pre-filter over the live library and report the plan. On a healthy legacy
+/// library EVERY book must land in "unchanged" — zero to_embed, zero remaps.
+async fn run_plan_soak(app_dir: &str, collection_id: &str) -> Result<()> {
+    let app_dir = PathBuf::from(app_dir);
+    let db = ls_app::Db::open(app_dir.join("app.db")).context("open app.db")?;
+    let coll = db
+        .list_collections()
+        .context("list collections")?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .with_context(|| format!("collection {collection_id} not found"))?;
+    let store = Store::open(&coll.db_path, "chunks")
+        .await
+        .context("open index")?;
+    let files = ls_app::discover_books(&coll.source_paths);
+    let indexed = store.indexed_book_ids().await.context("scan ids")?;
+    let paths_by_id: std::collections::HashMap<String, String> = store
+        .book_paths()
+        .await
+        .context("scan paths")?
+        .into_iter()
+        .collect();
+    let filled = db
+        .backfill_source_paths(&coll.id, &paths_by_id)
+        .context("backfill source_path")?;
+    let caps = ls_app::service::cpu_caps_ver();
+    let candidates: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    let ctx = ls_app::PlanCtx {
+        collection_id: &coll.id,
+        db: &db,
+        indexed_ids: &indexed,
+        paths_by_id: &paths_by_id,
+        pipeline: "cpu",
+        caps_ver: &caps,
+        fp_fn: &|p| ls_app::file_fingerprint(p),
+        csig_fn: &|p| ls_app::content_signature(p),
+    };
+    let plan = ls_app::plan_index_run(&candidates, &ctx).context("plan")?;
+    let count = |r: &ls_app::SkipReason| {
+        plan.preskips
+            .iter()
+            .filter(|(_, x)| std::mem::discriminant(x) == std::mem::discriminant(r))
+            .count()
+    };
+    println!("collection '{}' ({} store books)", coll.name, indexed.len());
+    println!("  discovered candidates : {}", candidates.len());
+    println!("  source_path backfilled: {filled}");
+    println!(
+        "  unchanged (skip)      : {}",
+        count(&ls_app::SkipReason::Unchanged)
+    );
+    println!(
+        "  silenced skips        : {}",
+        count(&ls_app::SkipReason::Silenced)
+    );
+    println!(
+        "  duplicates in run     : {}",
+        count(&ls_app::SkipReason::DuplicateInRun)
+    );
+    println!(
+        "  unreadable            : {}",
+        count(&ls_app::SkipReason::Unreadable)
+    );
+    println!("  state refreshes       : {}", plan.state_refreshes.len());
+    println!("  remaps (moved files)  : {}", plan.remaps.len());
+    println!("  TO EMBED              : {}", plan.to_embed.len());
+    for it in plan.to_embed.iter().take(10) {
+        println!("    would embed: {}", it.path);
+    }
+    for m in plan.remaps.iter().take(10) {
+        println!("    would remap: {} -> {} ({})", m.old_id, m.new_id, m.path);
+    }
     Ok(())
 }
 
