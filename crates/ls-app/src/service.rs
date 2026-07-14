@@ -43,6 +43,23 @@ pub struct IndexStats {
     pub books_skipped: usize,
     pub books_failed: usize,
     pub chunks_written: usize,
+    /// Per-extension `(indexed, skipped-or-failed)` counts — what makes the
+    /// first post-upgrade re-scope run legible ("indexed 12 md, 3 txt ·
+    /// skipped 480 pdf"). Additive; absent entries mean zero.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub by_format: std::collections::BTreeMap<String, (usize, usize)>,
+}
+
+impl IndexStats {
+    pub fn count_format(&mut self, path: &str, indexed: bool) {
+        let ext = ls_core::ext_of(path).unwrap_or("other").to_string();
+        let e = self.by_format.entry(ext).or_default();
+        if indexed {
+            e.0 += 1;
+        } else {
+            e.1 += 1;
+        }
+    }
 }
 
 /// Progress events emitted during indexing (forwarded to the UI as Tauri events).
@@ -376,6 +393,7 @@ impl Service {
                 }
                 _ => {
                     stats.books_unchanged += 1;
+                    stats.count_format(path, false);
                     on_event(IndexEvent::Unchanged {
                         n,
                         total,
@@ -417,6 +435,7 @@ impl Service {
                         &e.to_string(),
                         &caps_ver,
                     )?;
+                    stats.count_format(path, false);
                     on_event(IndexEvent::Skipped {
                         n,
                         total,
@@ -440,6 +459,7 @@ impl Service {
                     "no extractable text",
                     &caps_ver,
                 )?;
+                stats.count_format(path, false);
                 on_event(IndexEvent::Skipped {
                     n,
                     total,
@@ -484,6 +504,7 @@ impl Service {
             wrote = true;
             self.db
                 .set_book_state(&collection.id, &doc.book_id, fp, csig, path)?;
+            stats.count_format(path, true);
             // Success erases past skip records for this path — both pipelines.
             self.db.erase_skips(&collection.id, path)?;
             on_event(IndexEvent::Indexed {

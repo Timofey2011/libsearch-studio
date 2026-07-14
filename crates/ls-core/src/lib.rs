@@ -67,9 +67,11 @@ pub const KNOWN_EXTS: &[&str] = &[
     "xps",
 ];
 
-/// Extensions ingest actually accepts TODAY. M0 ships with the pdf-only status
-/// quo (dark soak of the dedup guards); milestones flip families on here.
-pub const INGEST_EXTS: &[&str] = &["pdf"];
+/// Extensions ingest actually accepts TODAY. M1 (v0.9.0) turned on the plain
+/// text family; ebooks (M2) and office (M4) flip here later.
+pub const INGEST_EXTS: &[&str] = &[
+    "pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm",
+];
 
 /// The one extension-derivation rule (ROADMAP-3 invariant #8): lowercase the
 /// filename and LONGEST-match against `KNOWN_EXTS`, so `x.fb2.zip` is

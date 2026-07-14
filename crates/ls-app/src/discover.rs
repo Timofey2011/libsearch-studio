@@ -49,13 +49,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_pdfs_recursively_and_dedups() {
+    fn discovers_supported_files_recursively_and_dedups() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("a.pdf"), b"x").unwrap();
-        std::fs::write(root.join("notes.txt"), b"x").unwrap();
+        std::fs::write(root.join("notes.txt"), b"x").unwrap(); // M1: txt is ingested
+        std::fs::write(root.join("archive.tar.gz"), b"x").unwrap(); // unknown stays out
+        std::fs::write(root.join("book.epub"), b"x").unwrap(); // M2 format: not yet
         std::fs::create_dir(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/b.PDF"), b"x").unwrap();
+        std::fs::write(root.join("sub/l.MD"), b"x").unwrap();
 
         // Pass the dir AND one of its files explicitly — result must dedup.
         let paths = vec![
@@ -63,10 +66,13 @@ mod tests {
             root.join("a.pdf").to_string_lossy().into_owned(),
         ];
         let found = discover_books(&paths);
-        assert_eq!(found.len(), 2, "got {found:?}");
+        assert_eq!(found.len(), 4, "got {found:?}");
         assert!(found.iter().any(|p| p.ends_with("a.pdf")));
         assert!(found.iter().any(|p| p.ends_with("sub/b.PDF")));
-        assert!(!found.iter().any(|p| p.ends_with("notes.txt")));
+        assert!(found.iter().any(|p| p.ends_with("notes.txt")));
+        assert!(found.iter().any(|p| p.ends_with("sub/l.MD")));
+        assert!(!found.iter().any(|p| p.ends_with("archive.tar.gz")));
+        assert!(!found.iter().any(|p| p.ends_with("book.epub")));
     }
 
     #[test]

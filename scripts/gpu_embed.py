@@ -31,17 +31,17 @@ import pathlib
 import sys
 import time
 
-SCRIPT_VERSION = 2
+SCRIPT_VERSION = 3
 
 # The extension universe this script handles / deliberately skips. The Rust
 # lockstep test parses these literals out of the embedded script and asserts
 # they cover ls-core INGEST_EXTS exactly — keep them as plain literals.
-HANDLED_EXTS = {"pdf"}
+HANDLED_EXTS = {"pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm"}
 DIRECTED_SKIPS = {}  # ext -> user-facing reason; never reaches fitz.open()
 
 # ext -> format family stamped into the parquet `format` column. Mirrors
 # ls-core Format::from_ext for every handled ext (lockstep-tested).
-FAMILY = {"pdf": "pdf"}
+FAMILY = {"pdf": "pdf", "md": "md", "markdown": "md", "ipynb": "md", "txt": "txt", "text": "txt", "rst": "txt", "adoc": "txt", "org": "txt", "tex": "txt", "html": "html", "htm": "html"}
 
 # Python deps probed by --caps (importlib.util.find_spec — no import execution,
 # a broken package cannot crash the probe). Installing one changes the caps
@@ -91,6 +91,183 @@ def write_sidecar(out_path: pathlib.Path, outcomes: list) -> None:
     tmp = sidecar.with_name(sidecar.name + ".tmp")
     tmp.write_text(json.dumps({"v": 1, "outcomes": outcomes}))
     tmp.replace(sidecar)
+
+
+# ---- text-family extraction (M1) — mirrors crates/ls-extract/src/text.rs ----
+
+SECTION_FLOOR_CHARS = 480  # sections below this merge into their predecessor
+
+
+def decode_bytes(b: bytes) -> str:
+    """utf-8 strict -> cp1251 (RU txt) -> latin-1, mirroring the Rust decode."""
+    for enc in ("utf-8", "cp1251"):
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return b.decode("latin-1", errors="replace")
+
+
+def scan_md_sections(text):
+    """[(heading|None, body)]: `# `/`## ` open sections; deeper stay in-body."""
+    sections = [[None, []]]
+    for line in text.splitlines():
+        t = line.lstrip()
+        n = len(t) - len(t.lstrip("#"))
+        if 1 <= n <= 2 and t[n:n + 1] == " " and t[n + 1:].strip():
+            sections.append([t[n + 1:].strip(), []])
+        else:
+            sections[-1][1].append(line)
+    return [(h, "\n".join(b)) for h, b in sections]
+
+
+def scan_prefix_sections(text, l1, l2):
+    sections = [[None, []]]
+    for line in text.splitlines():
+        h = None
+        if line.startswith(l2):
+            h = line[len(l2):]
+        elif line.startswith(l1):
+            h = line[len(l1):]
+        if h is not None and h.strip():
+            sections.append([h.strip(), []])
+        else:
+            sections[-1][1].append(line)
+    return [(h, "\n".join(b)) for h, b in sections]
+
+
+def scan_rst_sections(text):
+    lines = text.splitlines()
+    sections = [[None, []]]
+    i = 0
+    while i < len(lines):
+        title = lines[i].strip()
+        under = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if (title and len(under) >= 3 and len(under) + 1 >= len(title)
+                and (set(under) == {"="} or set(under) == {"-"})):
+            sections.append([title, []])
+            i += 2
+        else:
+            sections[-1][1].append(lines[i])
+            i += 1
+    return [(h, "\n".join(b)) for h, b in sections]
+
+
+def scan_tex_sections(text):
+    sections = [[None, []]]
+    for raw in text.splitlines():
+        line = raw
+        for i, c in enumerate(raw):
+            if c == "%" and (i == 0 or raw[i - 1] != "\\"):
+                line = raw[:i]
+                break
+        t = line.lstrip()
+        h = None
+        for cmd in ("\\chapter{", "\\section{"):
+            if t.startswith(cmd) and "}" in t[len(cmd):]:
+                h = t[len(cmd):t.index("}", len(cmd))].strip()
+                break
+        if h:
+            sections.append([h, []])
+        else:
+            sections[-1][1].append(line)
+    return [(h, "\n".join(b)) for h, b in sections]
+
+
+def scan_ipynb_sections(raw):
+    nb = json.loads(raw)
+    md = []
+    for cell in nb.get("cells", []):
+        src = cell.get("source", "")
+        if isinstance(src, list):
+            src = "".join(src)
+        if not src.strip():
+            continue
+        if cell.get("cell_type") == "markdown":
+            md.append(src)
+        elif cell.get("cell_type") == "code":
+            md.append("```\n" + src + "\n```")
+    return scan_md_sections("\n".join(md))
+
+
+def scan_html_sections(raw):
+    from html.parser import HTMLParser
+
+    SKIP = {"script", "style", "nav", "head", "noscript", "svg", "iframe"}
+    BLOCK = {"p", "div", "li", "tr", "br", "h3", "h4", "h5", "h6", "section",
+             "article", "blockquote", "pre"}
+
+    class T(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.sections = [[None, []]]
+            self.skip_depth = 0
+            self.heading = None  # collecting h1/h2 text
+
+        def handle_starttag(self, tag, attrs):
+            if tag in SKIP:
+                self.skip_depth += 1
+            elif tag in ("h1", "h2") and self.skip_depth == 0:
+                self.heading = []
+
+        def handle_endtag(self, tag):
+            if tag in SKIP and self.skip_depth > 0:
+                self.skip_depth -= 1
+            elif tag in ("h1", "h2") and self.heading is not None:
+                h = "".join(self.heading).strip()
+                if h:
+                    self.sections.append([h, []])
+                self.heading = None
+            elif tag in BLOCK and self.skip_depth == 0:
+                self.sections[-1][1].append("\n")
+
+        def handle_data(self, data):
+            if self.skip_depth:
+                return
+            if self.heading is not None:
+                self.heading.append(data)
+            else:
+                self.sections[-1][1].append(data)
+
+    t = T()
+    t.feed(raw)
+    return [(h, "".join(b)) for h, b in t.sections]
+
+
+def apply_section_floor(sections):
+    out = []
+    for h, body in sections:
+        if out and len(body.strip()) < SECTION_FLOOR_CHARS:
+            ph, pb = out[-1]
+            merged = pb + ("\n" + h + "\n" if h else "\n") + body
+            out[-1] = (ph, merged)
+        else:
+            out.append((h, body))
+    return out
+
+
+def extract_text_sections(path, ext):
+    """[(heading|None, body)] for any text-family file, floor applied."""
+    raw = decode_bytes(path.read_bytes())
+    if ext in ("md", "markdown"):
+        sections = scan_md_sections(raw)
+    elif ext in ("txt", "text"):
+        sections = [(None, raw)]
+    elif ext == "rst":
+        sections = scan_rst_sections(raw)
+    elif ext == "adoc":
+        sections = scan_prefix_sections(raw, "= ", "== ")
+    elif ext == "org":
+        sections = scan_prefix_sections(raw, "* ", "** ")
+    elif ext == "tex":
+        sections = scan_tex_sections(raw)
+    elif ext == "ipynb":
+        sections = scan_ipynb_sections(raw)
+    elif ext in ("html", "htm"):
+        sections = scan_html_sections(raw)
+    else:
+        raise ValueError(f"not a text-family ext: {ext}")
+    return apply_section_floor(sections)
 
 
 def build_full_text(pages):
@@ -245,19 +422,31 @@ def main() -> None:
                 continue
             book_id = hashlib.sha1(str(path.resolve()).encode()).hexdigest()[:16]
             try:
-                full, page_offsets = build_full_text(extract_pages(path))
-                pieces = chunk_book(full, page_offsets, tokenizer)
+                if ext == "pdf":
+                    full, page_offsets = build_full_text(extract_pages(path))
+                    # (loc_start, loc_end, page, chapter, text)
+                    pieces = [(ls, le, pg, "") + (t,)
+                              for (ls, le, pg, t) in chunk_book(full, page_offsets, tokenizer)]
+                else:
+                    # Text family: window each heading section separately so
+                    # chunks never cross sections; chapter feeds the Index tab.
+                    pieces = []
+                    base = 0
+                    for heading, bodytext in extract_text_sections(path, ext):
+                        for (ls, le, _pg, t) in chunk_book(bodytext, [], tokenizer):
+                            pieces.append((base + ls, base + le, -1, heading or "", t))
+                        base += len(bodytext) + 1
             except Exception as e:  # noqa: BLE001
                 outcomes.append({"i": idx, "status": "error", "reason": str(e)})
                 print(f"[{i}/{n}] skip (error) {p}: {e}", file=sys.stderr)
                 continue
-            if not pieces:
+            if not pieces or sum(len(t) for (_a, _b, _c, _d, t) in pieces) < 200:
                 outcomes.append({"i": idx, "status": "skipped",
                                  "reason": "no extractable text"})
                 print(f"[{i}/{n}] skip (no text) {p}", file=sys.stderr)
                 continue
 
-            texts = [t for (_ls, _le, _pg, t) in pieces]
+            texts = [t for (_ls, _le, _pg, _ch, t) in pieces]
             t_book = time.perf_counter()
             vectors = model.encode(
                 texts, batch_size=args.batch, normalize_embeddings=True,
@@ -266,7 +455,7 @@ def main() -> None:
             dt = time.perf_counter() - t_book
             fam = FAMILY.get(ext, "pdf")
             rows = []
-            for j, ((loc_start, loc_end, page_no, text), vec) in enumerate(zip(pieces, vectors)):
+            for j, ((loc_start, loc_end, page_no, chapter, text), vec) in enumerate(zip(pieces, vectors)):
                 rows.append({
                     "id": f"{book_id}:{j}",
                     "book_id": book_id,
@@ -274,7 +463,7 @@ def main() -> None:
                     "author": "",
                     "source_path": str(path.resolve()),
                     "format": fam,
-                    "chapter": "",
+                    "chapter": chapter,
                     "page": int(page_no),
                     "loc_start": int(loc_start),
                     "loc_end": int(loc_end),
