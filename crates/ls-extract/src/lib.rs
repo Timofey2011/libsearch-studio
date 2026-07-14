@@ -12,7 +12,9 @@ use std::sync::OnceLock;
 use ls_core::{Block, BookDoc, Format};
 use regex::Regex;
 
+pub mod ebook;
 pub mod text;
+pub use ebook::{cpu_directed_skip, extract_ebook};
 pub use text::extract_text_family;
 
 /// Below this many characters of extracted text, treat the book as empty
@@ -110,6 +112,9 @@ pub fn extract(path: &Path) -> Result<BookDoc, ExtractError> {
         // Text family (ROADMAP-3 M1): heading-aware sections, section floor,
         // H1-H2 depth cap — see text.rs. MIN_BOOK_CHARS applied inside.
         Some(Format::Md | Format::Txt | Format::Html) => text::extract_text_family(path),
+        // Ebook family (ROADMAP-3 M2): epub TOC chapters, fb2 sections+author,
+        // mobi best-effort with a GPU-fallback skip reason. MIN_BOOK_CHARS inside.
+        Some(Format::Epub | Format::Fb2 | Format::Mobi) => ebook::extract_ebook(path),
         _ => Err(ExtractError::Unsupported(
             path.to_string_lossy().to_string(),
         )),

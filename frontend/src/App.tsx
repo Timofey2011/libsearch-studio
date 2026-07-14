@@ -2202,6 +2202,34 @@ export default function App() {
                   >
                     Open
                   </button>
+                  <button
+                    className="mini"
+                    onClick={async () => {
+                      // §4.2: the sanctioned way to chapter-enrich or restamp a
+                      // legacy book — deletes and re-embeds this ONE book.
+                      if (
+                        !window.confirm(
+                          `Re-index "${b.title}"?\n\nThis removes its current chunks; the next Index run re-embeds just this book with the latest extractor (chapters, format).`
+                        )
+                      )
+                        return;
+                      try {
+                        await invoke("reindex_book", {
+                          collectionIds: collIds,
+                          sourcePath: b.source_path,
+                        });
+                        setIndexNote(`"${b.title}" cleared — run Index to re-embed it.`);
+                        // Invalidate the cached catalog so Titles/Index reload.
+                        setCatalogFor("");
+                        setCatalog(null);
+                      } catch (e) {
+                        setIndexNote(`Re-index failed: ${e}`);
+                      }
+                    }}
+                    title="Delete this book's chunks and re-embed it on the next Index run"
+                  >
+                    ↻ Re-index
+                  </button>
                 </div>
               </Fragment>
             );

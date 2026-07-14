@@ -1,7 +1,7 @@
 // GENERATED from ls-core by `cargo run -p ls-cli -- gen-exts`. DO NOT EDIT:
 // a Rust test asserts this file is byte-identical to the generator's output.
 export const KNOWN_EXTS = ["pdf", "epub", "mobi", "azw3", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm", "docx", "rtf", "odt", "doc", "fb2", "fb2.zip", "pages", "webarchive", "djvu", "xps"] as const;
-export const INGEST_EXTS = ["pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm"] as const;
+export const INGEST_EXTS = ["pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm", "epub", "fb2", "fb2.zip", "mobi", "azw3", "xps"] as const;
 /// Extension -> format family (citation shape / reader-kind routing).
 export const EXT_FAMILY: Record<string, string> = {
   "pdf": "pdf",

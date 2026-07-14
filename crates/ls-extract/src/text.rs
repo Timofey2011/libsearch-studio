@@ -23,9 +23,9 @@ use crate::{stable_book_id, ExtractError};
 /// ls-embed and extraction must stay model-free.
 pub const SECTION_FLOOR_CHARS: usize = 480;
 
-struct Section {
-    heading: Option<String>,
-    body: String,
+pub(crate) struct Section {
+    pub(crate) heading: Option<String>,
+    pub(crate) body: String,
 }
 
 /// Read a file and decode it: strict UTF-8 first, then charset detection
@@ -289,7 +289,7 @@ fn scan_html(raw: &str) -> Vec<Section> {
 
 /// Merge sections below the floor into their predecessor: the earlier section
 /// keeps its `chapter` label; the small heading is inlined as body text.
-fn apply_section_floor(sections: Vec<Section>) -> Vec<Section> {
+pub(crate) fn apply_section_floor(sections: Vec<Section>) -> Vec<Section> {
     let mut out: Vec<Section> = Vec::new();
     for s in sections {
         let too_small = s.body.trim().len() < SECTION_FLOOR_CHARS;
