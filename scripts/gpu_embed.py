@@ -31,17 +31,17 @@ import pathlib
 import sys
 import time
 
-SCRIPT_VERSION = 4
+SCRIPT_VERSION = 5
 
 # The extension universe this script handles / deliberately skips. The Rust
 # lockstep test parses these literals out of the embedded script and asserts
 # they cover ls-core INGEST_EXTS exactly — keep them as plain literals.
-HANDLED_EXTS = {"pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm", "epub", "fb2", "fb2.zip", "mobi", "azw3", "xps"}
+HANDLED_EXTS = {"pdf", "md", "markdown", "txt", "text", "rst", "adoc", "org", "tex", "ipynb", "html", "htm", "epub", "fb2", "fb2.zip", "mobi", "azw3", "xps", "docx", "rtf", "odt"}
 DIRECTED_SKIPS = {}  # ext -> user-facing reason; never reaches fitz.open()
 
 # ext -> format family stamped into the parquet `format` column. Mirrors
 # ls-core Format::from_ext for every handled ext (lockstep-tested).
-FAMILY = {"pdf": "pdf", "md": "md", "markdown": "md", "ipynb": "md", "txt": "txt", "text": "txt", "rst": "txt", "adoc": "txt", "org": "txt", "tex": "txt", "html": "html", "htm": "html", "epub": "epub", "fb2": "fb2", "fb2.zip": "fb2", "mobi": "mobi", "azw3": "mobi", "xps": "xps"}
+FAMILY = {"pdf": "pdf", "md": "md", "markdown": "md", "ipynb": "md", "txt": "txt", "text": "txt", "rst": "txt", "adoc": "txt", "org": "txt", "tex": "txt", "html": "html", "htm": "html", "epub": "epub", "fb2": "fb2", "fb2.zip": "fb2", "mobi": "mobi", "azw3": "mobi", "xps": "xps", "docx": "docx", "rtf": "rtf", "odt": "odt"}
 
 # Formats fitz opens natively (fb2.zip is unzipped to a temp .fb2 first).
 FITZ_EXTS = {"pdf", "epub", "fb2", "fb2.zip", "mobi", "azw3", "xps"}
@@ -52,7 +52,7 @@ TOC_CHAPTER_EXTS = {"epub", "fb2", "fb2.zip", "mobi", "azw3", "xps"}
 # a broken package cannot crash the probe). Installing one changes the caps
 # hash, which retries past dependency skips (§2.8).
 CORE_DEPS = ["fitz", "torch", "sentence_transformers", "transformers", "pyarrow"]
-OPTIONAL_DEPS = []  # grows with M4 (docx, striprtf, …)
+OPTIONAL_DEPS = ["docx", "striprtf", "odf"]  # office deps (M4): pip-install to enable
 
 TARGET_TOKENS = 400
 OVERLAP_TOKENS = 80
@@ -275,6 +275,64 @@ def extract_text_sections(path, ext):
     return apply_section_floor(sections)
 
 
+# ---- office-family extraction (M4) — venv-optional python deps --------------
+
+def extract_office_sections(path, ext):
+    """[(heading|None, body)] for docx/rtf/odt. A missing dependency raises
+    _OfficeDepMissing — a runtime skip only Python can discover; it travels
+    via the sidecar and is retried automatically after pip install (§2.8)."""
+    if ext == "docx":
+        try:
+            import docx  # python-docx
+        except ImportError:
+            raise _OfficeDepMissing("docx support: pip install python-docx")
+        d = docx.Document(str(path))
+        sections = [[None, []]]
+        for p in d.paragraphs:
+            text = p.text.strip()
+            if not text:
+                continue
+            style = (p.style.name or "").replace(" ", "").lower() if p.style else ""
+            if style in ("heading1", "heading2"):
+                sections.append([text, []])
+            else:
+                sections[-1][1].append(text)
+        return apply_section_floor([(h, "\n".join(b)) for h, b in sections])
+    if ext == "rtf":
+        try:
+            from striprtf.striprtf import rtf_to_text
+        except ImportError:
+            raise _OfficeDepMissing("rtf support: pip install striprtf")
+        raw = decode_bytes(path.read_bytes())
+        return [(None, rtf_to_text(raw))]
+    if ext == "odt":
+        try:
+            from odf import opendocument, text as odf_text, teletype
+        except ImportError:
+            raise _OfficeDepMissing("odt support: pip install odfpy")
+        d = opendocument.load(str(path))
+        sections = [[None, []]]
+        for el in d.text.childNodes:
+            name = getattr(el, "qname", (None, None))[1]
+            content = teletype.extractText(el).strip() if name in ("h", "p") else ""
+            if not content:
+                continue
+            if name == "h":
+                lvl = int(el.getAttribute("outlinelevel") or 1)
+                if lvl <= 2:
+                    sections.append([content, []])
+                else:
+                    sections[-1][1].append(content)
+            else:
+                sections[-1][1].append(content)
+        return apply_section_floor([(h, "\n".join(b)) for h, b in sections])
+    raise ValueError(f"not an office ext: {ext}")
+
+
+class _OfficeDepMissing(Exception):
+    pass
+
+
 def build_full_text(pages):
     """Concatenate page texts into one stream so chunks can cross page breaks.
     Returns (full_text, page_offsets) where page_offsets[k] = (char_offset, page_no)
@@ -477,11 +535,21 @@ def main() -> None:
                     pieces = [(ls, le, pg, chapter_at(pg), t)
                               for (ls, le, pg, t) in chunk_book(full, page_offsets, tokenizer)]
                 else:
-                    # Text family: window each heading section separately so
-                    # chunks never cross sections; chapter feeds the Index tab.
+                    # Text/office families: window each heading section
+                    # separately so chunks never cross sections.
+                    if ext in ("docx", "rtf", "odt"):
+                        try:
+                            secs = extract_office_sections(path, ext)
+                        except _OfficeDepMissing as dep:
+                            outcomes.append({"i": idx, "status": "skipped",
+                                             "reason": str(dep)})
+                            print(f"[{i}/{n}] skip ({dep}) {p}", file=sys.stderr)
+                            continue
+                    else:
+                        secs = extract_text_sections(path, ext)
                     pieces = []
                     base = 0
-                    for heading, bodytext in extract_text_sections(path, ext):
+                    for heading, bodytext in secs:
                         for (ls, le, _pg, t) in chunk_book(bodytext, [], tokenizer):
                             pieces.append((base + ls, base + le, -1, heading or "", t))
                         base += len(bodytext) + 1

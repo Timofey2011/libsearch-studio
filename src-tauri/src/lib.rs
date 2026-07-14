@@ -1200,6 +1200,72 @@ async fn extract_preview_text(path: String) -> Result<SourceText, String> {
     .map_err(|e| e.to_string())?
 }
 
+#[derive(serde::Serialize)]
+struct DisplayPath {
+    display_path: String,
+    converted: bool,
+    converter: Option<String>,
+}
+
+/// Conversion-cache contract (ROADMAP-3 §0.b): formats with no JS renderer
+/// (rtf/odt today; doc/webarchive in M5) are converted to HTML via macOS
+/// textutil into `<data_dir>/converted/<content_signature>.html`. The
+/// ORIGINAL path stays the book's identity everywhere; only display reads the
+/// artifact. Cache invalidation is automatic — changed bytes = new signature.
+/// Without textutil (Linux), returns the original unconverted; the frontend
+/// falls back to the extracted-text reader.
+#[tauri::command]
+async fn resolve_display_path(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<DisplayPath, String> {
+    let data_dir = state.data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let original = DisplayPath {
+            display_path: path.clone(),
+            converted: false,
+            converter: None,
+        };
+        let ext = ls_core::ext_of(&path).unwrap_or("");
+        if !matches!(ext, "rtf" | "odt") {
+            return Ok(original);
+        }
+        let have_textutil = std::process::Command::new("which")
+            .arg("textutil")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have_textutil {
+            return Ok(original);
+        }
+        let csig = ls_app::content_signature(Path::new(&path));
+        if ls_app::is_sig_sentinel(&csig) {
+            return Err("file is unreadable".into());
+        }
+        let dir = data_dir.join("converted");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let cache = dir.join(format!("{csig}.html"));
+        if !cache.exists() {
+            let out = std::process::Command::new("textutil")
+                .args(["-convert", "html", "-output"])
+                .arg(&cache)
+                .arg(&path)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !out.status.success() || !cache.exists() {
+                return Ok(original); // conversion failed → text fallback
+            }
+        }
+        Ok(DisplayPath {
+            display_path: cache.to_string_lossy().into_owned(),
+            converted: true,
+            converter: Some("textutil".into()),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Open a source file in the OS default application (e.g. Books/Calibre for
 /// .epub) — the fallback for formats the in-app reader can't render.
 #[tauri::command]
@@ -2481,6 +2547,7 @@ pub fn run() {
             library_catalog,
             reindex_book,
             extract_preview_text,
+            resolve_display_path,
             index_health,
             reset_chunker_state,
             check_llm,
