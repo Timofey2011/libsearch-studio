@@ -171,21 +171,15 @@ async fn run_backfill_state(app_dir: &str, collection_id: &str) -> Result<()> {
         pairs.len(),
         coll.name
     );
-    let (mut ok, mut missing) = (0usize, 0usize);
-    for (book_id, source_path) in &pairs {
-        let p = Path::new(source_path);
-        let fp = ls_app::file_fingerprint(p);
-        let csig = ls_app::content_signature(p);
-        if csig == "missing" {
-            missing += 1;
-        }
-        // Backfilled books keep chunks produced by an OLDER scheme — record them
-        // as legacy (ver 0) so the app's re-index nudge stays honest about them.
-        db.set_book_state_ver(&coll.id, book_id, &fp, &csig, 0)
-            .context("write book_state")?;
-        ok += 1;
+    let out =
+        ls_app::service::backfill_book_state(&db, &coll.id, &pairs).context("write book_state")?;
+    eprintln!(
+        "done: {} recorded ({} unreadable — NOT seeded; re-run once they are readable)",
+        out.seeded, out.unseedable
+    );
+    for p in &out.unseedable_paths {
+        eprintln!("  unseedable: {p}");
     }
-    eprintln!("done: {ok} recorded ({missing} files missing on disk)");
     Ok(())
 }
 

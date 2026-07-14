@@ -109,34 +109,100 @@ pub fn content_signature(path: &Path) -> String {
 
     const SAMPLE: u64 = 256 * 1024;
     let Ok(mut f) = std::fs::File::open(path) else {
-        return "missing".to_string();
+        return CONTENT_SIG_MISSING.to_string();
     };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return CONTENT_SIG_MISSING.to_string();
+    };
     let mut h = std::collections::hash_map::DefaultHasher::new();
     h.write_u64(len);
 
-    fn hash_n(f: &mut std::fs::File, h: &mut impl Hasher, max: u64) {
-        let mut remaining = max;
+    // Hash exactly `max` bytes (or to a genuine EOF); a read error or short
+    // read returns None. A signature derived from PARTIAL bytes must never be
+    // reported as confident: two distinct same-length files that both fail
+    // mid-read (dehydrated cloud placeholder, permission flip) would otherwise
+    // produce IDENTICAL signatures and dedup would remap one book onto the
+    // other's path.
+    fn hash_n(f: &mut std::fs::File, h: &mut impl Hasher, max: u64) -> Option<u64> {
+        let mut hashed = 0u64;
         let mut buf = [0u8; 64 * 1024];
-        while remaining > 0 {
-            let want = remaining.min(buf.len() as u64) as usize;
+        while hashed < max {
+            let want = (max - hashed).min(buf.len() as u64) as usize;
             match f.read(&mut buf[..want]) {
-                Ok(0) => break,
+                Ok(0) => break, // genuine EOF
                 Ok(n) => {
                     h.write(&buf[..n]);
-                    remaining -= n as u64;
+                    hashed += n as u64;
                 }
-                Err(_) => break,
+                Err(_) => return None,
             }
         }
+        Some(hashed)
     }
 
-    hash_n(&mut f, &mut h, SAMPLE);
+    let head_expected = len.min(SAMPLE);
+    match hash_n(&mut f, &mut h, SAMPLE) {
+        Some(n) if n >= head_expected => {}
+        _ => return CONTENT_SIG_MISSING.to_string(),
+    }
     // Hash the tail too (only meaningfully distinct for files > 2 samples).
-    if len > 2 * SAMPLE && f.seek(SeekFrom::End(-(SAMPLE as i64))).is_ok() {
-        hash_n(&mut f, &mut h, SAMPLE);
+    if len > 2 * SAMPLE {
+        if f.seek(SeekFrom::End(-(SAMPLE as i64))).is_err() {
+            return CONTENT_SIG_MISSING.to_string();
+        }
+        match hash_n(&mut f, &mut h, SAMPLE) {
+            Some(n) if n >= SAMPLE => {}
+            _ => return CONTENT_SIG_MISSING.to_string(),
+        }
     }
     format!("{len:x}:{:016x}", h.finish())
+}
+
+/// The failure sentinel shared by [`content_signature`] and [`file_fingerprint`].
+/// It is POISON, never identity: reverse lookups treat it as no-match, writers
+/// refuse to persist it, and in-run dedup maps never key on it.
+pub const CONTENT_SIG_MISSING: &str = "missing";
+
+/// Outcome of [`backfill_book_state`].
+#[derive(Debug, Default)]
+pub struct BackfillOutcome {
+    pub seeded: usize,
+    pub unseedable: usize,
+    pub unseedable_paths: Vec<String>,
+}
+
+/// Seed the fingerprint manifest for books already present in a lance store
+/// (e.g. loaded via Parquet import), so the dedup recognizes them and never
+/// re-embeds. Unreadable files are NOT seeded — a row carrying the failure
+/// sentinel is a dedup trap (see [`CONTENT_SIG_MISSING`]) — they are counted
+/// and listed instead, and can be seeded by a later run once readable.
+/// Rows are stamped `chunker_ver = 0` (legacy): their chunks came from an
+/// older scheme and the re-index nudge should stay honest about that.
+pub fn backfill_book_state(
+    db: &crate::Db,
+    collection_id: &str,
+    pairs: &[(String, String)],
+) -> Result<BackfillOutcome, crate::DbError> {
+    let mut out = BackfillOutcome::default();
+    for (book_id, source_path) in pairs {
+        let p = Path::new(source_path);
+        let fp = file_fingerprint(p);
+        let csig = content_signature(p);
+        if crate::is_sig_sentinel(&fp) || crate::is_sig_sentinel(&csig) {
+            out.unseedable += 1;
+            out.unseedable_paths.push(source_path.clone());
+            continue;
+        }
+        db.set_book_state_ver(collection_id, book_id, &fp, &csig, source_path, 0)?;
+        out.seeded += 1;
+    }
+    Ok(out)
+}
+
+/// True when a fingerprint/content-signature value is the failure sentinel (or
+/// empty) and must never participate in identity matching.
+pub fn is_sig_sentinel(v: &str) -> bool {
+    v.is_empty() || v == CONTENT_SIG_MISSING
 }
 
 /// `(path, size, mtime)` fingerprint — changes iff the file changes.
@@ -202,89 +268,88 @@ impl Service {
         // when the fingerprint manifest is empty (index built before the manifest
         // existed, or via Parquet import). One scan up front, then O(1) lookups.
         let indexed = store.indexed_book_ids().await.unwrap_or_default();
+        let paths_by_id: std::collections::HashMap<String, String> = store
+            .book_paths()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        // Fill source_path for manifest rows that predate the column (metadata
+        // only — no file reads, so safe against dehydrated cloud placeholders).
+        self.db
+            .backfill_source_paths(&collection.id, &paths_by_id)?;
+
+        // The shared dedup pre-filter (also used by the GPU fast-index path):
+        // decides skip / remap / refresh / embed per candidate, writing nothing.
+        let candidates: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let ctx = crate::plan::PlanCtx {
+            collection_id: &collection.id,
+            db: &self.db,
+            indexed_ids: &indexed,
+            paths_by_id: &paths_by_id,
+            fp_fn: &|p| file_fingerprint(p),
+            csig_fn: &|p| content_signature(p),
+        };
+        let plan = crate::plan::plan_index_run(&candidates, &ctx)?;
+
+        // Metadata-only actions first: manifest refreshes, then moved-file
+        // re-points (chunk metadata rewrite, no re-embedding).
+        for r in &plan.state_refreshes {
+            self.db.refresh_book_state(
+                &collection.id,
+                &r.book_id,
+                &r.fingerprint,
+                r.content_sig.as_deref(),
+                &r.path,
+            )?;
+        }
+        for m in &plan.remaps {
+            store.remap_book(&m.old_id, &m.new_id, &m.path).await.ok();
+            self.db.delete_book_state(&collection.id, &m.old_id)?;
+            self.db.set_book_state_ver(
+                &collection.id,
+                &m.new_id,
+                &m.fingerprint,
+                m.content_sig.as_deref().unwrap_or(""),
+                &m.path,
+                m.chunker_ver,
+            )?;
+        }
+
+        let mut n = 0usize;
+        for (path, reason) in &plan.preskips {
+            n += 1;
+            match reason {
+                crate::plan::SkipReason::Unreadable => {
+                    stats.books_failed += 1;
+                    on_event(IndexEvent::Skipped {
+                        n,
+                        total,
+                        path: path.clone(),
+                        reason: "unreadable (permissions, or an offline cloud placeholder?)".into(),
+                    });
+                }
+                _ => {
+                    stats.books_unchanged += 1;
+                    on_event(IndexEvent::Unchanged {
+                        n,
+                        total,
+                        title: title_of(Path::new(path)),
+                    });
+                }
+            }
+        }
 
         let mut wrote = false;
-        'files: for (i, path) in paths.iter().enumerate() {
+        'files: for item in &plan.to_embed {
             // Stop promptly when the user hits Stop; books written so far are kept.
             if is_cancelled() {
                 break;
             }
-            let n = i + 1;
+            n += 1;
+            let path = &item.path;
             let p = Path::new(path);
-
-            // Fast skip BEFORE the costly extract: the book id is derived from the
-            // path and the fingerprint from file metadata, so an unchanged file is
-            // recognized with just a stat. This makes re-index / resume cheap.
-            let book_id = ls_extract::stable_book_id(p);
-            let fp = file_fingerprint(p);
-            if self
-                .db
-                .book_fingerprint(&collection.id, &book_id)?
-                .as_deref()
-                == Some(fp.as_str())
-            {
-                stats.books_unchanged += 1;
-                on_event(IndexEvent::Unchanged {
-                    n,
-                    total,
-                    title: title_of(p),
-                });
-                continue;
-            }
-
-            // Same content under a new path (the folder was moved/renamed): the
-            // fingerprint is path-independent, so an already-indexed book matches.
-            // Re-point its chunks to the new id + path instead of re-embedding.
-            if let Some(old_id) = self.db.book_id_for_fingerprint(&collection.id, &fp)? {
-                if old_id != book_id {
-                    store.remap_book(&old_id, &book_id, path).await.ok();
-                    self.db.delete_book_state(&collection.id, &old_id)?;
-                    self.db
-                        .set_book_fingerprint(&collection.id, &book_id, &fp)?;
-                    stats.books_unchanged += 1;
-                    on_event(IndexEvent::Unchanged {
-                        n,
-                        total,
-                        title: title_of(p),
-                    });
-                    continue;
-                }
-            }
-
-            // Already embedded in a prior run but not yet in the manifest: record
-            // the fingerprint and skip re-embedding. (An edit made between that
-            // run and now is picked up on the next re-index via the fp check.)
-            if indexed.contains(&book_id) {
-                self.db
-                    .set_book_fingerprint(&collection.id, &book_id, &fp)?;
-                stats.books_unchanged += 1;
-                on_event(IndexEvent::Unchanged {
-                    n,
-                    total,
-                    title: title_of(p),
-                });
-                continue;
-            }
-
-            // Content-checksum dedup: the same bytes under a new path or a changed
-            // timestamp (re-sync, copy, duplicate) — caught even when (size, mtime)
-            // differs. Re-point the existing chunks instead of re-embedding.
-            let csig = content_signature(p);
-            if let Some(old_id) = self.db.book_id_for_content(&collection.id, &csig)? {
-                if old_id != book_id {
-                    store.remap_book(&old_id, &book_id, path).await.ok();
-                    self.db.delete_book_state(&collection.id, &old_id)?;
-                    self.db
-                        .set_book_state(&collection.id, &book_id, &fp, &csig)?;
-                    stats.books_unchanged += 1;
-                    on_event(IndexEvent::Unchanged {
-                        n,
-                        total,
-                        title: title_of(p),
-                    });
-                    continue;
-                }
-            }
+            let (fp, csig) = (&item.fingerprint, &item.content_sig);
 
             // Announce the file before the (potentially slow) extract so a large
             // or problematic PDF is visible instead of the bar looking frozen.
@@ -310,7 +375,7 @@ impl Service {
             if doc.blocks.is_empty() {
                 stats.books_skipped += 1;
                 self.db
-                    .set_book_state(&collection.id, &doc.book_id, &fp, &csig)?;
+                    .set_book_state(&collection.id, &doc.book_id, fp, csig, path)?;
                 on_event(IndexEvent::Skipped {
                     n,
                     total,
@@ -354,7 +419,7 @@ impl Service {
             stats.books_indexed += 1;
             wrote = true;
             self.db
-                .set_book_state(&collection.id, &doc.book_id, &fp, &csig)?;
+                .set_book_state(&collection.id, &doc.book_id, fp, csig, path)?;
             on_event(IndexEvent::Indexed {
                 n,
                 total,

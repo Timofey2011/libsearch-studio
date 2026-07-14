@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS book_state (
     fingerprint   TEXT NOT NULL,
     content_sig   TEXT NOT NULL DEFAULT '',
     chunker_ver   INTEGER NOT NULL DEFAULT 0,
+    source_path   TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (collection_id, book_id)
 );
 -- User-authored memory ("Ledger, not Brain"): one editable note per scope
@@ -62,6 +63,30 @@ CREATE TABLE IF NOT EXISTS notebook (
 
 pub struct Db {
     conn: Connection,
+}
+
+/// A matched `book_state` row. Dedup guards need the whole row: the stored
+/// path distinguishes a moved file from metadata churn, and the stored content
+/// signature confirms identity when a size:mtime fingerprint collides.
+#[derive(Debug, Clone)]
+pub struct BookStateHit {
+    pub book_id: String,
+    pub source_path: String,
+    pub content_sig: String,
+    pub fingerprint: String,
+    /// Preserved across remaps so a moved legacy book keeps its honest
+    /// re-index nudge instead of being silently stamped current.
+    pub chunker_ver: i64,
+}
+
+fn hit_from_row(r: &rusqlite::Row) -> Result<BookStateHit, rusqlite::Error> {
+    Ok(BookStateHit {
+        book_id: r.get(0)?,
+        source_path: r.get(1)?,
+        content_sig: r.get(2)?,
+        fingerprint: r.get(3)?,
+        chunker_ver: r.get(4)?,
+    })
 }
 
 /// The chunking scheme version stamped on newly indexed books. Bump when chunk
@@ -105,10 +130,29 @@ impl Db {
             &conn,
             "ALTER TABLE book_state ADD COLUMN chunker_ver INTEGER NOT NULL DEFAULT 0",
         )?;
+        // The book's source path, powering the moved-vs-unmoved distinction in
+        // dedup guards without a store lookup ('' = predates the column).
+        alter_ignore_duplicate(
+            &conn,
+            "ALTER TABLE book_state ADD COLUMN source_path TEXT NOT NULL DEFAULT ''",
+        )?;
+        // Purge failure-sentinel rows written by older backfills: a "missing"
+        // fingerprint/signature is not identity, and a row carrying one can
+        // remap an unrelated book onto the wrong path (the affected books are
+        // simply re-evaluated on the next index run).
+        let purged = conn.execute(
+            "DELETE FROM book_state WHERE fingerprint = 'missing' OR content_sig = 'missing'",
+            [],
+        )?;
+        if purged > 0 {
+            eprintln!("book_state: purged {purged} failure-sentinel row(s)");
+        }
         Ok(Self { conn })
     }
 
-    #[cfg(test)]
+    /// In-memory Db for tests (unit AND integration). Runs SCHEMA only — every
+    /// column added via an `open()` ALTER migration must also be in SCHEMA, or
+    /// tests diverge from production databases.
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -350,19 +394,26 @@ impl Db {
     /// Find an already-indexed book in this collection whose stored fingerprint
     /// matches. Because the fingerprint is path-independent (`size:mtime`), this
     /// recognizes a file that moved to a new path so we can re-point its chunks
-    /// instead of re-embedding them.
-    pub fn book_id_for_fingerprint(
+    /// instead of re-embedding them. Returns the whole row: guards need the
+    /// stored path (moved-vs-unmoved) and content signature (fingerprint
+    /// collisions are real once thousands of small files share size+mtime).
+    /// The failure sentinel and empty values never match.
+    pub fn book_state_for_fingerprint(
         &self,
         collection_id: &str,
         fingerprint: &str,
-    ) -> Result<Option<String>, DbError> {
+    ) -> Result<Option<BookStateHit>, DbError> {
+        if crate::is_sig_sentinel(fingerprint) {
+            return Ok(None);
+        }
         let r = self.conn.query_row(
-            "SELECT book_id FROM book_state WHERE collection_id = ?1 AND fingerprint = ?2 LIMIT 1",
+            "SELECT book_id, source_path, content_sig, fingerprint, chunker_ver FROM book_state
+             WHERE collection_id = ?1 AND fingerprint = ?2 LIMIT 1",
             params![collection_id, fingerprint],
-            |r| r.get::<_, String>(0),
+            hit_from_row,
         );
         match r {
-            Ok(id) => Ok(Some(id)),
+            Ok(hit) => Ok(Some(hit)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -370,22 +421,24 @@ impl Db {
 
     /// Find an already-indexed book in this collection by content signature
     /// (timestamp-independent). Recognizes the same content even if its mtime
-    /// changed or it was duplicated. Empty signatures never match.
-    pub fn book_id_for_content(
+    /// changed or it was duplicated. The failure sentinel and empty values
+    /// never match.
+    pub fn book_state_for_content(
         &self,
         collection_id: &str,
         content_sig: &str,
-    ) -> Result<Option<String>, DbError> {
-        if content_sig.is_empty() {
+    ) -> Result<Option<BookStateHit>, DbError> {
+        if crate::is_sig_sentinel(content_sig) {
             return Ok(None);
         }
         let r = self.conn.query_row(
-            "SELECT book_id FROM book_state WHERE collection_id = ?1 AND content_sig = ?2 LIMIT 1",
+            "SELECT book_id, source_path, content_sig, fingerprint, chunker_ver FROM book_state
+             WHERE collection_id = ?1 AND content_sig = ?2 LIMIT 1",
             params![collection_id, content_sig],
-            |r| r.get::<_, String>(0),
+            hit_from_row,
         );
         match r {
-            Ok(id) => Ok(Some(id)),
+            Ok(hit) => Ok(Some(hit)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -399,12 +452,14 @@ impl Db {
         book_id: &str,
         fingerprint: &str,
         content_sig: &str,
+        source_path: &str,
     ) -> Result<(), DbError> {
         self.set_book_state_ver(
             collection_id,
             book_id,
             fingerprint,
             content_sig,
+            source_path,
             CURRENT_CHUNKER_VER,
         )
     }
@@ -412,26 +467,41 @@ impl Db {
     /// Like [`Db::set_book_state`] but with an explicit chunker version — used by
     /// backfills recording books whose chunks came from an OLDER scheme (ver 0),
     /// so the re-index nudge stays honest about them.
+    ///
+    /// Refuses to persist a row whose fingerprint is the failure sentinel: an
+    /// unreadable file must produce NO state (a sentinel row is a dedup trap —
+    /// the next unreadable file would "match" it and remap an unrelated book).
+    /// A sentinel content signature is stored as '' (fingerprint-only row).
     pub fn set_book_state_ver(
         &self,
         collection_id: &str,
         book_id: &str,
         fingerprint: &str,
         content_sig: &str,
+        source_path: &str,
         chunker_ver: i64,
     ) -> Result<(), DbError> {
+        if crate::is_sig_sentinel(fingerprint) {
+            return Ok(());
+        }
+        let content_sig = if content_sig == crate::CONTENT_SIG_MISSING {
+            ""
+        } else {
+            content_sig
+        };
         self.conn.execute(
-            "INSERT INTO book_state (collection_id, book_id, fingerprint, content_sig, chunker_ver)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO book_state (collection_id, book_id, fingerprint, content_sig, chunker_ver, source_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(collection_id, book_id)
              DO UPDATE SET fingerprint=excluded.fingerprint, content_sig=excluded.content_sig,
-                           chunker_ver=excluded.chunker_ver",
+                           chunker_ver=excluded.chunker_ver, source_path=excluded.source_path",
             params![
                 collection_id,
                 book_id,
                 fingerprint,
                 content_sig,
-                chunker_ver
+                chunker_ver,
+                source_path
             ],
         )?;
         Ok(())
@@ -452,13 +522,79 @@ impl Db {
         collection_id: &str,
         book_id: &str,
         fingerprint: &str,
+        source_path: &str,
     ) -> Result<(), DbError> {
+        if crate::is_sig_sentinel(fingerprint) {
+            return Ok(());
+        }
         self.conn.execute(
-            "INSERT INTO book_state (collection_id, book_id, fingerprint) VALUES (?1, ?2, ?3)
-             ON CONFLICT(collection_id, book_id) DO UPDATE SET fingerprint=excluded.fingerprint",
-            params![collection_id, book_id, fingerprint],
+            "INSERT INTO book_state (collection_id, book_id, fingerprint, source_path) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(collection_id, book_id)
+             DO UPDATE SET fingerprint=excluded.fingerprint, source_path=excluded.source_path",
+            params![collection_id, book_id, fingerprint, source_path],
         )?;
         Ok(())
+    }
+
+    /// Refresh manifest state under an EXISTING book id without touching its
+    /// chunker version (the chunks were not rewritten, so the re-index nudge
+    /// must stay honest). `content_sig: None` keeps whatever the row has. A
+    /// fresh insert (store-derived book with no row yet) lands as ver 0 =
+    /// legacy, which is true — its chunks predate the manifest.
+    pub fn refresh_book_state(
+        &self,
+        collection_id: &str,
+        book_id: &str,
+        fingerprint: &str,
+        content_sig: Option<&str>,
+        source_path: &str,
+    ) -> Result<(), DbError> {
+        if crate::is_sig_sentinel(fingerprint) {
+            return Ok(());
+        }
+        let csig = match content_sig {
+            Some(c) if c != crate::CONTENT_SIG_MISSING => Some(c),
+            Some(_) => None,
+            None => None,
+        };
+        self.conn.execute(
+            "INSERT INTO book_state (collection_id, book_id, fingerprint, content_sig, chunker_ver, source_path)
+             VALUES (?1, ?2, ?3, COALESCE(?4, ''), 0, ?5)
+             ON CONFLICT(collection_id, book_id)
+             DO UPDATE SET fingerprint=excluded.fingerprint,
+                           content_sig=COALESCE(?4, book_state.content_sig),
+                           source_path=excluded.source_path",
+            params![collection_id, book_id, fingerprint, csig, source_path],
+        )?;
+        Ok(())
+    }
+
+    /// Fill the `source_path` column for rows that predate it ('' default),
+    /// from the lance store's `(book_id, source_path)` scan. Metadata only —
+    /// no file I/O, so it is safe against dehydrated cloud placeholders.
+    pub fn backfill_source_paths(
+        &self,
+        collection_id: &str,
+        paths_by_id: &std::collections::HashMap<String, String>,
+    ) -> Result<usize, DbError> {
+        let mut filled = 0usize;
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT book_id FROM book_state WHERE collection_id = ?1 AND source_path = ''",
+            )?;
+            let rows = stmt.query_map(params![collection_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for id in ids {
+            if let Some(path) = paths_by_id.get(&id) {
+                filled += self.conn.execute(
+                    "UPDATE book_state SET source_path = ?3
+                     WHERE collection_id = ?1 AND book_id = ?2 AND source_path = ''",
+                    params![collection_id, id, path],
+                )?;
+            }
+        }
+        Ok(filled)
     }
 
     /// How many of a collection's indexed books were chunked by an OLDER scheme
@@ -520,12 +656,14 @@ mod tests {
     fn chunker_ver_tracking_and_reset() {
         let db = Db::open_in_memory().unwrap();
         // Freshly indexed books are stamped current; backfilled imports are legacy.
-        db.set_book_state("c1", "fresh", "fp1", "sig1").unwrap();
-        db.set_book_state_ver("c1", "imported", "fp2", "sig2", 0)
+        db.set_book_state("c1", "fresh", "fp1", "sig1", "/lib/fresh.pdf")
+            .unwrap();
+        db.set_book_state_ver("c1", "imported", "fp2", "sig2", "/lib/imported.pdf", 0)
             .unwrap();
         assert_eq!(db.legacy_chunker_count("c1").unwrap(), 1);
         // Re-indexing the legacy book (normal path) upgrades its stamp.
-        db.set_book_state("c1", "imported", "fp2", "sig2").unwrap();
+        db.set_book_state("c1", "imported", "fp2", "sig2", "/lib/imported.pdf")
+            .unwrap();
         assert_eq!(db.legacy_chunker_count("c1").unwrap(), 0);
         // Reset forgets fingerprints so a re-index re-embeds everything.
         assert_eq!(db.clear_book_state("c1").unwrap(), 2);
@@ -637,30 +775,58 @@ mod tests {
     fn book_fingerprint_tracks_changes() {
         let db = Db::open_in_memory().unwrap();
         assert_eq!(db.book_fingerprint("c1", "b1").unwrap(), None);
-        db.set_book_fingerprint("c1", "b1", "fp1").unwrap();
+        db.set_book_fingerprint("c1", "b1", "fp1", "/lib/b1.pdf")
+            .unwrap();
         assert_eq!(db.book_fingerprint("c1", "b1").unwrap(), Some("fp1".into()));
-        db.set_book_fingerprint("c1", "b1", "fp2").unwrap();
+        db.set_book_fingerprint("c1", "b1", "fp2", "/lib/b1.pdf")
+            .unwrap();
         assert_eq!(db.book_fingerprint("c1", "b1").unwrap(), Some("fp2".into()));
     }
 
     #[test]
     fn content_sig_finds_moved_book() {
         let db = Db::open_in_memory().unwrap();
-        // An empty signature must never match.
-        assert_eq!(db.book_id_for_content("c1", "").unwrap(), None);
+        // Empty and sentinel signatures must never match.
+        assert!(db.book_state_for_content("c1", "").unwrap().is_none());
+        assert!(db
+            .book_state_for_content("c1", "missing")
+            .unwrap()
+            .is_none());
         // Record a book under its old id with a content signature.
-        db.set_book_state("c1", "old", "fp-old", "sig-xyz").unwrap();
-        assert_eq!(
-            db.book_id_for_content("c1", "sig-xyz").unwrap(),
-            Some("old".into())
-        );
+        db.set_book_state("c1", "old", "fp-old", "sig-xyz", "/lib/old.pdf")
+            .unwrap();
+        let hit = db.book_state_for_content("c1", "sig-xyz").unwrap().unwrap();
+        assert_eq!(hit.book_id, "old");
+        assert_eq!(hit.source_path, "/lib/old.pdf");
         // Scoped per collection.
-        assert_eq!(db.book_id_for_content("c2", "sig-xyz").unwrap(), None);
+        assert!(db
+            .book_state_for_content("c2", "sig-xyz")
+            .unwrap()
+            .is_none());
         // set_book_fingerprint must preserve the existing content signature.
-        db.set_book_fingerprint("c1", "old", "fp-new").unwrap();
+        db.set_book_fingerprint("c1", "old", "fp-new", "/lib/old.pdf")
+            .unwrap();
         assert_eq!(
-            db.book_id_for_content("c1", "sig-xyz").unwrap(),
-            Some("old".into())
+            db.book_state_for_content("c1", "sig-xyz")
+                .unwrap()
+                .unwrap()
+                .book_id,
+            "old"
         );
+        // Sentinel writes are refused entirely.
+        db.set_book_state("c1", "ghost", "missing", "missing", "/lib/g.pdf")
+            .unwrap();
+        assert_eq!(db.book_fingerprint("c1", "ghost").unwrap(), None);
+        // A sentinel csig on a valid fingerprint is stored as '' (no content identity).
+        db.set_book_state("c1", "halfread", "fp-h", "missing", "/lib/h.pdf")
+            .unwrap();
+        assert_eq!(
+            db.book_fingerprint("c1", "halfread").unwrap(),
+            Some("fp-h".into())
+        );
+        assert!(db
+            .book_state_for_content("c1", "missing")
+            .unwrap()
+            .is_none());
     }
 }
