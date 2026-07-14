@@ -539,7 +539,19 @@ fn chunks_with_vectors(batch: &RecordBatch) -> Result<Vec<Chunk>, StoreError> {
             title: title.value(i).to_string(),
             author: opt(author.value(i)),
             source_path: source_path.value(i).to_string(),
-            format: Format::from_ext(format.value(i)).unwrap_or(Format::Pdf),
+            // Import is strict (ROADMAP-3 §2.4): an unknown format string
+            // means gpu_embed.py and ls-core Format drifted — the exact
+            // mechanism that once mislabeled every imported .md as pdf. Fail
+            // loudly naming the file; the READ path stays tolerant.
+            format: Format::from_ext(format.value(i)).ok_or_else(|| {
+                StoreError::Schema(format!(
+                    "parquet row for '{}' (book {}) has unknown format '{}' — \
+                     gpu_embed.py and ls-core Format are out of sync",
+                    source_path.value(i),
+                    book_id.value(i),
+                    format.value(i)
+                ))
+            })?,
             chapter: opt(chapter.value(i)),
             page: if p < 0 { None } else { Some(p as u32) },
             loc_start: loc_start.value(i) as usize,

@@ -1,18 +1,15 @@
 //! Expand a collection's configured source paths into a concrete list of book
 //! files to index. A source path may be a single file or a directory (walked
-//! recursively). Only formats the engine can extract (PDF in v1) are returned.
+//! recursively). Only formats ingest currently accepts (`ls_core::INGEST_EXTS`,
+//! flipped per ROADMAP-3 milestone) are returned; the extension is derived by
+//! the one canonical rule, `ls_core::ext_of` (compound extensions included).
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Extensions the extractor can handle today. EPUB/MOBI ingest is out of scope
-/// for v1 (the reader is PDF-only), so we don't surface them.
-const SUPPORTED: &[&str] = &["pdf"];
-
 fn is_supported(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| SUPPORTED.contains(&e.to_ascii_lowercase().as_str()))
+    ls_core::ext_of(&path.to_string_lossy())
+        .map(|e| ls_core::INGEST_EXTS.contains(&e))
         .unwrap_or(false)
 }
 

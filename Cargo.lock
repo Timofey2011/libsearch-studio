@@ -120,7 +120,9 @@ dependencies = [
  "log",
  "ls-app",
  "ls-artifacts",
+ "ls-core",
  "ls-embed",
+ "ls-extract",
  "ls-index",
  "ls-llm",
  "ls-query",
@@ -4853,6 +4855,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "ls-app",
+ "ls-core",
  "ls-embed",
  "ls-extract",
  "ls-index",

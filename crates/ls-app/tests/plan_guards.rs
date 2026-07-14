@@ -23,6 +23,7 @@ struct World {
     paths_by_id: HashMap<String, String>,
     fps: HashMap<String, String>,
     csigs: HashMap<String, String>,
+    caps_ver: String,
 }
 
 impl World {
@@ -34,6 +35,7 @@ impl World {
             paths_by_id: HashMap::new(),
             fps: HashMap::new(),
             csigs: HashMap::new(),
+            caps_ver: "caps-v1".into(),
         }
     }
 
@@ -85,6 +87,8 @@ impl World {
                 db: &self.db,
                 indexed_ids: &self.indexed_ids,
                 paths_by_id: &self.paths_by_id,
+                pipeline: "cpu",
+                caps_ver: &self.caps_ver,
                 fp_fn: &fp_fn,
                 csig_fn: &csig_fn,
             };
@@ -319,4 +323,132 @@ fn genuine_move_still_remaps_preserving_ver() {
     assert_eq!(m.old_id, "legacy-m");
     assert_eq!(m.path, "/new/book.pdf");
     assert_eq!(m.chunker_ver, 0, "legacy ver survives the move");
+}
+
+/// §2.8 skip records: silenced while file + capabilities are unchanged;
+/// retried when either changes; pipeline-scoped; never identity-keyed.
+#[test]
+fn skip_state_silences_retries_and_scopes() {
+    let mut w = World::new();
+    w.add_new_file("/lib/broken.pdf", "60:60", "cs:broke");
+    // First run recorded a CPU skip (e.g. extract failure).
+    w.db.upsert_skip(
+        &w.coll,
+        "/lib/broken.pdf",
+        "cpu",
+        "60:60",
+        "boom",
+        "caps-v1",
+    )
+    .unwrap();
+
+    // Same file, same caps → silenced (no embed, no re-announcement).
+    let plan = w.plan(&["/lib/broken.pdf"]);
+    assert_eq!(
+        plan.preskips,
+        vec![("/lib/broken.pdf".to_string(), SkipReason::Silenced)]
+    );
+    assert!(plan.to_embed.is_empty());
+
+    // Capabilities changed (tool installed / device switched) → retried.
+    w.caps_ver = "caps-v2".into();
+    let plan = w.plan(&["/lib/broken.pdf"]);
+    assert_eq!(plan.to_embed.len(), 1, "caps bump must retry the skip");
+
+    // File changed (new fingerprint) under the old caps → retried too.
+    w.caps_ver = "caps-v1".into();
+    w.fps.insert("/lib/broken.pdf".into(), "61:61".into());
+    let plan = w.plan(&["/lib/broken.pdf"]);
+    assert_eq!(plan.to_embed.len(), 1, "changed file must retry the skip");
+
+    // Pipeline scoping: a GPU-recorded skip must not hide the file from CPU.
+    w.fps.insert("/lib/broken.pdf".into(), "60:60".into());
+    w.db.erase_skips(&w.coll, "/lib/broken.pdf").unwrap();
+    w.db.upsert_skip(
+        &w.coll,
+        "/lib/broken.pdf",
+        "gpu",
+        "60:60",
+        "no dep",
+        "gcaps",
+    )
+    .unwrap();
+    let plan = w.plan(&["/lib/broken.pdf"]); // pipeline = cpu
+    assert_eq!(plan.to_embed.len(), 1, "gpu skip must not silence cpu");
+}
+
+/// Skip-collision (mirrors §2.1 scenario (c)): a skip row for file A must not
+/// suppress file B with a colliding fingerprint, and B's success must not
+/// erase A's record.
+#[test]
+fn skip_rows_are_path_keyed_not_fingerprint_keyed() {
+    let mut w = World::new();
+    w.add_new_file("/notes/a.md", "500:7777", "cs:aa");
+    w.add_new_file("/notes/b.md", "500:7777", "cs:bb"); // same size:mtime
+    w.db.upsert_skip(
+        &w.coll,
+        "/notes/a.md",
+        "cpu",
+        "500:7777",
+        "no text",
+        "caps-v1",
+    )
+    .unwrap();
+
+    let plan = w.plan(&["/notes/a.md", "/notes/b.md"]);
+    // A silenced; B (no row for ITS path) indexes normally.
+    assert_eq!(plan.to_embed.len(), 1);
+    assert_eq!(plan.to_embed[0].path, "/notes/b.md");
+
+    // B's success erases only B's rows; A stays silenced next run.
+    w.db.erase_skips(&w.coll, "/notes/b.md").unwrap();
+    let plan2 = w.plan(&["/notes/a.md"]);
+    assert_eq!(
+        plan2.preskips,
+        vec![("/notes/a.md".to_string(), SkipReason::Silenced)]
+    );
+}
+
+/// Stage-2 safety: skip records live in their own table and must never be
+/// found by the book_state reverse lookups.
+#[test]
+fn skip_rows_never_reach_dedup_lookups() {
+    let w = World::new();
+    w.db.upsert_skip(&w.coll, "/lib/x.pdf", "cpu", "42:42", "r", "c")
+        .unwrap();
+    assert!(w
+        .db
+        .book_state_for_fingerprint(&w.coll, "42:42")
+        .unwrap()
+        .is_none());
+    // Sentinel skip rows are refused outright.
+    w.db.upsert_skip(&w.coll, "/lib/y.pdf", "cpu", "missing", "r", "c")
+        .unwrap();
+    assert!(w
+        .db
+        .skip_state_hit(&w.coll, "/lib/y.pdf", "cpu")
+        .unwrap()
+        .is_none());
+}
+
+/// Orphan GC: rows whose path left the collection's sources are swept.
+#[test]
+fn skip_gc_sweeps_paths_outside_sources() {
+    let w = World::new();
+    w.db.upsert_skip(&w.coll, "/lib/in.pdf", "cpu", "1:1", "r", "c")
+        .unwrap();
+    w.db.upsert_skip(&w.coll, "/elsewhere/out.pdf", "gpu", "2:2", "r", "c")
+        .unwrap();
+    let swept = w.db.gc_skips(&w.coll, &["/lib".to_string()]).unwrap();
+    assert_eq!(swept, 1);
+    assert!(w
+        .db
+        .skip_state_hit(&w.coll, "/lib/in.pdf", "cpu")
+        .unwrap()
+        .is_some());
+    assert!(w
+        .db
+        .skip_state_hit(&w.coll, "/elsewhere/out.pdf", "gpu")
+        .unwrap()
+        .is_none());
 }

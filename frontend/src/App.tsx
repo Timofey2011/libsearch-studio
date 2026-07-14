@@ -3,6 +3,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import PdfReader from "./PdfReader";
+import { extOf, EXT_FAMILY } from "./generated/supportedExts";
 
 type Collection = {
   id: string;
@@ -146,6 +147,7 @@ type Settings = {
   providers: Record<string, ProviderCreds>;
   python_bin: string;
   indexer_script: string;
+  gpu_device: string;
   hybrid_top_k: number;
   final_top_k: number;
   min_relevance: number;
@@ -937,10 +939,12 @@ export default function App() {
   }
 
   async function openSource(s: Src) {
-    // The reader iframe only renders PDFs (WKWebView native); Markdown renders
-    // in-app, anything else (epub/mobi/…) gets a passage view + external open.
-    const ext = (s.source_path.split(".").pop() ?? "").toLowerCase();
-    const kind: ReaderKind = ext === "pdf" ? "pdf" : ext === "md" || ext === "markdown" || ext === "txt" ? "md" : "other";
+    // Reader-kind routing via the generated extension map (the canonical rule
+    // lives in ls-core; last-dot splitting would route ".fb2.zip" wrong).
+    // PDFs render in PdfReader; Markdown/plain text in-app; anything else
+    // (epub/mobi/…) gets a passage view + external open.
+    const family = EXT_FAMILY[extOf(s.source_path) ?? ""] ?? "other";
+    const kind: ReaderKind = family === "pdf" ? "pdf" : family === "md" || family === "txt" ? "md" : "other";
     setReader({ path: s.source_path, page: s.page, missing: false, kind, citeText: s.text });
     // The book may have been moved/renamed since indexing — warn instead of
     // showing a silently-blank reader.
@@ -1692,6 +1696,13 @@ export default function App() {
             placeholder="/path/to/scripts/index_to_parquet.py"
             value={settings.indexer_script}
             onChange={(e) => editSetting("indexer_script", e.target.value)}
+          />
+          <label>Fast index · device</label>
+          <input
+            placeholder="mps (Apple GPU) · cuda · cpu"
+            value={settings.gpu_device ?? "mps"}
+            onChange={(e) => editSetting("gpu_device", e.target.value)}
+            spellCheck={false}
           />
         </div>
         <div style={{ marginTop: 10 }}>
