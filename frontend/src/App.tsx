@@ -1590,12 +1590,15 @@ export default function App() {
             ) : (
               <div className="muted">No folders yet — add one to index.</div>
             )}
-            <div className="row" style={{ marginTop: 6 }}>
+            {/* key: remount the whole row when indexing flips — WKWebView drops
+                the repaint of the shrinking button otherwise, leaving ghost
+                pixels of the idle row visible behind Indexing…/Stop. */}
+            <div className="row" style={{ marginTop: 6 }} key={indexing ? "row-busy" : "row-idle"}>
               <button onClick={() => addFolderToColl(currentColl)} disabled={indexing}>
                 Add folder…
               </button>
               <button
-                className="primary"
+                className="primary index-btn"
                 onClick={runAutoIndex}
                 disabled={indexing || currentColl.source_paths.length === 0}
                 title={gpuReady ? "Embed on the GPU (resumable)" : "Embed on the CPU — set up GPU in Settings → Indexing for ~10x faster"}

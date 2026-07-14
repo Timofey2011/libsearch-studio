@@ -367,6 +367,11 @@ a:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Same width in "Index / Re-index" and "Indexing…" states so the row
+   doesn't reflow when a run starts. */
+.index-btn {
+  min-width: 118px;
+}
 .stop-btn {
   color: #fff;
   background: var(--danger);

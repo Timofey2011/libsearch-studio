@@ -2,6 +2,15 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.12.1 — 2026-07-14
+
+Bump manifests 0.12.0 → 0.12.1.
+
+- Fixed ghost buttons showing through behind "Indexing…" and "■ Stop" while
+  an index run is active (WKWebView kept stale pixels of the idle row after
+  the layout shifted; the row now remounts on the state change and the Index
+  button keeps a constant width).
+
 ## v0.12.0 — 2026-07-14
 
 Bump manifests 0.11.0 → 0.12.0. Best-effort formats — ROADMAP-3 complete.
