@@ -100,7 +100,8 @@ mod tests {
         std::fs::write(root.join("notes.txt"), b"x").unwrap(); // M1: txt is ingested
         std::fs::write(root.join("archive.tar.gz"), b"x").unwrap(); // unknown stays out
         std::fs::write(root.join("book.epub"), b"x").unwrap(); // M2: epub is ingested
-        std::fs::write(root.join("book.docx"), b"x").unwrap(); // M4 format: not yet
+        std::fs::write(root.join("book.docx"), b"x").unwrap(); // M4: docx is ingested
+        std::fs::write(root.join("book.pages"), b"x").unwrap(); // M5 format: not yet
         std::fs::create_dir(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/b.PDF"), b"x").unwrap();
         std::fs::write(root.join("sub/l.MD"), b"x").unwrap();
@@ -111,14 +112,15 @@ mod tests {
             root.join("a.pdf").to_string_lossy().into_owned(),
         ];
         let found = discover_books(&paths);
-        assert_eq!(found.len(), 5, "got {found:?}");
+        assert_eq!(found.len(), 6, "got {found:?}");
         assert!(found.iter().any(|p| p.ends_with("a.pdf")));
         assert!(found.iter().any(|p| p.ends_with("sub/b.PDF")));
         assert!(found.iter().any(|p| p.ends_with("notes.txt")));
         assert!(found.iter().any(|p| p.ends_with("sub/l.MD")));
         assert!(found.iter().any(|p| p.ends_with("book.epub")));
+        assert!(found.iter().any(|p| p.ends_with("book.docx")));
         assert!(!found.iter().any(|p| p.ends_with("archive.tar.gz")));
-        assert!(!found.iter().any(|p| p.ends_with("book.docx")));
+        assert!(!found.iter().any(|p| p.ends_with("book.pages")));
     }
 
     #[test]
