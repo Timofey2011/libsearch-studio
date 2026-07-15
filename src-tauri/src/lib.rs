@@ -568,6 +568,16 @@ async fn fast_index_collection(
             ls_core::supported_exts_display()
         ));
     }
+    // §14 hybrid sweep: converter-only formats (doc/pages/webarchive/djvu) never
+    // reach the GPU helper — the standard engine handles them in a follow-up
+    // pass within this same run, so they don't dead-end on GPU-routed machines.
+    // gpu_embed.py's DIRECTED_SKIPS stay as a safety net for custom scripts.
+    let (sweep_files, files): (Vec<String>, Vec<String>) = files.into_iter().partition(|f| {
+        ls_core::ext_of(f)
+            .map(|e| ls_extract::CONVERTED_EXTS.contains(&e))
+            .unwrap_or(false)
+    });
+    let gpu_phase_had_files = !files.is_empty();
 
     let _ = window.emit("index-progress", IndexEvent::Loading);
 
@@ -618,7 +628,8 @@ async fn fast_index_collection(
         }
     };
 
-    let (to_embed, preskipped, silenced, unreadable, remaps, preskip_paths) = {
+    #[allow(clippy::type_complexity)]
+    let (to_embed, preskipped, silenced, unreadable, remaps, preskip_paths, sweep_plan) = {
         let db = state.db()?;
         let _ = db.backfill_source_paths(&coll.id, &paths_by_id);
         let _ = db.gc_skips(&coll.id, &coll.source_paths);
@@ -667,6 +678,47 @@ async fn fast_index_collection(
             .filter(|(_, r)| *r == ls_app::SkipReason::Silenced)
             .count();
         let preskip_paths: Vec<String> = plan.preskips.iter().map(|(p, _)| p.clone()).collect();
+
+        // §14: pre-plan the sweep files with the CPU pipeline so their
+        // metadata repair (state refreshes, moved-file remaps) happens in this
+        // same model-free block — a moved .doc is re-pointed on EVERY run,
+        // exactly like every other format, regardless of what the embed
+        // phases later do.
+        let cpu_caps = ls_app::service::cpu_caps_ver();
+        let sweep_candidates: Vec<std::path::PathBuf> =
+            sweep_files.iter().map(std::path::PathBuf::from).collect();
+        let sctx = ls_app::PlanCtx {
+            collection_id: &coll.id,
+            db: &db,
+            indexed_ids: &indexed,
+            paths_by_id: &paths_by_id,
+            pipeline: "cpu",
+            caps_ver: &cpu_caps,
+            fp_fn: &|p| ls_app::file_fingerprint(p),
+            csig_fn: &|p| ls_app::content_signature(p),
+        };
+        let splan = ls_app::plan_index_run(&sweep_candidates, &sctx).map_err(|e| e.to_string())?;
+        for r in &splan.state_refreshes {
+            let _ = db.refresh_book_state(
+                &coll.id,
+                &r.book_id,
+                &r.fingerprint,
+                r.content_sig.as_deref(),
+                &r.path,
+            );
+        }
+        for m in &splan.remaps {
+            let _ = db.delete_book_state(&coll.id, &m.old_id);
+            let _ = db.set_book_state_ver(
+                &coll.id,
+                &m.new_id,
+                &m.fingerprint,
+                m.content_sig.as_deref().unwrap_or(""),
+                &m.path,
+                m.chunker_ver,
+            );
+        }
+
         (
             plan.to_embed,
             plan.preskips.len() - unreadable.len() - silenced,
@@ -674,10 +726,11 @@ async fn fast_index_collection(
             unreadable,
             plan.remaps,
             preskip_paths,
+            splan,
         )
     };
     // Apply any path re-points now that the DB handle is dropped.
-    for m in &remaps {
+    for m in remaps.iter().chain(sweep_plan.remaps.iter()) {
         store.remap_book(&m.old_id, &m.new_id, &m.path).await.ok();
     }
     let mut by_format: std::collections::BTreeMap<String, (usize, usize)> =
@@ -705,144 +758,127 @@ async fn fast_index_collection(
         );
     }
 
-    if to_embed.is_empty() {
-        let mut by_format: std::collections::BTreeMap<String, (usize, usize)> =
-            std::collections::BTreeMap::new();
-        for p in &preskip_paths {
-            let e = by_format
-                .entry(ls_core::ext_of(p).unwrap_or("other").to_string())
-                .or_default();
-            e.1 += 1;
-        }
-        let stats = IndexStats {
-            books_indexed: 0,
-            books_unchanged: preskipped,
-            books_skipped: silenced,
-            books_failed: unreadable.len(),
-            chunks_written: 0,
-            by_format,
-        };
-        let _ = window.emit(
-            "index-progress",
-            IndexEvent::Finished {
-                stats: stats.clone(),
-            },
-        );
-        return Ok(stats);
-    }
-    let total = to_embed.len();
-
-    let tmp_dir = state.data_dir.join("tmp");
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
-
-    let _ = window.emit("index-progress", IndexEvent::Started { total });
-    let _ = window.emit(
-        "index-log",
-        format!("Embedding {total} new/changed file(s) on the GPU helper…"),
-    );
-
-    // Checkpoint every CHECKPOINT_N books: embed a batch, import it, and commit
-    // its fingerprints. A Stop/crash then loses only the current batch — the rest
-    // stays in the index and the dedup resumes from there on the next run.
-    const CHECKPOINT_N: usize = 40;
-    let mut gi = 0usize; // global book counter for progress numbering
+    // GPU embed phase (skipped entirely when nothing gpu-side needs embedding;
+    // the run then falls through to the sweep and the single merged Finished).
     let mut indexed = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut chunks_written = 0usize;
     let mut cancelled = false;
-    for (bi, batch) in to_embed.chunks(CHECKPOINT_N).enumerate() {
-        if state.cancel.load(Ordering::SeqCst) {
-            cancelled = true;
-            break;
-        }
-        let parquet = tmp_dir.join(format!("fastindex-{collection_id}-{bi}.parquet"));
-        let batch_paths: Vec<String> = batch.iter().map(|it| it.path.clone()).collect();
-        match run_py_batch(
-            &window,
-            &state.cancel,
-            &store,
-            &py,
-            &script,
-            &settings.gpu_device,
-            &parquet,
-            &batch_paths,
-            &mut gi,
-            total,
-        )
-        .await
-        {
-            Err(msg) => {
-                // Batch containment (§2.4): rows discarded, NO state committed
-                // for any file in this batch, run continues with later batches
-                // — except a spawn failure, which would fail them all.
-                let fatal = msg.starts_with("failed to start Python helper");
-                let _ = window.emit(
-                    "index-log",
-                    format!(
-                        "batch {} failed — no state committed, its files retry next run: {msg}",
-                        bi + 1
-                    ),
-                );
-                if fatal {
-                    return Err(msg);
-                }
-                failed += batch.len();
-                gi += batch.len();
-                continue;
-            }
-            Ok(None) => {
+    // A fatal helper-spawn failure no longer aborts the command on the spot:
+    // the sweep needs no Python, so it still runs; the error is returned after.
+    let mut fatal_err: Option<String> = None;
+    if !to_embed.is_empty() {
+        let total = to_embed.len();
+
+        let tmp_dir = state.data_dir.join("tmp");
+        std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+
+        let _ = window.emit("index-progress", IndexEvent::Started { total });
+        let _ = window.emit(
+            "index-log",
+            format!("Embedding {total} new/changed file(s) on the GPU helper…"),
+        );
+
+        // Checkpoint every CHECKPOINT_N books: embed a batch, import it, and commit
+        // its fingerprints. A Stop/crash then loses only the current batch — the rest
+        // stays in the index and the dedup resumes from there on the next run.
+        const CHECKPOINT_N: usize = 40;
+        let mut gi = 0usize; // global book counter for progress numbering
+        for (bi, batch) in to_embed.chunks(CHECKPOINT_N).enumerate() {
+            if state.cancel.load(Ordering::SeqCst) {
                 cancelled = true;
                 break;
             }
-            Ok(Some(res)) => {
-                chunks_written += res.chunks;
-                // Outcome-aware commit (§2.10): state per the sidecar, never
-                // blanket success. fp/csig come from plan time (no recompute).
-                let db = state.db()?;
-                for oc in &res.outcomes {
-                    let it = &batch[oc.i];
-                    match oc.status.as_str() {
-                        "indexed" => {
-                            indexed += 1;
-                            count_fmt(&mut by_format, &it.path, true);
-                            let p = Path::new(&it.path);
-                            let _ = db.set_book_state(
-                                &coll.id,
-                                &ls_app::stable_book_id(p),
-                                &it.fingerprint,
-                                &it.content_sig,
-                                &it.path,
-                            );
-                            let _ = db.erase_skips(&coll.id, &it.path);
+            let parquet = tmp_dir.join(format!("fastindex-{collection_id}-{bi}.parquet"));
+            let batch_paths: Vec<String> = batch.iter().map(|it| it.path.clone()).collect();
+            match run_py_batch(
+                &window,
+                &state.cancel,
+                &store,
+                &py,
+                &script,
+                &settings.gpu_device,
+                &parquet,
+                &batch_paths,
+                &mut gi,
+                total,
+            )
+            .await
+            {
+                Err(msg) => {
+                    // Batch containment (§2.4): rows discarded, NO state committed
+                    // for any file in this batch, run continues with later batches
+                    // — except a spawn failure, which would fail them all.
+                    let fatal = msg.starts_with("failed to start Python helper");
+                    let _ = window.emit(
+                        "index-log",
+                        format!(
+                            "batch {} failed — no state committed, its files retry next run: {msg}",
+                            bi + 1
+                        ),
+                    );
+                    if fatal {
+                        fatal_err = Some(msg);
+                        break;
+                    }
+                    failed += batch.len();
+                    gi += batch.len();
+                    continue;
+                }
+                Ok(None) => {
+                    cancelled = true;
+                    break;
+                }
+                Ok(Some(res)) => {
+                    chunks_written += res.chunks;
+                    // Outcome-aware commit (§2.10): state per the sidecar, never
+                    // blanket success. fp/csig come from plan time (no recompute).
+                    let db = state.db()?;
+                    for oc in &res.outcomes {
+                        let it = &batch[oc.i];
+                        match oc.status.as_str() {
+                            "indexed" => {
+                                indexed += 1;
+                                count_fmt(&mut by_format, &it.path, true);
+                                let p = Path::new(&it.path);
+                                let _ = db.set_book_state(
+                                    &coll.id,
+                                    &ls_app::stable_book_id(p),
+                                    &it.fingerprint,
+                                    &it.content_sig,
+                                    &it.path,
+                                );
+                                let _ = db.erase_skips(&coll.id, &it.path);
+                            }
+                            "skipped" => {
+                                skipped += 1;
+                                count_fmt(&mut by_format, &it.path, false);
+                                let _ = db.upsert_skip(
+                                    &coll.id,
+                                    &it.path,
+                                    "gpu",
+                                    &it.fingerprint,
+                                    &oc.reason,
+                                    &gpu_caps,
+                                );
+                            }
+                            // "error": transient — no state at all, retried next run.
+                            _ => failed += 1,
                         }
-                        "skipped" => {
-                            skipped += 1;
-                            count_fmt(&mut by_format, &it.path, false);
-                            let _ = db.upsert_skip(
-                                &coll.id,
-                                &it.path,
-                                "gpu",
-                                &it.fingerprint,
-                                &oc.reason,
-                                &gpu_caps,
-                            );
-                        }
-                        // "error": transient — no state at all, retried next run.
-                        _ => failed += 1,
                     }
                 }
             }
         }
-    }
 
-    // Build the FTS index once the run settles (cheap to rebuild; skipped on a
-    // cancel — it's rebuilt when a later run completes).
-    if chunks_written > 0 && !cancelled {
-        store.ensure_fts_index().await.map_err(|e| e.to_string())?;
-    }
+        // Build the FTS index once the run settles (cheap to rebuild; skipped on a
+        // cancel or fatal helper failure — it's rebuilt when a later run completes).
+        if chunks_written > 0 && !cancelled && fatal_err.is_none() {
+            store.ensure_fts_index().await.map_err(|e| e.to_string())?;
+        }
+    } // end GPU embed phase
 
-    let stats = IndexStats {
+    let mut stats = IndexStats {
         books_indexed: indexed,
         books_unchanged: preskipped,
         books_skipped: skipped + silenced,
@@ -850,6 +886,132 @@ async fn fast_index_collection(
         chunks_written,
         by_format,
     };
+
+    // ---- §14 standard-engine sweep ----
+    // Metadata repair for sweep formats already happened in the planning block.
+    // Account for their planner outcomes (mirrors the GPU preskip accounting),
+    // then run the embed phase only if something actually needs embedding.
+    let mut sweep_meta = IndexStats::default();
+    for (p, r) in &sweep_plan.preskips {
+        match r {
+            ls_app::SkipReason::Unreadable => {
+                sweep_meta.books_failed += 1;
+                let _ = window.emit(
+                    "index-log",
+                    format!(
+                        "skipped (unreadable — permissions, or an offline cloud placeholder?): {p}"
+                    ),
+                );
+            }
+            ls_app::SkipReason::Silenced => {
+                sweep_meta.books_skipped += 1;
+            }
+            _ => {
+                sweep_meta.books_unchanged += 1;
+            }
+        }
+        sweep_meta.count_format(p, false);
+    }
+    stats.merge(sweep_meta);
+
+    drop(store); // the sweep's Service opens its own handle
+
+    let sweep_to_embed: Vec<String> = sweep_plan
+        .to_embed
+        .iter()
+        .map(|it| it.path.clone())
+        .collect();
+    if !sweep_to_embed.is_empty() && !state.cancel.load(Ordering::SeqCst) {
+        let n = sweep_to_embed.len();
+        if fatal_err.is_some() {
+            let _ = window.emit(
+                "index-log",
+                format!("GPU helper failed to start — running the standard-engine pass for {n} converter-format file(s) anyway"),
+            );
+        }
+        let _ = window.emit(
+            "index-log",
+            format!("Standard-engine pass for {n} converter-format file(s) (doc/pages/webarchive/djvu)…"),
+        );
+        // The embedder load below takes seconds — same rationale as the CPU path.
+        let _ = window.emit("index-progress", IndexEvent::Loading);
+        let models_dir = state.models_dir();
+        let data_dir = state.data_dir.clone();
+        let cancel = state.cancel.clone();
+        let w = window.clone();
+        let coll2 = coll.clone();
+        let sweep_paths = sweep_to_embed.clone();
+        let res = tauri::async_runtime::spawn_blocking(move || -> Result<IndexStats, String> {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(async move {
+                let mut embedder =
+                    Embedder::load(models_dir.join("bge-m3")).map_err(models_missing)?;
+                let counter =
+                    BgeTokenCounter::load(models_dir.join("bge-m3")).map_err(models_missing)?;
+                let svc = Service::new(&data_dir).map_err(|e| e.to_string())?;
+                svc.index_collection(
+                    &coll2,
+                    &sweep_paths,
+                    &mut embedder,
+                    &counter,
+                    || cancel.load(Ordering::SeqCst),
+                    |ev| {
+                        // One run, one Finished: suppress the sweep's own and
+                        // mirror skip reasons into the persistent log — they
+                        // carry the remedy ("install antiword", "brew install
+                        // djvulibre") and must survive the progress line.
+                        if let IndexEvent::Skipped { path, reason, .. } = &ev {
+                            let _ = w.emit("index-log", format!("skipped {path}: {reason}"));
+                        }
+                        if !matches!(ev, IndexEvent::Finished { .. }) {
+                            let _ = w.emit("index-progress", ev);
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+        match res {
+            Ok(s) => stats.merge(s),
+            Err(e) => {
+                // The sweep WAS the run → surface its failure as the command
+                // error. Otherwise contain it: the GPU work is already
+                // committed and reported; these files retry next run (no
+                // skip_state row is written for an embed-phase failure).
+                if !gpu_phase_had_files && fatal_err.is_none() {
+                    return Err(e);
+                }
+                let _ = window.emit("index-log", format!("standard-engine pass failed: {e}"));
+                let mut f = IndexStats::default();
+                for pth in &sweep_to_embed {
+                    f.books_failed += 1;
+                    f.count_format(pth, false);
+                }
+                stats.merge(f);
+            }
+        }
+    }
+
+    if let Some(msg) = fatal_err {
+        // No Finished on this path (the rejected invoke is the terminal signal);
+        // the sweep's results are committed + surfaced via the log.
+        let _ = window.emit(
+            "index-log",
+            format!(
+                "standard-engine pass result: {} indexed, {} unchanged, {} skipped",
+                stats.books_indexed, stats.books_unchanged, stats.books_skipped
+            ),
+        );
+        return Err(msg);
+    }
     let _ = window.emit(
         "index-progress",
         IndexEvent::Finished {
@@ -944,7 +1106,12 @@ async fn setup_gpu_indexing(
         .arg("transformers")
         .arg("onnx")
         .arg("pyarrow")
-        .arg("pymupdf");
+        .arg("pymupdf")
+        // Office deps (tiny next to torch): without them a fresh GPU setup
+        // skips docx/rtf/odt with a "pip install …" reason until installed.
+        .arg("python-docx")
+        .arg("striprtf")
+        .arg("odfpy");
     stream_to_log(
         &window,
         "Installing packages (torch, sentence-transformers, …)",
@@ -2667,6 +2834,26 @@ mod lockstep {
                 );
             }
         }
+    }
+
+    #[test]
+    fn partition_set_matches_gpu_directed_skips() {
+        // Hybrid sweep invariant (§14): fast_index_collection partitions on
+        // ls_extract::CONVERTED_EXTS; gpu_embed.py's DIRECTED_SKIPS is the
+        // safety net for custom scripts. If the sets drift, a directed-skip
+        // outside CONVERTED_EXTS lands in gpu_files and dead-ends again, or a
+        // converted ext missing from DIRECTED_SKIPS reaches fitz on legacy
+        // helpers. py_literal_strings returns dict keys and values
+        // interleaved — keys are the even indices.
+        let kv = py_literal_strings(GPU_EMBED_PY, "DIRECTED_SKIPS");
+        let keys: std::collections::BTreeSet<&str> =
+            kv.iter().step_by(2).map(|s| s.as_str()).collect();
+        let converted: std::collections::BTreeSet<&str> =
+            ls_extract::CONVERTED_EXTS.iter().copied().collect();
+        assert_eq!(
+            keys, converted,
+            "gpu_embed.py DIRECTED_SKIPS keys must equal ls_extract::CONVERTED_EXTS"
+        );
     }
 
     #[test]

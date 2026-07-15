@@ -2,6 +2,25 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.13.0 — 2026-07-14
+
+Bump manifests 0.12.1 → 0.13.0. Hybrid indexing: no format dead-ends.
+
+- **Standard-engine sweep**: on GPU-configured machines, converter-only
+  formats (.doc, .pages, .webarchive, .djvu) are now indexed by the standard
+  engine automatically at the end of the same Index run — previously the GPU
+  helper skipped them with "handled by standard indexing" and nothing ever
+  ran it. One progress stream, one combined summary.
+- Moved converter-format files are re-pointed on every run (metadata repair
+  no longer depends on models loading or the run completing).
+- Converter tools (textutil/antiword/soffice/djvutxt) now run with a hard
+  timeout, so Stop can't get stuck behind a hung conversion.
+- Skip reasons that carry a remedy ("install antiword or LibreOffice",
+  "brew install djvulibre") are now written to the persistent run Log.
+- "Set up search models (auto)" now installs the Word/RTF/OpenDocument
+  helpers (python-docx, striprtf, odfpy) so fresh GPU setups index office
+  documents without a manual pip install.
+
 ## v0.12.1 — 2026-07-14
 
 Bump manifests 0.12.0 → 0.12.1.

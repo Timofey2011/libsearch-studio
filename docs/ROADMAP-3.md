@@ -612,3 +612,50 @@ counts on both pipelines, AND the §3.5 progressive display work (itself 1-2 day
 test matrix). The §3.5 display work is split out as its own line item (**M1b — display**,
 S-M) so the ingest release gate is not squeezed; M1 ingest remains M, and M1+M1b together
 are honestly L.
+
+---
+
+## §14 Post-ship addendum (v0.13.0): the hybrid standard-engine sweep
+
+Shipped after M5 exposed a routing gap: on a GPU-configured machine the single Index
+button always runs the GPU helper, whose §7 directed skips point doc/pages/webarchive/djvu
+at "standard indexing" — which never ran. Design (adversarially critiqued, 17 confirmed
+amendments folded in):
+
+- **Partition, don't filter twice.** `fast_index_collection` splits discovery on
+  `ls_extract::CONVERTED_EXTS`: converter-only formats never enter the GPU plan or batches
+  (no wasted helper spawn, no junk `gpu` skip rows, no double counting).
+  `gpu_embed.py`'s DIRECTED_SKIPS remain as a safety net for custom/legacy scripts; a
+  lockstep test (`partition_set_matches_gpu_directed_skips`) pins the two sets equal.
+- **Metadata repair is unconditional.** The sweep files are pre-planned with the CPU
+  pipeline (`plan_index_run`, `cpu_caps_ver()`) inside the same model-free planning block
+  as the GPU plan; their state refreshes and moved-file remaps apply on every run —
+  regardless of models, cancellation, or GPU failures (invariant: a moved .doc is
+  re-pointed exactly like a moved .pdf).
+- **The embed phase is lazy.** Only when the sweep plan's `to_embed` is non-empty (and
+  Stop wasn't pressed — `state.cancel` checked directly, covering the GPU-empty path) does
+  the run emit Loading, load the CPU embedder, and run `Service::index_collection` over
+  exactly those paths. Steady state pays zero model loads.
+- **One run, one Finished.** The sweep's internal Finished is suppressed; its stats merge
+  (`IndexStats::merge`) into the GPU phase's for a single summary. Its Skipped reasons are
+  mirrored into the persistent index-log (they carry the remedy: "install antiword…",
+  "brew install djvulibre…").
+- **Exit matrix.** GPU `to_embed` empty → sweep runs. Batch loop settle (incl. Stop) →
+  sweep runs unless Stop. Fatal helper-spawn failure → FTS skipped, sweep STILL runs (it
+  needs no Python), then the error is returned without a Finished (the rejected invoke is
+  the frontend's terminal signal; sweep results are committed + logged). Shared-infra
+  failures (tmp dir, SQLite, Lance FTS) → sweep skipped, same error would hit it too.
+  Sweep embed failure → contained (log + counted as failed, no skip_state row) unless the
+  sweep WAS the run (GPU had no files), then it surfaces as the command error.
+- **Converter waits are bounded.** All four converter subprocesses run through
+  `run_bounded` (120s deadline, kill + reap, stdout drained on a thread) so Stop is never
+  wedged behind a hung soffice or a dehydrated-placeholder read. Known remaining seam:
+  pure-Rust reads (cache_key head read, extract_pdf on a cached preview) can still block
+  on dehydrated placeholders — pre-existing, deferred. Threading the cancel flag into
+  ls-extract was considered and deferred (public-API churn for marginal gain once waits
+  are bounded).
+- **Setup installs office deps.** python-docx/striprtf/odfpy join the provisioning pip
+  list, so fresh GPU setups handle docx/rtf/odt natively; existing venvs pick them up on
+  the next Setup run (the caps-hash change then auto-retries old skips).
+- **Frontend.** The sweep phase re-emits `started`: the chunk accumulator now survives
+  phase changes and ETA uses a per-phase clock (`phaseStart`).

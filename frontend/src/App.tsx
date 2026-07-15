@@ -261,6 +261,9 @@ export default function App() {
   const [progress, setProgress] = useState<{ pct: number; label: string } | null>(null);
   const [indexNote, setIndexNote] = useState<string | null>(null);
   const [indexStart, setIndexStart] = useState<number | null>(null);
+  // A GPU run can chain a standard-engine sweep phase; each phase re-emits
+  // "started". ETA math must use the current phase's clock, not the run's.
+  const [phaseStart, setPhaseStart] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(0);
   const [idxCount, setIdxCount] = useState<{ done: number; total: number; chunks: number }>({ done: 0, total: 0, chunks: 0 });
   const [indexLog, setIndexLog] = useState<string[]>([]);
@@ -579,7 +582,9 @@ export default function App() {
       if (ev.kind === "loading") setProgress({ pct: 0, label: "Loading models…" });
       else if (ev.kind === "started") {
         setProgress({ pct: 0, label: `Found ${ev.total} file(s)` });
-        setIdxCount({ done: 0, total: ev.total, chunks: 0 });
+        // chunks accumulate across phases (GPU + sweep report as one run).
+        setIdxCount((c) => ({ done: 0, total: ev.total, chunks: c.chunks }));
+        setPhaseStart(Date.now());
       } else if (ev.kind === "working")
         setProgress({ pct: (ev.total ? (ev.n - 1) / ev.total : 0) * 100, label: `Reading ${file(ev.path)} (${ev.n}/${ev.total})` });
       else if (ev.kind === "embedding") {
@@ -1279,6 +1284,7 @@ export default function App() {
     setIdxCount({ done: 0, total: 0, chunks: 0 });
     const t = Date.now();
     setIndexStart(t);
+    setPhaseStart(t);
     setNowMs(t);
   }
 
@@ -1657,10 +1663,11 @@ export default function App() {
             )}
             {indexing && indexStart && (() => {
               const elapsed = Math.max(0, (nowMs - indexStart) / 1000);
+              const phaseElapsed = Math.max(0, (nowMs - (phaseStart ?? indexStart)) / 1000);
               const rate = elapsed > 0 ? idxCount.chunks / elapsed : 0;
               const eta =
                 idxCount.done > 0 && idxCount.total > 0
-                  ? (elapsed / idxCount.done) * (idxCount.total - idxCount.done)
+                  ? (phaseElapsed / idxCount.done) * (idxCount.total - idxCount.done)
                   : null;
               return (
                 <div className="muted idx-meta" style={{ marginTop: 4 }}>

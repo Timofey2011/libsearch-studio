@@ -51,6 +51,21 @@ pub struct IndexStats {
 }
 
 impl IndexStats {
+    /// Fold another run's stats in (the GPU phase + the standard-engine sweep
+    /// report as ONE run): field sums, by_format entry-wise.
+    pub fn merge(&mut self, other: IndexStats) {
+        self.books_indexed += other.books_indexed;
+        self.books_unchanged += other.books_unchanged;
+        self.books_skipped += other.books_skipped;
+        self.books_failed += other.books_failed;
+        self.chunks_written += other.chunks_written;
+        for (ext, (i, s)) in other.by_format {
+            let e = self.by_format.entry(ext).or_default();
+            e.0 += i;
+            e.1 += s;
+        }
+    }
+
     pub fn count_format(&mut self, path: &str, indexed: bool) {
         let ext = ls_core::ext_of(path).unwrap_or("other").to_string();
         let e = self.by_format.entry(ext).or_default();
@@ -579,6 +594,41 @@ impl Service {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stats_merge_sums_fields_and_by_format() {
+        let mut a = IndexStats {
+            books_indexed: 2,
+            books_unchanged: 10,
+            books_skipped: 1,
+            books_failed: 0,
+            chunks_written: 40,
+            by_format: [("pdf".to_string(), (2usize, 10usize))]
+                .into_iter()
+                .collect(),
+        };
+        let b = IndexStats {
+            books_indexed: 1,
+            books_unchanged: 0,
+            books_skipped: 2,
+            books_failed: 1,
+            chunks_written: 8,
+            by_format: [
+                ("doc".to_string(), (1usize, 2usize)),
+                ("pdf".to_string(), (0usize, 1usize)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        a.merge(b);
+        assert_eq!(a.books_indexed, 3);
+        assert_eq!(a.books_unchanged, 10);
+        assert_eq!(a.books_skipped, 3);
+        assert_eq!(a.books_failed, 1);
+        assert_eq!(a.chunks_written, 48);
+        assert_eq!(a.by_format["pdf"], (2, 11));
+        assert_eq!(a.by_format["doc"], (1, 2));
+    }
+
     use super::*;
 
     #[test]
