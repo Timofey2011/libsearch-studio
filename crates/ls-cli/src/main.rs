@@ -150,7 +150,13 @@ async fn run_maintenance(
     }
     if fix_orphans || fix_stamps || fix_dups || fix_multi {
         let out = ls_app::maintenance::apply(
-            &store, &db, &coll, fix_orphans, fix_stamps, fix_dups, fix_multi,
+            &store,
+            &db,
+            &coll,
+            fix_orphans,
+            fix_stamps,
+            fix_dups,
+            fix_multi,
         )
         .await
         .map_err(anyhow::Error::msg)?;
