@@ -2,6 +2,25 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.14.0 — 2026-07-15
+
+Bump manifests 0.13.0 → 0.14.0. Library hygiene.
+
+- **Maintenance panel** (Settings → Maintenance): scan a library for debris
+  and fix it in one click — entries whose files were deleted, wrong format
+  labels (imported books were stamped "pdf" regardless of type), the same
+  document indexed twice as pdf + docx, and files indexed under duplicate
+  ids. Fixes touch only the index — never your files — and the fix always
+  re-checks the library at apply time, so a stale report can't delete the
+  wrong thing.
+- **Office documents join duplicate-detection**: a document sitting as
+  pdf + docx (or any office pair) with the same name now indexes once —
+  the pdf wins (page-numbered citations, best reader); among office-only
+  pairs the cleaner format wins and .pages never shadows a sibling.
+- An index run and a maintenance fix can no longer run at the same time.
+- Unreachable source folders (unmounted drive, offline share) are reported
+  and their books are never misclassified as missing.
+
 ## v0.13.0 — 2026-07-14
 
 Bump manifests 0.12.1 → 0.13.0. Hybrid indexing: no format dead-ends.

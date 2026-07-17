@@ -3,6 +3,7 @@
 //! calls; it depends on the engine crates but contains no UI code.
 
 pub mod discover;
+pub mod maintenance;
 pub mod plan;
 pub mod service;
 pub mod settings;
@@ -11,6 +12,7 @@ pub mod types;
 
 pub use discover::discover_books;
 pub use ls_extract::stable_book_id;
+pub use maintenance::{FixOutcome, MaintenanceReport};
 pub use plan::{
     plan_index_run, EmbedItem, IndexPlan, PlanCtx, RemapAction, SkipReason, StateRefresh,
 };

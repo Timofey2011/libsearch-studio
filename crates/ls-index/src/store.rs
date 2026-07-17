@@ -208,6 +208,109 @@ impl Store {
         Ok(())
     }
 
+    /// One `(book_id, source_path, format)` triple per book — the raw stored
+    /// format string, deliberately unparsed (classification happens in the
+    /// caller so unparseable stamps are flagged, never silently skipped).
+    pub async fn book_formats(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+        let mut stream = self
+            .table
+            .query()
+            .select(Select::columns(&[
+                "book_id".to_string(),
+                "source_path".to_string(),
+                "format".to_string(),
+            ]))
+            .execute()
+            .await?;
+        let mut map = std::collections::HashMap::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| StoreError::Stream(e.to_string()))?;
+            let bid = str_col(&batch, "book_id")?;
+            let sp = str_col(&batch, "source_path")?;
+            let f = str_col(&batch, "format")?;
+            for i in 0..bid.len() {
+                map.entry(bid.value(i).to_string())
+                    .or_insert_with(|| (sp.value(i).to_string(), f.value(i).to_string()));
+            }
+        }
+        Ok(map.into_iter().map(|(b, (p, f))| (b, p, f)).collect())
+    }
+
+    /// UNCOLLAPSED `(book_id, source_path)` pairs — unlike [`Self::book_paths`]
+    /// (one path per id), this surfaces ids whose rows straddle several paths
+    /// (a partially-failed remap) and paths indexed under several ids.
+    pub async fn book_path_pairs(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, String)>, StoreError> {
+        let mut stream = self
+            .table
+            .query()
+            .select(Select::columns(&[
+                "book_id".to_string(),
+                "source_path".to_string(),
+            ]))
+            .execute()
+            .await?;
+        let mut out = std::collections::HashSet::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| StoreError::Stream(e.to_string()))?;
+            let bid = str_col(&batch, "book_id")?;
+            let sp = str_col(&batch, "source_path")?;
+            for i in 0..bid.len() {
+                out.insert((bid.value(i).to_string(), sp.value(i).to_string()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rewrite the `format` column for many books in one UPDATE per id-chunk
+    /// (each lance update writes new fragments — 231 single-row updates would
+    /// mean 231 table versions).
+    pub async fn restamp_formats(
+        &self,
+        book_ids: &[String],
+        format: &str,
+    ) -> Result<(), StoreError> {
+        let fmt = format.replace('\'', "''");
+        for chunk in book_ids.chunks(256) {
+            let list = chunk
+                .iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.table
+                .update()
+                .only_if(format!("book_id IN ({list})"))
+                .column("format", format!("'{fmt}'"))
+                .execute()
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Delete many books' chunks in one predicate per id-chunk.
+    pub async fn delete_books(&self, book_ids: &[String]) -> Result<(), StoreError> {
+        for chunk in book_ids.chunks(256) {
+            let list = chunk
+                .iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.table.delete(&format!("book_id IN ({list})")).await?;
+        }
+        Ok(())
+    }
+
+    /// Compact fragments and prune stale versions — run after a large
+    /// maintenance batch (updates/deletes write new fragments that FTS
+    /// otherwise flat-scans).
+    pub async fn optimize(&self) -> Result<(), StoreError> {
+        self.table
+            .optimize(lancedb::table::OptimizeAction::All)
+            .await?;
+        Ok(())
+    }
+
     /// Remove all chunks for a book (idempotent re-index).
     pub async fn delete_book(&self, book_id: &str) -> Result<(), StoreError> {
         let safe = book_id.replace('\'', "''");

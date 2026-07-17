@@ -29,23 +29,40 @@ fn walk(dir: &Path, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Book-format preference for same-stem variants of one book sitting in the
-/// same directory (ported from the Python engine's epub>pdf>mobi dedup):
-/// lower rank wins; `None` = not a book variant (text formats always kept).
-fn variant_rank(path: &str) -> Option<u8> {
+/// Book/document-format preference for same-stem variants of one work sitting
+/// in the same directory (ported from the Python engine's epub>pdf>mobi
+/// dedup, extended to office formats in v0.14): lower rank wins; `None` = not
+/// a variant format (md/txt/html etc. are always kept — same-stem notes.md
+/// next to notes.pdf is too often genuinely different content).
+///
+/// Office ordering: pdf beats office twins (page-numbered citations, best
+/// reader, battle-tested extraction); among office-only twins the native
+/// pure-Rust extractors come first (docx/odt/rtf), converter-dependent doc
+/// next (textutil absence heals via the caps retry), and pages LAST — its
+/// extractability depends on the file's embedded preview, a failure no tool
+/// install can retry past, so it must never shadow an extractable sibling.
+/// NOTE: the winner shadows losers BEFORE extraction is attempted, and
+/// discovery never consults skip_state — an unextractable winner hides its
+/// siblings on fresh indexes (bounded: already-indexed loser rows are kept).
+pub(crate) fn variant_rank(path: &str) -> Option<u8> {
     match ls_core::ext_of(path) {
         Some("epub") => Some(0),
         Some("pdf") => Some(1),
         Some("fb2") | Some("fb2.zip") => Some(2),
         Some("mobi") => Some(3),
         Some("azw3") => Some(4),
-        Some("djvu") => Some(5),
+        Some("docx") => Some(5),
+        Some("odt") => Some(6),
+        Some("rtf") => Some(7),
+        Some("doc") => Some(8),
+        Some("pages") => Some(9),
+        Some("djvu") => Some(10),
         _ => None,
     }
 }
 
 /// Directory + lowercase stem, the variant-grouping key.
-fn variant_key(path: &str) -> Option<(String, String)> {
+pub(crate) fn variant_key(path: &str) -> Option<(String, String)> {
     let p = Path::new(path);
     let ext = ls_core::ext_of(path)?;
     let name = p.file_name()?.to_string_lossy().to_lowercase();
@@ -114,15 +131,17 @@ mod tests {
             root.join("a.pdf").to_string_lossy().into_owned(),
         ];
         let found = discover_books(&paths);
-        assert_eq!(found.len(), 7, "got {found:?}");
+        assert_eq!(found.len(), 5, "got {found:?}");
         assert!(found.iter().any(|p| p.ends_with("a.pdf")));
         assert!(found.iter().any(|p| p.ends_with("sub/b.PDF")));
         assert!(found.iter().any(|p| p.ends_with("notes.txt")));
         assert!(found.iter().any(|p| p.ends_with("sub/l.MD")));
         assert!(found.iter().any(|p| p.ends_with("book.epub")));
-        assert!(found.iter().any(|p| p.ends_with("book.docx")));
+        // v0.14: office formats join variant dedup — the epub twin wins over
+        // both the docx and the pages sibling of the same stem.
+        assert!(!found.iter().any(|p| p.ends_with("book.docx")));
+        assert!(!found.iter().any(|p| p.ends_with("book.pages")));
         assert!(!found.iter().any(|p| p.ends_with("archive.tar.gz")));
-        assert!(found.iter().any(|p| p.ends_with("book.pages")));
         assert!(!found.iter().any(|p| p.ends_with("help.chm")));
     }
 
@@ -156,6 +175,35 @@ mod tests {
         assert!(found.iter().any(|p| p.ends_with("only.mobi")));
         assert!(found.iter().any(|p| p.ends_with("sub/guide.pdf")));
         assert!(found.iter().any(|p| p.ends_with("guide.md")));
+        assert_eq!(found.len(), 5, "got {found:?}");
+    }
+
+    #[test]
+    fn office_twins_dedup_pdf_wins_and_pages_never_shadows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // pdf + docx export of one document: only the pdf survives (v0.14).
+        std::fs::write(root.join("report.pdf"), b"x").unwrap();
+        std::fs::write(root.join("report.docx"), b"x").unwrap();
+        // office-only twins: docx beats rtf; pages loses to everything.
+        std::fs::write(root.join("memo.docx"), b"x").unwrap();
+        std::fs::write(root.join("memo.rtf"), b"x").unwrap();
+        std::fs::write(root.join("note.doc"), b"x").unwrap();
+        std::fs::write(root.join("note.pages"), b"x").unwrap();
+        // a lone pages file is still discovered.
+        std::fs::write(root.join("solo.pages"), b"x").unwrap();
+        // text formats are never variant-deduped, even next to a pdf.
+        std::fs::write(root.join("report.md"), b"x").unwrap();
+
+        let found = discover_books(&[root.to_string_lossy().into_owned()]);
+        assert!(found.iter().any(|p| p.ends_with("report.pdf")));
+        assert!(!found.iter().any(|p| p.ends_with("report.docx")));
+        assert!(found.iter().any(|p| p.ends_with("memo.docx")));
+        assert!(!found.iter().any(|p| p.ends_with("memo.rtf")));
+        assert!(found.iter().any(|p| p.ends_with("note.doc")));
+        assert!(!found.iter().any(|p| p.ends_with("note.pages")));
+        assert!(found.iter().any(|p| p.ends_with("solo.pages")));
+        assert!(found.iter().any(|p| p.ends_with("report.md")));
         assert_eq!(found.len(), 5, "got {found:?}");
     }
 

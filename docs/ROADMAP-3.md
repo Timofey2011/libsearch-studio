@@ -659,3 +659,38 @@ amendments folded in):
   the next Setup run (the caps-hash change then auto-retries old skips).
 - **Frontend.** The sweep phase re-emits `started`: the chunk accumulator now survives
   phase changes and ETA uses a per-phase clock (`phaseStart`).
+
+---
+
+## §15 Post-ship addendum (v0.14.0): office variant dedup + the §2.6 Maintenance panel
+
+Adversarially critiqued (14 confirmed amendments). Two features, one theme — library hygiene:
+
+- **Ranking** (discover.rs): office formats join same-stem variant dedup as
+  epub(0) pdf(1) fb2(2) mobi(3) azw3(4) docx(5) odt(6) rtf(7) doc(8) pages(9) djvu(10).
+  Every pre-existing ebook decision is preserved; pdf beats office twins; pages ranks last
+  among office because its extractability depends on file CONTENTS (embedded Preview.pdf) —
+  a failure no tool install can retry past, so it must never shadow an extractable sibling.
+  Known seam (deferred): the winner shadows losers before extraction is attempted and
+  discovery never consults skip_state — a plan-time fallback that re-admits the next-ranked
+  sibling when the sole winner carries an active skip is backlogged.
+- **Maintenance** (ls-app/src/maintenance.rs + Store batch helpers): four scans — store
+  orphans (file gone; dehydrated placeholders pass fs::metadata and are never flagged),
+  manifest-only orphans (book_state rows with no store presence, incl. pre-M0a empty-path
+  rows), format-stamp repair (family-level comparison on the RAW stored string; batched
+  IN-list UPDATEs), duplicate variants (two-level grouping: variant_key → distinct ranked
+  ON-DISK paths; keeper = best on-disk rank) and same-path multi-id rows (keeper = the
+  manifest's id, else the path-derived id). Removal recipe = reindex_book minus the
+  re-embed: store rows under EVERY id holding the path, then clear_book_state_by_path
+  (path-keyed across id schemes — single-id deletion strands manifest rows that would
+  silently shadow a restored file), then erase_skips. `apply` RE-DERIVES targets at apply
+  time (client reports are never trusted) and returns per-category acted-on counts; after
+  any change it rebuilds FTS (updates/deletes write fragments the FTS otherwise
+  flat-scans) and compacts (Store::optimize). Roots that fail fs::metadata are reported as
+  unreachable and everything under them is unjudgeable — never orphaned.
+- **Exclusivity**: AppState.busy (RAII CAS guard) — index runs and maintenance fixes are
+  mutually exclusive in the backend, both directions.
+- **UI**: Maintenance tab (action tab — no Save footer), collection-scoped with the name
+  in every confirm string; fix results show acted-on counts with an explicit drift note
+  when they differ from the scanned counts; the Titles/Index catalog loader now refetches
+  on invalidation (catalog/catalogFor joined its effect deps).

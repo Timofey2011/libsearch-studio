@@ -58,16 +58,32 @@ function fmtDur(sec: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(ss)}` : `${m}:${pad(ss)}`;
 }
 
-type ToolsTab = "collections" | "synthesis" | "retrieval" | "memory" | "indexing" | "general" | "help";
+type ToolsTab = "collections" | "synthesis" | "retrieval" | "memory" | "indexing" | "maintenance" | "general" | "help";
 const TOOLS_TABS: [ToolsTab, string][] = [
   ["collections", "Collections"],
   ["synthesis", "Synthesis"],
   ["retrieval", "Retrieval"],
   ["memory", "Memory"],
   ["indexing", "Indexing"],
+  ["maintenance", "Maintenance"],
   ["general", "General"],
   ["help", "Help"],
 ];
+
+// Mirrors ls_app::maintenance report/outcome shapes (snake_case serde).
+type MaintenanceReport = {
+  orphans: { book_id: string; path: string; kind: string }[];
+  bad_stamps: { book_id: string; path: string; from: string; to: string }[];
+  dup_variants: { keep_path: string; remove: { book_id: string; path: string }[] }[];
+  multi_id: { path: string; keep_id: string; remove_ids: string[] }[];
+  unreachable_roots: { root: string; affected: number }[];
+};
+type FixOutcome = {
+  orphans_removed: number;
+  restamped: number;
+  dup_rows_removed: number;
+  multi_id_removed: number;
+};
 
 // Mirrors ls_llm::estimate_tokens (chars/4 Latin, /2.5 substantially-Cyrillic) —
 // cosmetic counter only; the authoritative numbers come back in PromptMeta.
@@ -258,6 +274,10 @@ export default function App() {
   const [newPaths, setNewPaths] = useState<string[]>([]);
   const [indexing, setIndexing] = useState(false);
   const [indexKind, setIndexKind] = useState<"cpu" | "gpu" | null>(null);
+  const [maintReport, setMaintReport] = useState<MaintenanceReport | null>(null);
+  const [maintFor, setMaintFor] = useState<string | null>(null); // collection the report belongs to
+  const [maintBusy, setMaintBusy] = useState(false);
+  const [maintNote, setMaintNote] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ pct: number; label: string } | null>(null);
   const [indexNote, setIndexNote] = useState<string | null>(null);
   const [indexStart, setIndexStart] = useState<number | null>(null);
@@ -482,8 +502,10 @@ export default function App() {
         setCatalogFor(key);
       })
       .catch(console.error);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mainTab, themeView, collIds]);
+    // catalog/catalogFor in the deps: clearing the cache (Maintenance fixes,
+    // per-book re-index) must REFETCH while Titles/Index is open, not strand
+    // the view on the "Loading…" placeholder.
+  }, [mainTab, themeView, collIds, catalog, catalogFor]);
 
   // Index health for the passive re-index nudge (manifest-only, no folder scan).
   useEffect(() => {
@@ -1960,6 +1982,184 @@ export default function App() {
     );
   }
 
+  async function runMaintScan() {
+    if (!currentColl || maintBusy) return;
+    setMaintBusy(true);
+    setMaintNote(null);
+    try {
+      const r = await invoke<MaintenanceReport>("maintenance_scan", { collectionId: currentColl.id });
+      setMaintReport(r);
+      setMaintFor(currentColl.id);
+    } catch (e) {
+      setMaintNote("Error: " + String(e));
+    }
+    setMaintBusy(false);
+  }
+
+  /// One category per click; targets are re-derived server-side, so the shown
+  /// count can drift from what actually happens — surface that honestly.
+  async function runMaintFix(kind: "orphans" | "stamps" | "dups" | "multi", shown: number) {
+    if (!currentColl || !maintFor || maintBusy) return;
+    const label =
+      kind === "orphans"
+        ? `Remove ${shown} missing-file entr${shown === 1 ? "y" : "ies"} from "${currentColl.name}"?`
+        : kind === "dups"
+          ? `Remove ${shown} duplicate variant(s) from "${currentColl.name}"? The better format of each pair stays indexed.`
+          : kind === "multi"
+            ? `Remove ${shown} duplicate id(s) from "${currentColl.name}"? Each file keeps one entry.`
+            : "";
+    if (label && !confirm(label)) return;
+    setMaintBusy(true);
+    setMaintNote(null);
+    try {
+      const out = await invoke<FixOutcome>("maintenance_fix", {
+        collectionId: maintFor,
+        fixOrphans: kind === "orphans",
+        fixStamps: kind === "stamps",
+        fixDups: kind === "dups",
+        fixMulti: kind === "multi",
+      });
+      const acted =
+        kind === "orphans"
+          ? out.orphans_removed
+          : kind === "stamps"
+            ? out.restamped
+            : kind === "dups"
+              ? out.dup_rows_removed
+              : out.multi_id_removed;
+      let note = `Done — ${acted} ${kind === "stamps" ? "repaired" : "removed"}.`;
+      if (acted !== shown) {
+        note += ` (${shown} were shown — the library changed since your scan; review the fresh scan below.)`;
+      }
+      setMaintNote(note);
+      // Badges/counts may have changed: invalidate the catalog (the loader
+      // effect refetches while Titles/Index is open) and re-scan.
+      setCatalog(null);
+      setCatalogFor("");
+      const r = await invoke<MaintenanceReport>("maintenance_scan", { collectionId: maintFor });
+      setMaintReport(r);
+    } catch (e) {
+      setMaintNote("Error: " + String(e));
+    }
+    setMaintBusy(false);
+  }
+
+  function renderMaintenanceTab() {
+    const r = maintFor === currentColl?.id ? maintReport : null;
+    const dupCount = r ? r.dup_variants.reduce((n, g) => n + g.remove.length, 0) : 0;
+    const multiCount = r ? r.multi_id.reduce((n, m) => n + m.remove_ids.length, 0) : 0;
+    const file = (p: string) => p.split("/").pop();
+    const card = (
+      title: string,
+      count: number,
+      fixLabel: string,
+      onFix: () => void,
+      body: React.ReactNode
+    ) => (
+      <div className="nudge" style={{ marginTop: 8, alignItems: "flex-start" }}>
+        <div style={{ flex: 1 }}>
+          <b style={{ fontSize: 13 }}>
+            {title} ({count})
+          </b>
+          {count > 0 && <div style={{ marginTop: 4 }}>{body}</div>}
+        </div>
+        <button className="mini" disabled={count === 0 || maintBusy || indexing} onClick={onFix}>
+          {fixLabel}
+        </button>
+      </div>
+    );
+    const list = (items: string[]) => (
+      <details>
+        <summary className="muted" style={{ cursor: "pointer", fontSize: 12 }}>
+          show {Math.min(items.length, 50)} of {items.length}
+        </summary>
+        <ul className="path-list" style={{ marginTop: 4 }}>
+          {items.slice(0, 50).map((it, i) => (
+            <li key={i}>
+              <span className="path">{it}</span>
+            </li>
+          ))}
+        </ul>
+      </details>
+    );
+    if (!currentColl) {
+      return <div className="muted">Select a library first.</div>;
+    }
+    return (
+      <div>
+        <h4>{currentColl.name}</h4>
+        {collIds.length > 1 && (
+          <div className="muted" style={{ fontSize: 12 }}>
+            Maintenance runs on this collection only — {collIds.length} selected.
+          </div>
+        )}
+        <p className="muted" style={{ fontSize: 12.5 }}>
+          Scans the index for debris: entries whose files are gone, wrong format labels, and
+          duplicates. Fixes touch only the index — never your files.
+        </p>
+        <div className="row">
+          <button className="primary" disabled={maintBusy || indexing} onClick={runMaintScan}>
+            {maintBusy ? "Working…" : "Scan library"}
+          </button>
+          {maintNote && (
+            <span className={maintNote.startsWith("Error") ? "note-err" : "note-ok"} style={{ fontSize: 12.5 }}>
+              {maintNote}
+            </span>
+          )}
+        </div>
+        {r && (
+          <div style={{ marginTop: 10 }}>
+            {r.unreachable_roots.length > 0 && (
+              <div className="nudge" style={{ marginTop: 8 }}>
+                <span>
+                  ⚠ {r.unreachable_roots.map((u) => u.root).join(", ")} is not reachable right now —
+                  books under it were not checked. Mount it and re-scan.
+                </span>
+              </div>
+            )}
+            {card(
+              "Missing files",
+              r.orphans.length,
+              "Remove from index",
+              () => runMaintFix("orphans", r.orphans.length),
+              list(r.orphans.map((o) => `${file(o.path) ?? "(no path)"}${o.kind === "manifest" ? " · manifest only" : ""}`))
+            )}
+            {card(
+              "Format labels to repair",
+              r.bad_stamps.length,
+              "Repair labels",
+              () => runMaintFix("stamps", r.bad_stamps.length),
+              list(r.bad_stamps.map((b) => `${file(b.path)} — ${b.from} → ${b.to}`))
+            )}
+            {card(
+              "Duplicate variants",
+              dupCount,
+              "Remove duplicates",
+              () => runMaintFix("dups", dupCount),
+              list(
+                r.dup_variants.flatMap((g) =>
+                  g.remove.map((x) => `${file(x.path)} (keeping ${file(g.keep_path)})`)
+                )
+              )
+            )}
+            {card(
+              "Duplicate ids",
+              multiCount,
+              "Remove duplicates",
+              () => runMaintFix("multi", multiCount),
+              list(r.multi_id.map((m) => `${file(m.path)} — ${m.remove_ids.length} extra id(s)`))
+            )}
+            {r.orphans.length + r.bad_stamps.length + dupCount + multiCount === 0 && (
+              <div className="note-ok" style={{ marginTop: 8 }}>
+                Library is clean — nothing to fix.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   function renderIndexingTab() {
     if (!settings) return null;
     return (
@@ -2709,11 +2909,12 @@ export default function App() {
                   {toolsTab === "retrieval" && renderRetrievalTab()}
                   {toolsTab === "memory" && renderMemoryTab()}
                   {toolsTab === "indexing" && renderIndexingTab()}
+                  {toolsTab === "maintenance" && renderMaintenanceTab()}
                   {toolsTab === "general" && renderGeneralTab()}
                   {toolsTab === "help" && renderHelpTab()}
                 </div>
               </div>
-              {toolsTab !== "collections" && toolsTab !== "help" && (
+              {toolsTab !== "collections" && toolsTab !== "help" && toolsTab !== "maintenance" && (
                 <div className="tools-foot">
                   <button className="primary" onClick={saveSettings}>
                     Save

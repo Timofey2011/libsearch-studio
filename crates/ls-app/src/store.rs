@@ -681,6 +681,34 @@ impl Db {
         Ok(n)
     }
 
+    /// Every `(book_id, source_path)` manifest row of a collection — the
+    /// manifest-driven half of the Maintenance orphan scan.
+    pub fn book_state_rows(&self, collection_id: &str) -> Result<Vec<(String, String)>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT book_id, source_path FROM book_state WHERE collection_id = ?1")?;
+        let rows = stmt.query_map(params![collection_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The manifest's book_id for a source path (keeper preference when one
+    /// path is indexed under several id schemes).
+    pub fn book_id_for_source_path(
+        &self,
+        collection_id: &str,
+        source_path: &str,
+    ) -> Result<Option<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT book_id FROM book_state WHERE collection_id = ?1 AND source_path = ?2 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![collection_id, source_path], |r| {
+            r.get::<_, String>(0)
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
     /// A successful index of a file erases its skip records across BOTH
     /// pipelines (plain path-keyed delete).
     pub fn erase_skips(&self, collection_id: &str, source_path: &str) -> Result<(), DbError> {
@@ -708,9 +736,7 @@ impl Db {
         };
         let mut swept = 0usize;
         for p in paths {
-            let covered = source_prefixes
-                .iter()
-                .any(|pre| p == *pre || p.starts_with(&format!("{}/", pre.trim_end_matches('/'))));
+            let covered = path_under_roots(&p, source_prefixes);
             if !covered {
                 swept += self.conn.execute(
                     "DELETE FROM skip_state WHERE collection_id = ?1 AND source_path = ?2",
@@ -742,6 +768,14 @@ impl Db {
         )?;
         Ok(n)
     }
+}
+
+/// The one root-attribution rule (shared by skip GC and Maintenance): a path
+/// belongs to a root when it IS the root or sits under it.
+pub fn path_under_roots(path: &str, roots: &[String]) -> bool {
+    roots.iter().any(|pre| {
+        path == pre.as_str() || path.starts_with(&format!("{}/", pre.trim_end_matches('/')))
+    })
 }
 
 #[cfg(test)]

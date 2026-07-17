@@ -68,6 +68,25 @@ struct AppState {
     ask_cancel: Arc<AtomicBool>,
     /// Set by `cancel_map` to abort an in-flight theme-map build.
     map_cancel: Arc<AtomicBool>,
+    /// Exclusive-writer gate: an index run (CPU or GPU) and a maintenance fix
+    /// must never interleave — both rewrite store rows + book_state.
+    busy: Arc<AtomicBool>,
+}
+
+/// RAII writer-gate: both index commands and maintenance_fix have many early
+/// `?` returns — a clear-at-end would leak the flag on failure.
+struct BusyGuard(Arc<AtomicBool>);
+impl BusyGuard {
+    fn acquire(flag: &Arc<AtomicBool>, whos_running: &str) -> Result<Self, String> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| format!("{whos_running} — wait for it to finish (or press Stop)"))?;
+        Ok(Self(flag.clone()))
+    }
+}
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl AppState {
@@ -244,6 +263,10 @@ async fn index_collection(
     let models_dir = state.models_dir();
     let data_dir = state.data_dir.clone();
     let w = window.clone();
+    let _busy = BusyGuard::acquire(
+        &state.busy,
+        "another index run or maintenance fix is active",
+    )?;
     // Fresh cancellation flag for this run; the loop polls it between files.
     state.cancel.store(false, Ordering::SeqCst);
     let cancel = state.cancel.clone();
@@ -551,6 +574,10 @@ async fn fast_index_collection(
     if std::path::Path::new(&script) == managed_script {
         let _ = std::fs::write(&managed_script, GPU_EMBED_PY);
     }
+    let _busy = BusyGuard::acquire(
+        &state.busy,
+        "another index run or maintenance fix is active",
+    )?;
     // Fresh cancellation flag for this run; we kill the helper if it's set.
     state.cancel.store(false, Ordering::SeqCst);
 
@@ -2632,6 +2659,86 @@ async fn deepen_theme(
     Ok(subs)
 }
 
+/// §2.6 Maintenance: read-only report of index/manifest debris (missing
+/// files, wrong format stamps, duplicate variants, multi-id paths).
+#[tauri::command]
+async fn maintenance_scan(
+    state: State<'_, AppState>,
+    collection_id: String,
+) -> Result<ls_app::MaintenanceReport, String> {
+    let coll = state
+        .db()?
+        .list_collections()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| format!("collection {collection_id} not found"))?;
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<ls_app::MaintenanceReport, String> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        rt.block_on(async move {
+            let store = Store::open_or_create(&coll.db_path, "chunks")
+                .await
+                .map_err(|e| e.to_string())?;
+            let db = Db::open(data_dir.join("app.db")).map_err(|e| e.to_string())?;
+            ls_app::maintenance::scan(&store, &db, &coll).await
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Apply maintenance fixes. Targets are RE-DERIVED server-side at apply time
+/// (never trusts the client's report); returns per-category acted-on counts.
+#[tauri::command]
+async fn maintenance_fix(
+    state: State<'_, AppState>,
+    collection_id: String,
+    fix_orphans: bool,
+    fix_stamps: bool,
+    fix_dups: bool,
+    fix_multi: bool,
+) -> Result<ls_app::FixOutcome, String> {
+    let _busy = BusyGuard::acquire(&state.busy, "an index run is active")?;
+    let coll = state
+        .db()?
+        .list_collections()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| format!("collection {collection_id} not found"))?;
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<ls_app::FixOutcome, String> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        rt.block_on(async move {
+            let store = Store::open_or_create(&coll.db_path, "chunks")
+                .await
+                .map_err(|e| e.to_string())?;
+            let db = Db::open(data_dir.join("app.db")).map_err(|e| e.to_string())?;
+            ls_app::maintenance::apply(
+                &store,
+                &db,
+                &coll,
+                fix_orphans,
+                fix_stamps,
+                fix_dups,
+                fix_multi,
+            )
+            .await
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn init_state() -> AppState {
     // Load embedding models from the local HF cache only (no network at runtime).
     std::env::set_var("HF_HUB_OFFLINE", "1");
@@ -2676,6 +2783,7 @@ fn init_state() -> AppState {
         cancel: Arc::new(AtomicBool::new(false)),
         ask_cancel: Arc::new(AtomicBool::new(false)),
         map_cancel: Arc::new(AtomicBool::new(false)),
+        busy: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -2749,6 +2857,8 @@ pub fn run() {
             data_safety,
             library_catalog,
             reindex_book,
+            maintenance_scan,
+            maintenance_fix,
             extract_preview_text,
             resolve_display_path,
             index_health,

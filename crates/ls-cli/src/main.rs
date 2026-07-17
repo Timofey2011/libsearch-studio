@@ -66,6 +66,28 @@ async fn main() -> Result<()> {
             let coll = args.next().unwrap_or_else(|| "default".into());
             run_plan_soak(&app_dir, &coll).await
         }
+        Some("maintenance") => {
+            // §2.6 headless mirror of the app's Maintenance panel: scan is
+            // read-only; --fix-stamps / --fix-orphans / --fix-dups /
+            // --fix-multi apply the same re-derived fixes the UI applies.
+            let mut app_dir = String::new();
+            let mut coll = "default".to_string();
+            let (mut fo, mut fs_, mut fd, mut fm) = (false, false, false, false);
+            for a in args {
+                match a.as_str() {
+                    "--fix-orphans" => fo = true,
+                    "--fix-stamps" => fs_ = true,
+                    "--fix-dups" => fd = true,
+                    "--fix-multi" => fm = true,
+                    other if app_dir.is_empty() => app_dir = other.to_string(),
+                    other => coll = other.to_string(),
+                }
+            }
+            if app_dir.is_empty() {
+                bail!("usage: ls-cli maintenance <app-data-dir> [collection_id] [--fix-stamps] [--fix-orphans] [--fix-dups] [--fix-multi]");
+            }
+            run_maintenance(&app_dir, &coll, fo, fs_, fd, fm).await
+        }
         Some("gen-exts") => {
             // Regenerate the frontend's extension map from the ls-core
             // canonical list; a freshness test keeps the copy honest.
@@ -78,6 +100,66 @@ async fn main() -> Result<()> {
         }
         _ => bail!("usage: ls-cli <search|ingest|import|backfill-state|gen-exts|ask> ..."),
     }
+}
+
+async fn run_maintenance(
+    app_dir: &str,
+    coll_id: &str,
+    fix_orphans: bool,
+    fix_stamps: bool,
+    fix_dups: bool,
+    fix_multi: bool,
+) -> Result<()> {
+    let db = ls_app::Db::open(Path::new(app_dir).join("app.db")).context("open app.db")?;
+    let coll = db
+        .list_collections()
+        .context("list collections")?
+        .into_iter()
+        .find(|c| c.id == coll_id)
+        .with_context(|| format!("collection '{coll_id}' not found"))?;
+    let store = Store::open_or_create(&coll.db_path, "chunks")
+        .await
+        .context("open store")?;
+    let r = ls_app::maintenance::scan(&store, &db, &coll)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let dup_rows: usize = r.dup_variants.iter().map(|g| g.remove.len()).sum();
+    let multi_rows: usize = r.multi_id.iter().map(|m| m.remove_ids.len()).sum();
+    println!("collection '{}'", coll.name);
+    println!("  missing files (orphans) : {}", r.orphans.len());
+    for o in r.orphans.iter().take(20) {
+        println!("    [{}] {}", o.kind, o.path);
+    }
+    println!("  format labels to repair : {}", r.bad_stamps.len());
+    let mut by_pair: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for b in &r.bad_stamps {
+        *by_pair.entry((b.from.clone(), b.to.clone())).or_default() += 1;
+    }
+    for ((from, to), n) in by_pair {
+        println!("    {from} -> {to}: {n}");
+    }
+    println!("  duplicate variants      : {dup_rows}");
+    for g in r.dup_variants.iter().take(20) {
+        for x in &g.remove {
+            println!("    remove {} (keep {})", x.path, g.keep_path);
+        }
+    }
+    println!("  duplicate ids           : {multi_rows}");
+    for u in &r.unreachable_roots {
+        println!("  UNREACHABLE root (not scanned): {}", u.root);
+    }
+    if fix_orphans || fix_stamps || fix_dups || fix_multi {
+        let out = ls_app::maintenance::apply(
+            &store, &db, &coll, fix_orphans, fix_stamps, fix_dups, fix_multi,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        println!(
+            "APPLIED — orphans removed: {}, restamped: {}, dup rows removed: {}, dup ids removed: {}",
+            out.orphans_removed, out.restamped, out.dup_rows_removed, out.multi_id_removed
+        );
+    }
+    Ok(())
 }
 
 fn models_dir() -> PathBuf {
