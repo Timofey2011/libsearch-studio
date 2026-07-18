@@ -306,6 +306,15 @@ async fn index_collection(
     })
     .await
     .map_err(|e| e.to_string())??;
+    // v0.15 flag lifecycle (same fixed point as the GPU command): a completed,
+    // uncancelled run that planned zero forced work clears the armed flag.
+    if !state.cancel.load(Ordering::SeqCst) && stats.forced == 0 {
+        if let Ok(db) = state.db() {
+            if db.rechunk_pending(&collection_id).unwrap_or(false) {
+                let _ = db.set_rechunk_pending(&collection_id, false);
+            }
+        }
+    }
     Ok(stats)
 }
 
@@ -416,6 +425,9 @@ async fn run_py_batch(
     device: &str,
     parquet: &Path,
     batch: &[String],
+    // Per-file (aligned with `batch`) ids whose chunks the fresh embed
+    // replaces — deleted only for files the sidecar marks "indexed".
+    delete_ids: &[Vec<String>],
     gi: &mut usize,
     total: usize,
 ) -> Result<Option<BatchResult>, String> {
@@ -538,6 +550,22 @@ async fn run_py_batch(
             return Err(e);
         }
     };
+    // Replace, never append (v0.15): the new parquet exists and the sidecar
+    // is validated — drop the old chunks of every file that re-embedded,
+    // under every id scheme, in ONE delete. A failure voids the batch (no
+    // state commits); the files re-embed next run, so a partial delete
+    // self-heals at the cost of a bounded search gap for this batch only.
+    let stale: Vec<String> = outcomes
+        .iter()
+        .filter(|oc| oc.status == "indexed")
+        .flat_map(|oc| delete_ids.get(oc.i).cloned().unwrap_or_default())
+        .collect();
+    if !stale.is_empty() {
+        if let Err(e) = store.delete_books(&stale).await {
+            cleanup();
+            return Err(format!("stale-chunk delete failed: {e}"));
+        }
+    }
     // Import errors (incl. the §2.4 unknown-format hard error) void the batch.
     let chunks = match store.import_parquet(parquet).await {
         Ok(c) => c,
@@ -656,8 +684,20 @@ async fn fast_index_collection(
     };
 
     #[allow(clippy::type_complexity)]
-    let (to_embed, preskipped, silenced, unreadable, remaps, preskip_paths, sweep_plan) = {
+    let (
+        to_embed,
+        preskipped,
+        silenced,
+        unreadable,
+        remaps,
+        preskip_paths,
+        sweep_plan,
+        rechunk,
+        gpu_forced,
+    ) = {
         let db = state.db()?;
+        // Re-chunk armed? (v0.15) Both planners then force legacy books.
+        let rechunk = db.rechunk_pending(&coll.id).unwrap_or(false);
         let _ = db.backfill_source_paths(&coll.id, &paths_by_id);
         let _ = db.gc_skips(&coll.id, &coll.source_paths);
         let candidates: Vec<std::path::PathBuf> =
@@ -671,6 +711,7 @@ async fn fast_index_collection(
             caps_ver: &gpu_caps,
             fp_fn: &|p| ls_app::file_fingerprint(p),
             csig_fn: &|p| ls_app::content_signature(p),
+            rechunk,
         };
         let plan = ls_app::plan_index_run(&candidates, &ctx).map_err(|e| e.to_string())?;
         for r in &plan.state_refreshes {
@@ -723,6 +764,7 @@ async fn fast_index_collection(
             caps_ver: &cpu_caps,
             fp_fn: &|p| ls_app::file_fingerprint(p),
             csig_fn: &|p| ls_app::content_signature(p),
+            rechunk,
         };
         let splan = ls_app::plan_index_run(&sweep_candidates, &sctx).map_err(|e| e.to_string())?;
         for r in &splan.state_refreshes {
@@ -746,6 +788,7 @@ async fn fast_index_collection(
             );
         }
 
+        let gpu_forced = plan.forced_count;
         (
             plan.to_embed,
             plan.preskips.len() - unreadable.len() - silenced,
@@ -754,8 +797,21 @@ async fn fast_index_collection(
             plan.remaps,
             preskip_paths,
             splan,
+            rechunk,
+            gpu_forced,
         )
     };
+    // Uncollapsed (book_id, path) pairs → per-path deletion sets: a re-embedded
+    // book must REPLACE its chunks under every id scheme at that path.
+    let ids_by_path: std::collections::HashMap<String, Vec<String>> = store
+        .book_path_pairs()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .fold(std::collections::HashMap::new(), |mut m, (id, p)| {
+            m.entry(p).or_default().push(id);
+            m
+        });
     // Apply any path re-points now that the DB handle is dropped.
     for m in remaps.iter().chain(sweep_plan.remaps.iter()) {
         store.remap_book(&m.old_id, &m.new_id, &m.path).await.ok();
@@ -819,6 +875,18 @@ async fn fast_index_collection(
             }
             let parquet = tmp_dir.join(format!("fastindex-{collection_id}-{bi}.parquet"));
             let batch_paths: Vec<String> = batch.iter().map(|it| it.path.clone()).collect();
+            let batch_delete_ids: Vec<Vec<String>> = batch
+                .iter()
+                .map(|it| {
+                    let mut ids: Vec<String> =
+                        ids_by_path.get(&it.path).cloned().unwrap_or_default();
+                    let stable = ls_app::stable_book_id(Path::new(&it.path));
+                    if !ids.contains(&stable) {
+                        ids.push(stable);
+                    }
+                    ids
+                })
+                .collect();
             match run_py_batch(
                 &window,
                 &state.cancel,
@@ -828,6 +896,7 @@ async fn fast_index_collection(
                 &settings.gpu_device,
                 &parquet,
                 &batch_paths,
+                &batch_delete_ids,
                 &mut gi,
                 total,
             )
@@ -869,6 +938,15 @@ async fn fast_index_collection(
                                 indexed += 1;
                                 count_fmt(&mut by_format, &it.path, true);
                                 let p = Path::new(&it.path);
+                                // Same-path manifest rows under OTHER id
+                                // schemes go with the chunks they described —
+                                // BEFORE the fresh write (the path-keyed
+                                // delete matches the new row too).
+                                let _ = db.clear_book_state_by_path(
+                                    &coll.id,
+                                    &it.path,
+                                    &ls_app::stable_book_id(p),
+                                );
                                 let _ = db.set_book_state(
                                     &coll.id,
                                     &ls_app::stable_book_id(p),
@@ -911,6 +989,7 @@ async fn fast_index_collection(
         books_skipped: skipped + silenced,
         books_failed: unreadable.len() + failed,
         chunks_written,
+        forced: gpu_forced + sweep_plan.forced_count,
         by_format,
     };
 
@@ -1007,7 +1086,12 @@ async fn fast_index_collection(
         .map_err(|e| e.to_string())
         .and_then(|r| r);
         match res {
-            Ok(s) => stats.merge(s),
+            // The sweep's inner run re-plans its subset and would re-count the
+            // same forced work — the pre-plan above already counted it once.
+            Ok(mut s) => {
+                s.forced = 0;
+                stats.merge(s)
+            }
             Err(e) => {
                 // The sweep WAS the run → surface its failure as the command
                 // error. Otherwise contain it: the GPU work is already
@@ -1024,6 +1108,20 @@ async fn fast_index_collection(
                 }
                 stats.merge(f);
             }
+        }
+    }
+
+    // v0.15 flag lifecycle: the armed flag clears only at the plan-time fixed
+    // point — a COMPLETED run that planned zero forced embeds/twins/legacy
+    // remaps. A run that did force work leaves the flag armed for one cheap
+    // confirming pass; cancels and failures keep it armed (resume).
+    if rechunk && fatal_err.is_none() && !state.cancel.load(Ordering::SeqCst) && stats.forced == 0 {
+        if let Ok(db) = state.db() {
+            let _ = db.set_rechunk_pending(&coll.id, false);
+            let _ = window.emit(
+                "index-log",
+                "re-chunk complete — every indexed book is on the current chunker",
+            );
         }
     }
 
@@ -1573,6 +1671,9 @@ async fn export_note(state: State<'_, AppState>, scope: String) -> Result<String
 struct IndexHealth {
     /// Books whose chunks predate the current chunking scheme (v0.5.8 cross-page).
     legacy_books: usize,
+    /// The armed re-chunk flag (v0.15): persists until an Index run reaches
+    /// the nothing-left-to-force fixed point.
+    rechunk_pending: bool,
 }
 
 /// Per-collection index health for the passive re-index nudge. Reads only the
@@ -1582,7 +1683,9 @@ async fn index_health(
     state: State<'_, AppState>,
     collection_id: String,
 ) -> Result<IndexHealth, String> {
+    let db = state.db()?;
     Ok(IndexHealth {
+        rechunk_pending: db.rechunk_pending(&collection_id).unwrap_or(false),
         legacy_books: state
             .db()?
             .legacy_chunker_count(&collection_id)
@@ -1598,9 +1701,13 @@ async fn reset_chunker_state(
     state: State<'_, AppState>,
     collection_id: String,
 ) -> Result<usize, String> {
-    state
-        .db()?
-        .clear_book_state(&collection_id)
+    // v0.15: ARM the persistent flag — never wipe the manifest (the planner's
+    // store-presence guard made that a silent no-op; the flag survives
+    // restarts and cancelled runs, and the planner forces legacy books).
+    let db = state.db()?;
+    db.set_rechunk_pending(&collection_id, true)
+        .map_err(|e| e.to_string())?;
+    db.legacy_chunker_count(&collection_id)
         .map_err(|e| e.to_string())
 }
 

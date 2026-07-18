@@ -115,7 +115,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chardetng",
  "log",
@@ -5006,7 +5006,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "ls-app"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ls-core",
  "ls-embed",
@@ -5025,7 +5025,7 @@ dependencies = [
 
 [[package]]
 name = "ls-artifacts"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -5033,7 +5033,7 @@ dependencies = [
 
 [[package]]
 name = "ls-cli"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "ls-app",
@@ -5048,14 +5048,14 @@ dependencies = [
 
 [[package]]
 name = "ls-core"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ls-embed"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ls-core",
  "ndarray",
@@ -5068,7 +5068,7 @@ dependencies = [
 
 [[package]]
 name = "ls-extract"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chardetng",
  "ego-tree",
@@ -5090,7 +5090,7 @@ dependencies = [
 
 [[package]]
 name = "ls-index"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5104,7 +5104,7 @@ dependencies = [
 
 [[package]]
 name = "ls-llm"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "futures",
  "ls-query",
@@ -5117,7 +5117,7 @@ dependencies = [
 
 [[package]]
 name = "ls-query"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ls-core",
  "ls-embed",

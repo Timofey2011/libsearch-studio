@@ -299,6 +299,7 @@ async fn run_plan_soak(app_dir: &str, collection_id: &str) -> Result<()> {
         caps_ver: &caps,
         fp_fn: &|p| ls_app::file_fingerprint(p),
         csig_fn: &|p| ls_app::content_signature(p),
+        rechunk: db.rechunk_pending(&coll.id).unwrap_or(false),
     };
     let plan = ls_app::plan_index_run(&candidates, &ctx).context("plan")?;
     let count = |r: &ls_app::SkipReason| {
@@ -329,6 +330,9 @@ async fn run_plan_soak(app_dir: &str, collection_id: &str) -> Result<()> {
     println!("  state refreshes       : {}", plan.state_refreshes.len());
     println!("  remaps (moved files)  : {}", plan.remaps.len());
     println!("  TO EMBED              : {}", plan.to_embed.len());
+    if ctx.rechunk {
+        println!("  RECHUNK ARMED — forced: {}", plan.forced_count);
+    }
     for it in plan.to_embed.iter().take(10) {
         println!("    would embed: {}", it.path);
     }

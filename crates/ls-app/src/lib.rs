@@ -21,7 +21,7 @@ pub use service::{
     ServiceError, CONTENT_SIG_MISSING,
 };
 pub use settings::{ProviderCreds, Settings, SettingsError};
-pub use store::{BookStateHit, Db, DbError};
+pub use store::{BookStateHit, Db, DbError, CURRENT_CHUNKER_VER};
 pub use types::{Citation, Collection, Conversation, Message, Role};
 
 use std::path::PathBuf;

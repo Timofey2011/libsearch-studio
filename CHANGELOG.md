@@ -2,6 +2,24 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.15.0 — 2026-07-17
+
+Bump manifests 0.14.0 → 0.15.0. Re-chunk that actually re-chunks.
+
+- **Fixed: "Re-chunk on next Index" was a silent no-op** — the dedup guard
+  that protects imported libraries from pointless re-embedding also
+  neutralized the re-chunk opt-in (runs finished in minutes having done
+  nothing). It is now a persistent per-library flag: the next Index run
+  genuinely re-embeds every book still on the old chunking scheme.
+- **Resumable**: Stop (or a crash) loses at most the current 40-book batch;
+  the next Index continues from where it stopped. The flag survives
+  restarts and clears itself only when nothing is left to re-chunk.
+- **Fixed: re-embedding could duplicate chunks** — the GPU engine appended
+  a re-embedded book's new chunks without removing the old ones (latent,
+  would have doubled every book during a re-chunk). Both engines now
+  replace chunks, under every historical id a file has ever had.
+- The re-chunk banner now shows persistently while armed.
+
 ## v0.14.0 — 2026-07-15
 
 Bump manifests 0.13.0 → 0.14.0. Library hygiene.

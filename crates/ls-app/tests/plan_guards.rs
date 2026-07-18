@@ -65,7 +65,15 @@ impl World {
 
     /// Also returns how many candidate content-signature reads the plan needed
     /// (scenario (b) asserts the second run does none).
+    fn plan_rechunk(&self, candidates: &[&str]) -> ls_app::IndexPlan {
+        self.plan_counting_mode(candidates, true).0
+    }
+
     fn plan_counting(&self, candidates: &[&str]) -> (ls_app::IndexPlan, usize) {
+        self.plan_counting_mode(candidates, false)
+    }
+
+    fn plan_counting_mode(&self, candidates: &[&str], rechunk: bool) -> (ls_app::IndexPlan, usize) {
         let cands: Vec<PathBuf> = candidates.iter().map(PathBuf::from).collect();
         let csig_reads = Cell::new(0usize);
         let plan = {
@@ -91,6 +99,7 @@ impl World {
                 caps_ver: &self.caps_ver,
                 fp_fn: &fp_fn,
                 csig_fn: &csig_fn,
+                rechunk,
             };
             plan_index_run(&cands, &ctx).unwrap()
         };
@@ -124,8 +133,16 @@ impl World {
                 )
                 .unwrap();
         }
-        // Embeds would stamp state after a successful embed:
+        // Embeds would stamp state after a successful embed (v0.15 commit:
+        // same-path manifest rows across id schemes cleared first):
         for it in &plan.to_embed {
+            self.db
+                .clear_book_state_by_path(
+                    &self.coll,
+                    &it.path,
+                    &ls_app::stable_book_id(std::path::Path::new(&it.path)),
+                )
+                .unwrap();
             self.db
                 .set_book_state(
                     &self.coll,
@@ -451,4 +468,106 @@ fn skip_gc_sweeps_paths_outside_sources() {
         .skip_state_hit(&w.coll, "/elsewhere/out.pdf", "gpu")
         .unwrap()
         .is_none());
+}
+
+// ---- v0.15 re-chunk mode ---------------------------------------------------
+
+/// Store-present book under its stable id with a manifest row at `ver`.
+fn seed_indexed(w: &mut World, path: &str, fp: &str, csig: &str, ver: i64) {
+    let id = ls_app::stable_book_id(std::path::Path::new(path));
+    w.indexed_ids.insert(id.clone());
+    w.paths_by_id.insert(id, path.to_string());
+    w.db.set_book_state_ver(
+        &w.coll,
+        &ls_app::stable_book_id(std::path::Path::new(path)),
+        fp,
+        csig,
+        path,
+        ver,
+    )
+    .unwrap();
+    w.fps.insert(path.to_string(), fp.to_string());
+    w.csigs.insert(path.to_string(), csig.to_string());
+}
+
+/// Re-chunk forces a legacy (ver-0) manifest book with an UNCHANGED file into
+/// the embed queue; after the simulated embed commit the next armed run is the
+/// fixed point (forces nothing) — the flag-clear condition.
+#[test]
+fn rechunk_forces_legacy_books_and_reaches_fixed_point() {
+    let mut w = World::new();
+    // A normally-indexed legacy book: manifest ver 0 under the stable id.
+    seed_indexed(&mut w, "/lib/a.pdf", "1:1", "sig-a", 0);
+    // An imported legacy book: store presence under a legacy id, ver-0 row.
+    w.add_legacy_book("/lib/b.pdf", "legacy-b", "2:2", "sig-b");
+    // A book already on the current chunker: must keep its normal skip.
+    seed_indexed(
+        &mut w,
+        "/lib/c.pdf",
+        "3:3",
+        "sig-c",
+        ls_app::CURRENT_CHUNKER_VER,
+    );
+
+    // Without re-chunk: nothing embeds (the original no-op behavior).
+    let plain = w.plan(&["/lib/a.pdf", "/lib/b.pdf", "/lib/c.pdf"]);
+    assert!(plain.to_embed.is_empty());
+    assert_eq!(plain.forced_count, 0);
+
+    // Armed: both legacy books force; the current-ver book skips.
+    let plan = w.plan_rechunk(&["/lib/a.pdf", "/lib/b.pdf", "/lib/c.pdf"]);
+    let forced: Vec<&str> = plan.to_embed.iter().map(|i| i.path.as_str()).collect();
+    assert_eq!(forced, vec!["/lib/a.pdf", "/lib/b.pdf"], "{plan:?}");
+    assert_eq!(plan.forced_count, 2);
+
+    // Simulate the successful run's commit, then re-plan armed: fixed point.
+    w.apply(&plan);
+    let again = w.plan_rechunk(&["/lib/a.pdf", "/lib/b.pdf", "/lib/c.pdf"]);
+    assert!(again.to_embed.is_empty(), "{again:?}");
+    assert_eq!(again.forced_count, 0, "flag may clear now");
+}
+
+/// Forced content twins embed once per run but BOTH count as pending work, so
+/// the armed flag survives until the deferred twin re-chunks too.
+#[test]
+fn rechunk_twins_defer_but_count_as_pending() {
+    let mut w = World::new();
+    seed_indexed(&mut w, "/lib/t1.pdf", "1:1", "sig-same", 0);
+    seed_indexed(&mut w, "/lib/t2.pdf", "2:2", "sig-same", 0);
+    let plan = w.plan_rechunk(&["/lib/t1.pdf", "/lib/t2.pdf"]);
+    assert_eq!(plan.to_embed.len(), 1, "{plan:?}");
+    assert_eq!(plan.forced_count, 2, "deferred twin still pending");
+}
+
+/// A MOVED legacy file remaps first (ver preserved) and counts as pending —
+/// the flag survives the remap-only run and the NEXT armed run re-chunks it.
+#[test]
+fn rechunk_moved_legacy_remaps_first_then_forces_next_run() {
+    let mut w = World::new();
+    seed_indexed(&mut w, "/lib/old.pdf", "1:1", "sig-m", 0);
+    let old_id = ls_app::stable_book_id(std::path::Path::new("/lib/old.pdf"));
+    // The file moved: same fp/csig at a new path, old path gone.
+    w.fps.remove("/lib/old.pdf");
+    w.csigs.remove("/lib/old.pdf");
+    w.add_new_file("/lib/new.pdf", "1:1", "sig-m");
+
+    let plan = w.plan_rechunk(&["/lib/new.pdf"]);
+    assert!(plan.to_embed.is_empty(), "remap-first: {plan:?}");
+    assert_eq!(plan.remaps.len(), 1);
+    assert_eq!(plan.remaps[0].chunker_ver, 0, "ver preserved");
+    assert_eq!(
+        plan.forced_count, 1,
+        "legacy remap is pending re-chunk work"
+    );
+
+    // Apply the remap; the next armed run forces the embed at the new path.
+    w.apply(&plan);
+    w.indexed_ids.remove(&old_id);
+    let new_id = ls_app::stable_book_id(std::path::Path::new("/lib/new.pdf"));
+    w.indexed_ids.insert(new_id.clone());
+    w.paths_by_id.remove(&old_id);
+    w.paths_by_id.insert(new_id, "/lib/new.pdf".into());
+    let next = w.plan_rechunk(&["/lib/new.pdf"]);
+    assert_eq!(next.to_embed.len(), 1, "{next:?}");
+    assert_eq!(next.forced_count, 1);
 }

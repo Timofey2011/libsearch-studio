@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS collections (
     name         TEXT NOT NULL,
     db_path      TEXT NOT NULL,
     source_paths TEXT NOT NULL,   -- JSON array
-    embed_model  TEXT NOT NULL
+    embed_model  TEXT NOT NULL,
+    rechunk_pending INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS conversations (
     id             TEXT PRIMARY KEY,
@@ -140,6 +141,12 @@ impl Db {
         alter_ignore_duplicate(
             &conn,
             "ALTER TABLE book_state ADD COLUMN content_sig TEXT NOT NULL DEFAULT ''",
+        )?;
+        // Re-chunk armed flag (v0.15): survives restarts; cleared only when an
+        // Index run reaches the plan-time fixed point (nothing left to force).
+        alter_ignore_duplicate(
+            &conn,
+            "ALTER TABLE collections ADD COLUMN rechunk_pending INTEGER NOT NULL DEFAULT 0",
         )?;
         // Chunker version per indexed book; 0 = indexed before the marker existed.
         alter_ignore_duplicate(
@@ -749,6 +756,38 @@ impl Db {
 
     /// How many of a collection's indexed books were chunked by an OLDER scheme
     /// (before [`CURRENT_CHUNKER_VER`]) — the basis of the re-index nudge.
+    /// The re-chunk armed flag (v0.15): set by the nudge's opt-in, read by
+    /// both pipelines' planners, cleared by the commands at the fixed point.
+    pub fn rechunk_pending(&self, collection_id: &str) -> Result<bool, DbError> {
+        let v: i64 = self.conn.query_row(
+            "SELECT rechunk_pending FROM collections WHERE id = ?1",
+            params![collection_id],
+            |r| r.get(0),
+        )?;
+        Ok(v != 0)
+    }
+
+    pub fn set_rechunk_pending(&self, collection_id: &str, pending: bool) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE collections SET rechunk_pending = ?2 WHERE id = ?1",
+            params![collection_id, pending as i64],
+        )?;
+        Ok(())
+    }
+
+    /// A single book's chunker version from the manifest (None = no row).
+    pub fn book_chunker_ver(
+        &self,
+        collection_id: &str,
+        book_id: &str,
+    ) -> Result<Option<i64>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT chunker_ver FROM book_state WHERE collection_id = ?1 AND book_id = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![collection_id, book_id], |r| r.get::<_, i64>(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
     pub fn legacy_chunker_count(&self, collection_id: &str) -> Result<usize, DbError> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM book_state WHERE collection_id = ?1 AND chunker_ver < ?2",

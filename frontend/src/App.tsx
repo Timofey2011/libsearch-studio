@@ -263,6 +263,9 @@ export default function App() {
   const [legacyBooks, setLegacyBooks] = useState(0);
   const [nudgeDismissed, setNudgeDismissed] = useState(false);
   const [rechunkNote, setRechunkNote] = useState<string | null>(null);
+  // Persistent re-chunk armed flag (v0.15) — sourced from index_health, so it
+  // survives restarts and clears itself once a run reaches the fixed point.
+  const [rechunkArmed, setRechunkArmed] = useState(false);
   const [settingsNote, setSettingsNote] = useState<string | null>(null);
   // Per-provider key-check result: validated chat models for the dropdown.
   const [probe, setProbe] = useState<
@@ -510,11 +513,14 @@ export default function App() {
   // Index health for the passive re-index nudge (manifest-only, no folder scan).
   useEffect(() => {
     if (!toolsOpen || toolsTab !== "collections" || !currentColl) return;
-    invoke<{ legacy_books: number }>("index_health", { collectionId: currentColl.id })
-      .then((h) => setLegacyBooks(h.legacy_books))
+    invoke<{ legacy_books: number; rechunk_pending: boolean }>("index_health", { collectionId: currentColl.id })
+      .then((h) => {
+        setLegacyBooks(h.legacy_books);
+        setRechunkArmed(h.rechunk_pending);
+      })
       .catch(console.error);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [toolsOpen, toolsTab, currentColl?.id, indexing]);
+  }, [toolsOpen, toolsTab, indexing, currentColl?.id, indexing]);
 
   // Populate the model dropdown. Model listing is best-effort: cloud /models can
   // omit chat models and include image/embedding ones (e.g. Fireworks lists flux
@@ -1653,7 +1659,13 @@ export default function App() {
                 Delete collection
               </button>
             </div>
-            {legacyBooks > 0 && !nudgeDismissed && !rechunkNote && (
+            {rechunkArmed && !rechunkNote && (
+              <div className="note-ok" style={{ marginTop: 6, fontSize: 12.5 }}>
+                Re-chunk armed — the next Index / Re-index re-embeds {legacyBooks} legacy book(s)
+                with the current chunker. A cancelled run resumes where it left off.
+              </div>
+            )}
+            {legacyBooks > 0 && !nudgeDismissed && !rechunkNote && !rechunkArmed && (
               <div className="nudge">
                 <span>
                   {legacyBooks} book(s) were indexed with an older chunking scheme. Answers work fine, but re-chunking
@@ -1893,8 +1905,8 @@ export default function App() {
     if (!ok) return;
     try {
       const n = await invoke<number>("reset_chunker_state", { collectionId: coll.id });
-      setLegacyBooks(0);
-      setRechunkNote(`Ready — click Index / Re-index to re-embed ${n} book(s) with the current chunker.`);
+      setRechunkArmed(true);
+      setRechunkNote(`Armed — the next Index / Re-index re-embeds ${n} legacy book(s) with the current chunker. A cancelled run resumes where it left off.`);
     } catch (e) {
       setRechunkNote("Error: " + String(e));
     }

@@ -694,3 +694,38 @@ Adversarially critiqued (14 confirmed amendments). Two features, one theme — l
   in every confirm string; fix results show acted-on counts with an explicit drift note
   when they differ from the scanned counts; the Titles/Index catalog loader now refetches
   on invalidation (catalog/catalogFor joined its effect deps).
+
+---
+
+## §16 Post-ship addendum (v0.15.0): re-chunk that actually re-chunks
+
+User-caught: the v0.6.2 "Re-chunk on next Index" opt-in (clear book_state) became a
+structural no-op — the planner's stage-3-by-id store-presence guard re-skips and re-seeds
+every store-present book. Tracing it exposed a second latent bug: the GPU batch commit
+imported parquet without deleting a re-embedded book's old chunks (the CPU path deleted,
+but only under one id scheme). Fix (adversarially critiqued, 9 confirmed amendments):
+
+- **Persistent flag**: collections.rechunk_pending (SCHEMA+ALTER). The opt-in ARMS it;
+  nothing is wiped. index_health reports it; the UI shows a persistent armed banner.
+- **Planner re-chunk mode**: PlanCtx.rechunk. After stage 0.5, a candidate whose manifest
+  chunker_ver < CURRENT (or with store presence but no manifest row — by id or by path)
+  is forced into to_embed. Current-ver books keep their normal skips, so a cancelled run
+  RESUMES (checkpoint batches commit ver-CURRENT rows). A MOVED legacy file cannot be
+  force-embedded (its new path/id miss every membership test) — it remaps first, ver
+  preserved, and re-chunks on the next armed run.
+- **forced_count**: IndexPlan counts pending re-chunk work — forced embeds, forced twins
+  deferred as in-run duplicates, and remaps of legacy-ver rows. IndexStats.forced carries
+  it (sweep's inner re-plan zeroed before merge to avoid double counting).
+- **Flag lifecycle**: both commands clear the flag only at the plan-time fixed point —
+  a completed, uncancelled run with forced == 0. A run that forced work leaves the flag
+  armed for one cheap confirming pass. The nudge's legacy_chunker_count is a DIFFERENT
+  zero: residue after flag-clear means rows Index cannot fix (silenced skips, deleted
+  files) — Maintenance territory.
+- **Replace, never append**: per-path deletion sets from the UNCOLLAPSED store scan
+  (book_path_pairs) — every id a path has ever had. CPU: delete_books before add_chunks.
+  GPU: one delete_books per batch for sidecar-"indexed" files, after sidecar validation,
+  before import_parquet (a failed import self-heals next run; bounded search gap for that
+  batch only). Both commits also clear_book_state_by_path BEFORE the fresh write (the
+  path-keyed delete would otherwise remove the new row) — kills the legacy-id manifest
+  rows that would otherwise hold the legacy count above zero forever.
+- plan-soak reads the flag: arming + soak previews the forced set without embedding.

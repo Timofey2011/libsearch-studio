@@ -43,6 +43,10 @@ pub struct IndexStats {
     pub books_skipped: usize,
     pub books_failed: usize,
     pub chunks_written: usize,
+    /// Pending re-chunk work this run planned (forced embeds + forced twins +
+    /// legacy remaps). The armed flag clears only at forced == 0.
+    #[serde(default)]
+    pub forced: usize,
     /// Per-extension `(indexed, skipped-or-failed)` counts — what makes the
     /// first post-upgrade re-scope run legible ("indexed 12 md, 3 txt ·
     /// skipped 480 pdf"). Additive; absent entries mean zero.
@@ -59,6 +63,7 @@ impl IndexStats {
         self.books_skipped += other.books_skipped;
         self.books_failed += other.books_failed;
         self.chunks_written += other.chunks_written;
+        self.forced += other.forced;
         for (ext, (i, s)) in other.by_format {
             let e = self.by_format.entry(ext).or_default();
             e.0 += i;
@@ -348,6 +353,8 @@ impl Service {
         // sources, and compute this run's CPU capabilities hash (§2.8).
         let _ = self.db.gc_skips(&collection.id, &collection.source_paths);
         let caps_ver = cpu_caps_ver();
+        // Re-chunk armed? (v0.15) Planner then forces legacy-chunker books.
+        let rechunk = self.db.rechunk_pending(&collection.id).unwrap_or(false);
         // Best-effort formats (§7) convert into the app-owned cache; the
         // original file keeps identity (§0.b).
         let conv_dir = self.data_dir.join("converted");
@@ -364,8 +371,21 @@ impl Service {
             caps_ver: &caps_ver,
             fp_fn: &|p| file_fingerprint(p),
             csig_fn: &|p| content_signature(p),
+            rechunk,
         };
         let plan = crate::plan::plan_index_run(&candidates, &ctx)?;
+        stats.forced = plan.forced_count;
+        // Uncollapsed (book_id, path) pairs → per-path deletion sets: a
+        // re-embedded book must replace chunks under EVERY id at its path.
+        let ids_by_path: std::collections::HashMap<String, Vec<String>> = store
+            .book_path_pairs()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .fold(std::collections::HashMap::new(), |mut m, (id, p)| {
+                m.entry(p).or_default().push(id);
+                m
+            });
 
         // Metadata-only actions first: manifest refreshes, then moved-file
         // re-points (chunk metadata rewrite, no re-embedding).
@@ -533,10 +553,21 @@ impl Service {
                     chunks_total,
                 });
             }
-            store.delete_book(&doc.book_id).await.ok();
+            // Replace, never append: drop old chunks under every id at this
+            // path, and clear same-path manifest rows across id schemes
+            // BEFORE the fresh write (the path-keyed delete would otherwise
+            // remove the row we are about to insert).
+            let mut old_ids: Vec<String> =
+                ids_by_path.get(path.as_str()).cloned().unwrap_or_default();
+            if !old_ids.contains(&doc.book_id) {
+                old_ids.push(doc.book_id.clone());
+            }
+            store.delete_books(&old_ids).await?;
             stats.chunks_written += store.add_chunks(&chunks).await?;
             stats.books_indexed += 1;
             wrote = true;
+            self.db
+                .clear_book_state_by_path(&collection.id, path, &doc.book_id)?;
             self.db
                 .set_book_state(&collection.id, &doc.book_id, fp, csig, path)?;
             stats.count_format(path, true);
@@ -602,6 +633,7 @@ mod tests {
             books_skipped: 1,
             books_failed: 0,
             chunks_written: 40,
+            forced: 1,
             by_format: [("pdf".to_string(), (2usize, 10usize))]
                 .into_iter()
                 .collect(),
@@ -612,6 +644,7 @@ mod tests {
             books_skipped: 2,
             books_failed: 1,
             chunks_written: 8,
+            forced: 2,
             by_format: [
                 ("doc".to_string(), (1usize, 2usize)),
                 ("pdf".to_string(), (0usize, 1usize)),
@@ -625,6 +658,7 @@ mod tests {
         assert_eq!(a.books_skipped, 3);
         assert_eq!(a.books_failed, 1);
         assert_eq!(a.chunks_written, 48);
+        assert_eq!(a.forced, 3);
         assert_eq!(a.by_format["pdf"], (2, 11));
         assert_eq!(a.by_format["doc"], (1, 2));
     }

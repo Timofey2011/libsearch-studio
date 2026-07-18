@@ -82,6 +82,12 @@ pub struct IndexPlan {
     pub preskips: Vec<(String, SkipReason)>,
     pub remaps: Vec<RemapAction>,
     pub state_refreshes: Vec<StateRefresh>,
+    /// Re-chunk work this plan still carries: forced embeds, forced twins
+    /// deferred as in-run duplicates, and remaps of legacy-version rows (the
+    /// moved book re-chunks NEXT run, after the re-point). The commands clear
+    /// the armed flag only when a completed run planned ZERO of these — the
+    /// fixed point where re-running would force nothing.
+    pub forced_count: usize,
 }
 
 /// Planner context: everything the pure pre-filter needs from the world.
@@ -104,6 +110,9 @@ pub struct PlanCtx<'a> {
     pub caps_ver: &'a str,
     pub fp_fn: &'a dyn Fn(&Path) -> String,
     pub csig_fn: &'a dyn Fn(&Path) -> String,
+    /// Re-chunk mode (v0.15): books whose chunks predate CURRENT_CHUNKER_VER
+    /// bypass the unchanged-skip guards into the embed queue.
+    pub rechunk: bool,
 }
 
 impl PlanCtx<'_> {
@@ -167,6 +176,49 @@ pub fn plan_index_run(candidates: &[PathBuf], ctx: &PlanCtx) -> Result<IndexPlan
             }
         }
 
+        // Re-chunk mode (v0.15): a book whose chunks predate the current
+        // chunker is forced into the embed queue even though nothing about
+        // the file changed. Books already at CURRENT_CHUNKER_VER keep their
+        // normal skips — a cancelled re-chunk therefore RESUMES (each
+        // checkpointed batch commits ver-CURRENT rows). A MOVED legacy file
+        // never lands here: its new path/id miss every membership test below,
+        // so it falls through to the normal stage-2/-4 remap (re-point first,
+        // re-chunk on the next armed run — counted below so the flag survives
+        // the intermediate run).
+        if ctx.rechunk {
+            let legacy = match ctx.db.book_chunker_ver(ctx.collection_id, &book_id)? {
+                Some(v) => v < crate::CURRENT_CHUNKER_VER,
+                // No manifest row but chunks in the store (possibly under a
+                // legacy id at this same path) → legacy by definition.
+                None => {
+                    ctx.indexed_ids.contains(&book_id)
+                        || ctx.paths_by_id.values().any(|p| p == &path_str)
+                }
+            };
+            if legacy {
+                let csig = (ctx.csig_fn)(cand);
+                if is_sig_sentinel(&csig) {
+                    // Unreadable can't progress by re-running: not counted.
+                    plan.preskips.push((path_str, SkipReason::Unreadable));
+                    continue;
+                }
+                if seen_content.contains_key(&csig) {
+                    // Forced twin deferred this run — still pending work.
+                    plan.forced_count += 1;
+                    plan.preskips.push((path_str, SkipReason::DuplicateInRun));
+                    continue;
+                }
+                seen_content.insert(csig.clone(), book_id.clone());
+                plan.forced_count += 1;
+                plan.to_embed.push(EmbedItem {
+                    path: path_str,
+                    fingerprint: fp,
+                    content_sig: csig,
+                });
+                continue;
+            }
+        }
+
         // Stage 1: unchanged file under its own path-derived id.
         if ctx
             .db
@@ -204,7 +256,11 @@ pub fn plan_index_run(candidates: &[PathBuf], ctx: &PlanCtx) -> Result<IndexPlan
                     continue;
                 }
                 if !is_sig_sentinel(&hit.content_sig) && csig == hit.content_sig {
-                    // Confirmed move: re-point chunks, no re-embed.
+                    // Confirmed move: re-point chunks, no re-embed. Under
+                    // re-chunk, a legacy row moving is still-pending work.
+                    if ctx.rechunk && hit.chunker_ver < crate::CURRENT_CHUNKER_VER {
+                        plan.forced_count += 1;
+                    }
                     plan.remaps.push(RemapAction {
                         old_id: hit.book_id,
                         new_id: book_id,
@@ -333,6 +389,9 @@ fn stage_3_4(
         }
         if hit.book_id != book_id {
             // Genuine move (content proves identity).
+            if ctx.rechunk && hit.chunker_ver < crate::CURRENT_CHUNKER_VER {
+                plan.forced_count += 1;
+            }
             plan.remaps.push(RemapAction {
                 old_id: hit.book_id,
                 new_id: book_id.to_string(),
