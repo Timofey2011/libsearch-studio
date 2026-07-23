@@ -465,13 +465,15 @@ async fn run_py_batch(
                 let _ = window.emit("index-log", line.clone());
                 match parse_py_progress(&line) {
                     // Display only — authoritative outcomes come from the sidecar.
+                    // n is clamped: bisect retries re-print books, and the counter
+                    // must never exceed the total (or push the ETA negative).
                     PyProgress::Book { title, chunks } => {
                         *gi += 1;
-                        let _ = window.emit("index-progress", IndexEvent::Indexed { n: *gi, total, title, chunks });
+                        let _ = window.emit("index-progress", IndexEvent::Indexed { n: (*gi).min(total), total, title, chunks });
                     }
                     PyProgress::Skip { path, reason } => {
                         *gi += 1;
-                        let _ = window.emit("index-progress", IndexEvent::Skipped { n: *gi, total, path, reason });
+                        let _ = window.emit("index-progress", IndexEvent::Skipped { n: (*gi).min(total), total, path, reason });
                     }
                     PyProgress::Other => {}
                 }
@@ -925,13 +927,24 @@ async fn fast_index_collection(
         // Checkpoint every CHECKPOINT_N books: embed a batch, import it, and commit
         // its fingerprints. A Stop/crash then loses only the current batch — the rest
         // stays in the index and the dedup resumes from there on the next run.
+        //
+        // Batches live in a work-queue rather than a fixed iterator: when the
+        // helper dies wholesale (a native GPU/Metal abort no Python try can
+        // catch), the batch is split in half and both halves retried, until the
+        // one book that kills the process stands alone — it then gets a real
+        // caps-scoped skip (quarantine) instead of poisoning a batch every run.
         const CHECKPOINT_N: usize = 40;
         let mut gi = 0usize; // global book counter for progress numbering
-        for (bi, batch) in to_embed.chunks(CHECKPOINT_N).enumerate() {
+        let mut queue: std::collections::VecDeque<Vec<ls_app::EmbedItem>> =
+            to_embed.chunks(CHECKPOINT_N).map(|c| c.to_vec()).collect();
+        let mut seq = 0usize; // helper-attempt counter (batch numbering + tmp names)
+        while let Some(batch) = queue.pop_front() {
             if state.cancel.load(Ordering::SeqCst) {
                 cancelled = true;
                 break;
             }
+            seq += 1;
+            let bi = seq - 1;
             let parquet = tmp_dir.join(format!("fastindex-{collection_id}-{bi}.parquet"));
             let batch_paths: Vec<String> = batch.iter().map(|it| it.path.clone()).collect();
             let batch_delete_ids: Vec<Vec<String>> = batch
@@ -946,6 +959,7 @@ async fn fast_index_collection(
                     ids
                 })
                 .collect();
+            let gi_before = gi;
             match run_py_batch(
                 &window,
                 &state.cancel,
@@ -961,22 +975,68 @@ async fn fast_index_collection(
             {
                 Err(msg) => {
                     // Batch containment (§2.4): rows discarded, NO state committed
-                    // for any file in this batch, run continues with later batches
-                    // — except a spawn failure, which would fail them all.
+                    // for any file in this batch — except a spawn failure, which
+                    // would fail them all. The failed attempt's progress lines
+                    // weren't terminal (its books re-run below), so roll gi back.
                     let fatal = msg.starts_with("failed to start Python helper");
-                    let _ = window.emit(
-                        "index-log",
-                        format!(
-                            "batch {} failed — no state committed, its files retry next run: {msg}",
-                            bi + 1
-                        ),
-                    );
                     if fatal {
                         fatal_err = Some(msg);
                         break;
                     }
-                    failed += batch.len();
-                    gi += batch.len();
+                    gi = gi_before;
+                    if batch.len() > 1 {
+                        // Bisect: retry both halves next; repeated splits corner
+                        // the one book whose embedding kills the helper process.
+                        let mid = batch.len() / 2;
+                        let _ = window.emit(
+                            "index-log",
+                            format!(
+                                "batch {} failed — bisecting {} books into {}+{} to isolate the culprit: {msg}",
+                                bi + 1,
+                                batch.len(),
+                                mid,
+                                batch.len() - mid
+                            ),
+                        );
+                        let (a, b) = batch.split_at(mid);
+                        queue.push_front(b.to_vec());
+                        queue.push_front(a.to_vec());
+                    } else {
+                        // Alone (max free GPU memory) and still crashing: this
+                        // book is the culprit. Quarantine with a caps-scoped
+                        // skip so it stops voiding batches — retried only when
+                        // capabilities (python env / GPU) change.
+                        let it = &batch[0];
+                        gi += 1;
+                        skipped += 1;
+                        count_fmt(&mut by_format, &it.path, false);
+                        let reason = format!(
+                            "embedding crashed the GPU helper even in isolation — quarantined: {}",
+                            msg.lines().next().unwrap_or("unknown error")
+                        );
+                        let db = state.db()?;
+                        let _ = db.upsert_skip(
+                            &coll.id,
+                            &it.path,
+                            "gpu",
+                            &it.fingerprint,
+                            &reason,
+                            &gpu_caps,
+                        );
+                        let _ = window.emit(
+                            "index-log",
+                            format!("book quarantined (crashes the helper): {}", it.path),
+                        );
+                        let _ = window.emit(
+                            "index-progress",
+                            IndexEvent::Skipped {
+                                n: gi.min(total),
+                                total,
+                                path: it.path.clone(),
+                                reason,
+                            },
+                        );
+                    }
                     continue;
                 }
                 Ok(None) => {

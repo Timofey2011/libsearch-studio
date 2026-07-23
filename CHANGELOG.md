@@ -2,6 +2,24 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.15.3 — 2026-07-23
+
+Bump manifests 0.15.2 → 0.15.3.
+
+- **Fixed: books that crash the GPU helper at the native (Metal) level no
+  longer poison batches forever.** v0.15.2 contained Python-level embedding
+  failures, but the worst books kill the helper process outright — voiding
+  their whole batch, and again on every later run. A failed batch is now
+  bisected: both halves retry, splits repeat until the culprit stands
+  alone, and a book that crashes the helper even in isolation gets a real,
+  visible skip (quarantine) instead of being retried forever. Quarantined
+  books re-attempt automatically when the Python env/GPU capabilities
+  change, or after Maintenance clears their skip.
+- **Fixed: the progress counter could exceed the total (e.g. "663/562")
+  with a bogus "ETA 0:00".** Failed batches were double-counted; retried
+  books are no longer counted twice and the counter is clamped so it can
+  never pass the total.
+
 ## v0.15.2 — 2026-07-23
 
 Bump manifests 0.15.1 → 0.15.2.

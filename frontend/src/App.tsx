@@ -1701,7 +1701,8 @@ export default function App() {
               const rate = elapsed > 0 ? idxCount.chunks / elapsed : 0;
               const eta =
                 idxCount.done > 0 && idxCount.total > 0
-                  ? (phaseElapsed / idxCount.done) * (idxCount.total - idxCount.done)
+                  ? (phaseElapsed / idxCount.done) *
+                    Math.max(0, idxCount.total - idxCount.done)
                   : null;
               return (
                 <div className="muted idx-meta" style={{ marginTop: 4 }}>
