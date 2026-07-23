@@ -31,7 +31,7 @@ import pathlib
 import sys
 import time
 
-SCRIPT_VERSION = 7
+SCRIPT_VERSION = 8
 
 # The extension universe this script handles / deliberately skips. The Rust
 # lockstep test parses these literals out of the embedded script and asserts
@@ -619,6 +619,12 @@ def main() -> None:
                 })
             writer.write_table(pa.Table.from_pylist(rows, schema=schema))
             outcomes.append({"i": idx, "status": "indexed", "chunks": len(rows)})
+            # MPS memory is unified system memory and torch's cache never
+            # returns it to the OS — several huge books in one process crash
+            # the helper (Metal abort). Release after EVERY book, not only on
+            # failure; ~ms cost vs seconds of embedding.
+            del vectors
+            _free_mps()
             total_chunks += len(rows)
             rate = len(rows) / dt if dt > 0 else 0.0
             elapsed = time.perf_counter() - t_run

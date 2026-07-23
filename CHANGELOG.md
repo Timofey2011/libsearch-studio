@@ -2,6 +2,19 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.15.4 — 2026-07-23
+
+Bump manifests 0.15.3 → 0.15.4.
+
+- **Fixed the root cause of the batch crashes: the GPU helper leaked memory
+  across books.** The v0.15.3 bisect revealed the crashes were cumulative,
+  not per-book — every book in a "failing" batch embedded fine alone, but a
+  few very large PDFs in one helper process exhausted unified memory
+  (torch's MPS cache never returns memory to the OS) and killed the helper
+  at the Metal level. The helper (v8) now releases the MPS cache after
+  every book, so full 40-book batches survive the heaviest cohorts. The
+  v0.15.3 bisect stays as the safety net.
+
 ## v0.15.3 — 2026-07-23
 
 Bump manifests 0.15.2 → 0.15.3.
