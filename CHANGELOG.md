@@ -2,6 +2,19 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.15.2 — 2026-07-23
+
+Bump manifests 0.15.1 → 0.15.2.
+
+- **Fixed: one problematic book could void its whole 40-book batch.** An
+  embedding failure (e.g. the GPU running out of memory on a very large
+  PDF) crashed the helper mid-batch, discarding all 40 books' work — and
+  during a re-chunk this repeated every batch, silently re-embedding the
+  same books over and over. The helper now contains failures per book:
+  it frees GPU memory, retries the book once with a smaller micro-batch,
+  and if it still fails records an honest per-book error while the other
+  39 books commit normally.
+
 ## v0.15.1 — 2026-07-22
 
 Bump manifests 0.15.0 → 0.15.1.

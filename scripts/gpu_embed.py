@@ -31,7 +31,7 @@ import pathlib
 import sys
 import time
 
-SCRIPT_VERSION = 6
+SCRIPT_VERSION = 7
 
 # The extension universe this script handles / deliberately skips. The Rust
 # lockstep test parses these literals out of the embedded script and asserts
@@ -565,10 +565,40 @@ def main() -> None:
 
             texts = [t for (_ls, _le, _pg, _ch, t) in pieces]
             t_book = time.perf_counter()
-            vectors = model.encode(
-                texts, batch_size=args.batch, normalize_embeddings=True,
-                show_progress_bar=False,
-            )
+            # Per-book embed containment (v7): a torch failure on ONE book
+            # (e.g. MPS out-of-memory on a huge PDF) must record an error
+            # outcome and let the other 39 books of the batch commit — it
+            # previously escaped the loop and voided the whole batch. On the
+            # first failure free the MPS cache and retry once with a smaller
+            # micro-batch before giving up on the book.
+            def _embed(batch_size):
+                return model.encode(
+                    texts, batch_size=batch_size, normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+
+            def _free_mps():
+                try:
+                    import torch
+                    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            try:
+                try:
+                    vectors = _embed(args.batch)
+                except Exception as first:  # noqa: BLE001
+                    _free_mps()
+                    print(f"[{i}/{n}] embed retry (smaller batch) after: {first}",
+                          file=sys.stderr, flush=True)
+                    vectors = _embed(max(8, args.batch // 4))
+            except Exception as e:  # noqa: BLE001
+                _free_mps()
+                outcomes.append({"i": idx, "status": "error",
+                                 "reason": f"embed failed: {e}"})
+                print(f"[{i}/{n}] skip (embed error) {p}: {e}", file=sys.stderr)
+                continue
             dt = time.perf_counter() - t_book
             fam = FAMILY.get(ext, "pdf")
             rows = []
