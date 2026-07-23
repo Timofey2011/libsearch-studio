@@ -2,6 +2,23 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.15.1 — 2026-07-22
+
+Bump manifests 0.15.0 → 0.15.1.
+
+- **Fixed: index runs froze at a random book (e.g. "29/40", 0 ch/s) and
+  never recovered.** Root cause: trimming the internal log buffer could cut
+  a multi-byte character in half (Russian titles!), crashing the run's task
+  silently — the UI kept showing "Indexing…" forever. The trim now cuts on
+  character boundaries (regression-tested against the exact crash).
+- Batch commits and the search-index build also moved to their own
+  dedicated runtime with a 15-minute timeout — any future stall surfaces
+  as a clean, resumable error instead of a frozen run, with step-by-step
+  breadcrumbs in the Log.
+- The Mac no longer idle-sleeps while an index run is active (caffeinate
+  held for the duration). Closing the lid or quitting the app still stops
+  the run — it resumes on the next Index click.
+
 ## v0.15.0 — 2026-07-17
 
 Bump manifests 0.14.0 → 0.15.0. Re-chunk that actually re-chunks.

@@ -267,6 +267,7 @@ async fn index_collection(
         &state.busy,
         "another index run or maintenance fix is active",
     )?;
+    let _awake = CaffeinateGuard::start();
     // Fresh cancellation flag for this run; the loop polls it between files.
     state.cancel.store(false, Ordering::SeqCst);
     let cancel = state.cancel.clone();
@@ -419,18 +420,14 @@ struct BatchResult {
 async fn run_py_batch(
     window: &WebviewWindow,
     cancel: &AtomicBool,
-    store: &Store,
     py: &str,
     script: &str,
     device: &str,
     parquet: &Path,
     batch: &[String],
-    // Per-file (aligned with `batch`) ids whose chunks the fresh embed
-    // replaces — deleted only for files the sidecar marks "indexed".
-    delete_ids: &[Vec<String>],
     gi: &mut usize,
     total: usize,
-) -> Result<Option<BatchResult>, String> {
+) -> Result<Option<Vec<SidecarOutcome>>, String> {
     let mut cmd = tokio::process::Command::new(py);
     cmd.arg(script)
         .arg("--out")
@@ -480,7 +477,7 @@ async fn run_py_batch(
                 }
                 tail.push_str(&line);
                 tail.push('\n');
-                if tail.len() > 4000 { let cut = tail.len() - 4000; tail.drain(..cut); }
+                trim_tail(&mut tail, 4000);
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                 if cancel.load(Ordering::SeqCst) {
@@ -492,6 +489,10 @@ async fn run_py_batch(
         }
     }
     let status = child.wait().await.map_err(|e| e.to_string())?;
+    let _ = window.emit(
+        "index-log",
+        format!("· helper exited ({status}) — validating sidecar"),
+    );
     let sidecar_path = parquet.with_file_name(format!(
         "{}.outcomes.json",
         parquet.file_name().unwrap_or_default().to_string_lossy()
@@ -550,32 +551,83 @@ async fn run_py_batch(
             return Err(e);
         }
     };
-    // Replace, never append (v0.15): the new parquet exists and the sidecar
-    // is validated — drop the old chunks of every file that re-embedded,
-    // under every id scheme, in ONE delete. A failure voids the batch (no
-    // state commits); the files re-embed next run, so a partial delete
-    // self-heals at the cost of a bounded search gap for this batch only.
-    let stale: Vec<String> = outcomes
-        .iter()
-        .filter(|oc| oc.status == "indexed")
-        .flat_map(|oc| delete_ids.get(oc.i).cloned().unwrap_or_default())
-        .collect();
-    if !stale.is_empty() {
-        if let Err(e) = store.delete_books(&stale).await {
-            cleanup();
-            return Err(format!("stale-chunk delete failed: {e}"));
+    // Store work (delete + import) happens in the caller on a DEDICATED
+    // runtime — v0.15.0 ran it on the app's shared runtime and a lance write
+    // future wedged there forever (v0.15.1 fix). The parquet/sidecar stay on
+    // disk for the caller; it cleans up after the commit hop.
+    Ok(Some(outcomes))
+}
+
+/// Keep only the last `keep` bytes of the helper's stderr tail, cutting on a
+/// char boundary — a byte-offset drain PANICS mid multi-byte char (Cyrillic
+/// titles!) and silently killed the whole run: the frozen-at-29/40 bug
+/// (v0.15.1).
+fn trim_tail(tail: &mut String, keep: usize) {
+    if tail.len() <= keep {
+        return;
+    }
+    let mut cut = tail.len() - keep;
+    while cut < tail.len() && !tail.is_char_boundary(cut) {
+        cut += 1;
+    }
+    tail.drain(..cut);
+}
+
+/// Batch commit hop (v0.15.1): stale-chunk delete + parquet import on a FRESH
+/// dedicated runtime — the pattern every reliably-working store writer uses
+/// (CPU index, Maintenance) — with a hard timeout so a wedged lance write
+/// surfaces as an error instead of freezing the run.
+fn commit_batch_blocking(
+    db_path: String,
+    parquet: std::path::PathBuf,
+    stale: Vec<String>,
+) -> Result<usize, String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async move {
+        const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        let store = Store::open_or_create(&db_path, "chunks")
+            .await
+            .map_err(|e| e.to_string())?;
+        if !stale.is_empty() {
+            tokio::time::timeout(OP_TIMEOUT, store.delete_books(&stale))
+                .await
+                .map_err(|_| "stale-chunk delete timed out (15 min)".to_string())?
+                .map_err(|e| format!("stale-chunk delete failed: {e}"))?;
+        }
+        tokio::time::timeout(OP_TIMEOUT, store.import_parquet(&parquet))
+            .await
+            .map_err(|_| "parquet import timed out (15 min)".to_string())?
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Keep the Mac from idle-sleeping while an index run is active (a laptop
+/// sleeping mid-run pauses or kills it). RAII: the child dies with the guard.
+struct CaffeinateGuard(Option<std::process::Child>);
+impl CaffeinateGuard {
+    fn start() -> Self {
+        Self(
+            std::process::Command::new("/usr/bin/caffeinate")
+                .arg("-i")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok(),
+        )
+    }
+}
+impl Drop for CaffeinateGuard {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
-    // Import errors (incl. the §2.4 unknown-format hard error) void the batch.
-    let chunks = match store.import_parquet(parquet).await {
-        Ok(c) => c,
-        Err(e) => {
-            cleanup();
-            return Err(e.to_string());
-        }
-    };
-    cleanup();
-    Ok(Some(BatchResult { chunks, outcomes }))
 }
 
 /// Fast index a collection by offloading bulk embedding to the configured
@@ -606,6 +658,13 @@ async fn fast_index_collection(
         &state.busy,
         "another index run or maintenance fix is active",
     )?;
+    let _awake = CaffeinateGuard::start();
+    if _awake.0.is_none() {
+        let _ = window.emit(
+            "index-log",
+            "note: could not hold the Mac awake (caffeinate unavailable)",
+        );
+    }
     // Fresh cancellation flag for this run; we kill the helper if it's set.
     state.cancel.store(false, Ordering::SeqCst);
 
@@ -890,13 +949,11 @@ async fn fast_index_collection(
             match run_py_batch(
                 &window,
                 &state.cancel,
-                &store,
                 &py,
                 &script,
                 &settings.gpu_device,
                 &parquet,
                 &batch_paths,
-                &batch_delete_ids,
                 &mut gi,
                 total,
             )
@@ -926,7 +983,54 @@ async fn fast_index_collection(
                     cancelled = true;
                     break;
                 }
-                Ok(Some(res)) => {
+                Ok(Some(outcomes)) => {
+                    // v0.15.1 commit hop: stale delete + import on a dedicated
+                    // runtime with a timeout — a wedged lance write becomes a
+                    // fatal, resumable error instead of a frozen run.
+                    let stale: Vec<String> = outcomes
+                        .iter()
+                        .filter(|oc| oc.status == "indexed")
+                        .flat_map(|oc| batch_delete_ids.get(oc.i).cloned().unwrap_or_default())
+                        .collect();
+                    let _ = window.emit(
+                        "index-log",
+                        format!(
+                            "· committing batch {} ({} stale ids to replace)…",
+                            bi + 1,
+                            stale.len()
+                        ),
+                    );
+                    let db_path = coll.db_path.clone();
+                    let pq = parquet.clone();
+                    let hop = tauri::async_runtime::spawn_blocking(move || {
+                        commit_batch_blocking(db_path, pq, stale)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r);
+                    let _ = std::fs::remove_file(&parquet);
+                    let _ = std::fs::remove_file(parquet.with_file_name(format!(
+                        "{}.outcomes.json",
+                        parquet.file_name().unwrap_or_default().to_string_lossy()
+                    )));
+                    let batch_chunks = match hop {
+                        Ok(c) => c,
+                        Err(msg) => {
+                            // The shared store handle may be poisoned — end
+                            // the run honestly; committed batches are safe and
+                            // the armed flag makes the next run resume.
+                            fatal_err = Some(format!("batch commit failed: {msg}"));
+                            break;
+                        }
+                    };
+                    let _ = window.emit(
+                        "index-log",
+                        format!("· batch {} committed ({batch_chunks} chunks)", bi + 1),
+                    );
+                    let res = BatchResult {
+                        chunks: batch_chunks,
+                        outcomes,
+                    };
                     chunks_written += res.chunks;
                     // Outcome-aware commit (§2.10): state per the sidecar, never
                     // blanket success. fp/csig come from plan time (no recompute).
@@ -976,10 +1080,32 @@ async fn fast_index_collection(
             }
         }
 
-        // Build the FTS index once the run settles (cheap to rebuild; skipped on a
-        // cancel or fatal helper failure — it's rebuilt when a later run completes).
+        // Build the FTS index once the run settles (cheap to rebuild; skipped
+        // on a cancel or fatal failure — rebuilt when a later run completes).
+        // Dedicated runtime + timeout, same as the batch commits (v0.15.1).
         if chunks_written > 0 && !cancelled && fatal_err.is_none() {
-            store.ensure_fts_index().await.map_err(|e| e.to_string())?;
+            let db_path = coll.db_path.clone();
+            tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                rt.block_on(async move {
+                    let store = Store::open_or_create(&db_path, "chunks")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(15 * 60),
+                        store.ensure_fts_index(),
+                    )
+                    .await
+                    .map_err(|_| "FTS build timed out (15 min)".to_string())?
+                    .map_err(|e| e.to_string())
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())??;
         }
     } // end GPU embed phase
 
@@ -1125,6 +1251,9 @@ async fn fast_index_collection(
         }
     }
 
+    if let Some(msg) = &fatal_err {
+        let _ = window.emit("index-log", format!("RUN ENDED WITH ERROR: {msg}"));
+    }
     if let Some(msg) = fatal_err {
         // No Finished on this path (the rejected invoke is the terminal signal);
         // the sweep's results are committed + surfaced via the log.
@@ -3099,6 +3228,27 @@ mod lockstep {
 #[cfg(test)]
 mod tests {
     use super::is_aggregative;
+
+    #[test]
+    fn tail_trim_never_splits_multibyte_chars() {
+        // The exact production crash: the 4000-byte window boundary landing
+        // inside a Cyrillic character.
+        let mut tail = String::new();
+        for i in 0..400 {
+            tail.push_str(&format!(
+                "[{i}/400] Программирование_компьютерного_зрения_на_языке_Python: 12 chunks\n"
+            ));
+            super::trim_tail(&mut tail, 4000);
+            assert!(tail.len() <= 4004, "window respected: {}", tail.len());
+        }
+        assert!(tail.contains("Python"));
+        // Odd window sizes force boundary collisions at every alignment.
+        for keep in [1, 2, 3, 5, 7, 4001] {
+            let mut t = "яяяяяяяяяя".to_string();
+            super::trim_tail(&mut t, keep);
+            assert!(t.len() <= keep + 1);
+        }
+    }
 
     // The follow-up fusion gate (tiers + pronoun detection) lives in ls-query
     // (should_fuse_followup / pronoun_led) with its own unit tests; the cosine
