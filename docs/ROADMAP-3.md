@@ -1042,6 +1042,43 @@ Three things this settles:
 - **A pollution diff**: ~30 queries, top-10 before vs after, read every
   displacement. Converts "does this make search worse" into a count.
 
+### 18.4b Integration shape (settled by two facts about the existing code)
+
+The engine (`scripts/ocr_pdf.py`) is built and verified; what remains is
+wiring. Two discoveries fix its shape, so this is no longer an open design:
+
+1. **The converted-artifact seam already exists and is the right one.**
+   `.pages` files are served to the reader through
+   `ls_extract::pages_display_pdf(path, cache_dir)` → a cached PDF under
+   `<data_dir>/converted/<key>.pdf` → `resolve_display_path` returns it with
+   `converted: true` and a converter label. An OCR'd book is the identical
+   pattern: `ocr_display_pdf(path, cache_dir)`, converter label "OCR".
+   Nothing new is needed on the reader side, and the §18.3.1 blocker
+   (unhighlightable citations) dissolves — the reader opens the searchable
+   copy, whose text layer pdfjs can read.
+2. **Python cannot compute the cache key.** `convert.rs::cache_key` hashes
+   with Rust's `DefaultHasher`, which has no Python equivalent and is not
+   even guaranteed stable across Rust versions. So the helper must NOT invent
+   its own path — **Rust owns the key, Python owns the OCR**. `ocr_pdf.py`
+   already takes `--out <path>`, which is exactly this contract.
+
+Resulting order of work:
+
+- `ocr_display_pdf()` in `convert.rs`: return the cache hit, else run the
+  helper via the app's venv python with `--out <cache_file>`, honouring the
+  existing cancellation signal.
+- `resolve_display_path`: serve the OCR'd copy for a pdf that has one.
+- Ingest: once the searchable copy exists, **no new extraction code is
+  needed** — opening that PDF yields the text through the normal fitz path.
+  This is why the artifact-first design is cheaper than the text-first one
+  it replaced.
+- Trigger: the per-page coverage census of §18.3.3, which must also reach
+  already-indexed ghosts (`book_state`, not `skip_state`).
+- Install: a dedicated "install optional indexing deps" command for
+  `pyobjc-framework-Vision` — the full one-click setup must not be the only
+  path, since its `pip install -U` would also upgrade torch under a pinned
+  parity pipeline (§18.3.7).
+
 ### 18.5 The open decision (why this is not built)
 
 Both critiques land on the same point: "index the 7" is the wrong unit.
