@@ -1014,6 +1014,29 @@ measured throughput and judged quality by eye — not sufficient.
   unfindable), short-token fraction, repeated-line rate. Vision's own
   confidence is free but is a weak, optimistically-biased proxy — report it,
   never gate on it alone.
+**Calibration result (2026-07-24, `scripts/ocr_calibrate.py`, 8 pages/book):**
+
+| book | script | CER @200 | recall @200 | CER @300 | recall @300 |
+|---|---|---|---|---|---|
+| Кнут, Искусство программирования | ru | 0.067 | **0.954** | 0.065 | 0.953 |
+| Алгоритмы. Руководство по разработке | ru | 0.036 | **0.945** | 0.041 | 0.944 |
+| Programming Languages: Build, Prove, Compare | en | 0.109 | **0.931** | 0.109 | 0.932 |
+| Pearson, Fundamentals of Web Development | en | 0.256 | **0.986** | 0.282 | 0.988 |
+
+Three things this settles:
+
+1. **Word recall is 93–99 %** — that is the retrieval-relevant number, because
+   a query token OCR mangled is simply absent from the index (and Cyrillic has
+   no fuzzy fallback). OCR text is good enough to index.
+2. **CER is the wrong gate.** The Pearson book scores the *worst* CER (0.256)
+   and the *best* recall (0.986): it is a heavily designed textbook, and CER
+   punishes reading-order divergence — sidebars, captions, figure labels
+   emitted in a different order than the PDF's internal stream — as if it were
+   character error. Gate on recall; report CER as a layout-divergence signal.
+3. **300 dpi buys nothing.** CER is flat or slightly worse and recall is
+   unchanged, at double the raster cost. 200 dpi is the default; the open
+   question in §18.2 is closed.
+
 - **A 20-minute human page-read** of 3 pages per book. Non-optional: column
   interleaving and equation garbage are invisible to every intrinsic metric.
 - **A pollution diff**: ~30 queries, top-10 before vs after, read every
