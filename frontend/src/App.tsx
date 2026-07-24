@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import PdfReader from "./PdfReader";
 import BookReader from "./BookReader";
 import { extOf, EXT_FAMILY } from "./generated/supportedExts";
+import { mdNorm } from "./lib/cite";
 
 type Collection = {
   id: string;
@@ -374,30 +375,26 @@ export default function App() {
     const host = mdReaderRef.current;
     const cite = reader?.citeText;
     if (!host || !(reader?.text || reader?.html) || !cite) return;
-    // CROSS-PIN: ported verbatim in crates/ls-cli/src/citemetric.rs (md_norm,
-    // md_match) for the §17.1 metric — change both together.
-    //
-    // v0.16.1: match against BLOCK elements, not single text nodes — inline
-    // markup (**bold**, `code`, [n]) fragments a paragraph into several text
-    // nodes, so any needle spanning a marker could never match one node
-    // (§17.2b baseline: 23% of md citations missed). textContent re-joins the
-    // fragments. A second candidate needle skips the cite's first line: chunk
-    // text often STARTS with its section heading, which renders as a separate
-    // h1-h4 block the paragraph needle must not straddle.
-    const norm = (x: string) => x.replace(/\s+/g, " ").trim().toLowerCase();
+    // Match against BLOCK elements, not single text nodes — inline markup
+    // (**bold**, `code`, [n]) fragments a paragraph into several text nodes,
+    // so any needle spanning a marker could never match one node (§17.2b:
+    // 23% of md citations missed). textContent re-joins the fragments. A
+    // second candidate needle skips the cite's first line: chunk text often
+    // STARTS with its section heading, which renders as a separate h1-h4
+    // block the paragraph needle must not straddle.
     const candidates: string[] = [];
-    const full = norm(cite).slice(0, 40);
+    const full = mdNorm(cite).slice(0, 40);
     if (full) candidates.push(full);
     const nl = cite.indexOf("\n");
     if (nl >= 0) {
-      const rest = norm(cite.slice(nl + 1)).slice(0, 40);
+      const rest = mdNorm(cite.slice(nl + 1)).slice(0, 40);
       if (rest && !candidates.includes(rest)) candidates.push(rest);
     }
     if (!candidates.length) return;
     const blocks = host.querySelectorAll("p, li, h1, h2, h3, h4, pre, blockquote");
     for (const cand of candidates) {
       for (const el of blocks) {
-        if (norm(el.textContent ?? "").includes(cand)) {
+        if (mdNorm(el.textContent ?? "").includes(cand)) {
           el.scrollIntoView({ block: "center" });
           el.classList.add("cite-flash");
           setTimeout(() => el.classList.remove("cite-flash"), 2500);
@@ -3231,6 +3228,7 @@ export default function App() {
                 key={reader.path}
                 url={convertFileSrc(reader.displayPath ?? reader.path)}
                 page={reader.page ?? undefined}
+                citeText={reader.citeText}
                 full={readerFull}
                 onFail={() =>
                   setReader((r) => (r && r.path === reader.path ? { ...r, pdfNative: true } : r))

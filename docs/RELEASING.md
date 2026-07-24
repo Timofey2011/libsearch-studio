@@ -35,6 +35,37 @@ owner/name; keep it in sync with the `repository` field in `Cargo.toml`.)
 
 ---
 
+## Gates before you ship
+
+Run these from the repo root and get them all green *before* bumping versions.
+The first three are what CI re-runs (`.github/workflows/ci.yml`); the rest CI
+**cannot** run, so they are only ever as good as the last local run.
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+./frontend/node_modules/.bin/tsc --noEmit --project frontend
+```
+
+Additionally, when the change touches **retrieval, chunking, or citations**:
+
+- `cargo test -p ls-query --features models --test golden_set -- --nocapture`
+  — the golden set embeds a real corpus with the real models. CI has no
+  models, so this gate exists *only* on your Mac. It prints a per-case rank
+  table; every case must say `ok`.
+- `ls-cli cite-metric <app-dir> <collection>` — fast proxy signal for
+  citation integrity (see ROADMAP-3 §17.1). Compare against the rates in
+  §17.2b/§17.2c rather than eyeballing.
+- `tools/dom-cite-harness/` — the DOM-side ground truth (real foliate/pdfjs).
+  Slower (~15 min) and manual; run it when changing the cite-jump matchers,
+  and check the frozen thresholds in §17.2c.
+
+Builds put ~1 GB per profile into `target/`; cargo never GCs it. If a build
+dies with a disk error, `du -sh target` first — it reached **121 GB** once.
+
+---
+
 ## Cut a release
 
 1. **Bump the four version manifests** to the new `X.Y.Z` (keep them identical):

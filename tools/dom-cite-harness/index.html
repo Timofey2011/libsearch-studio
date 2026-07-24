@@ -84,6 +84,10 @@ function probeOf(cite) {
 
 const log = (m) => { document.getElementById("log").textContent += "\n" + m; };
 const manifest = await (await fetch("./manifest.json")).json();
+// ?only=pdf / ?only=epub — the epub pass is ~15 min; pdf iterations shouldn't pay it.
+const only = new URLSearchParams(location.search).get("only");
+if (only === "pdf") manifest.epub = [];
+if (only === "epub") manifest.pdf = [];
 const results = { epub: [], pdf: [] };
 
 // ---- epub: the real foliate search ----------------------------------------
@@ -163,47 +167,72 @@ for (const book of manifest.epub) {
   }
 }
 
-// ---- pdf: pdfjs page-ordinal check ----------------------------------------
+// ---- pdf: replica of PdfReader.locateCite (v0.16.3 highlight) -------------
+// Mirrors the shipped matcher exactly: `joined` concatenates item strings with
+// NO separator (only \n at EOL) — the same string `starts` indexes — and the
+// probe is matched as a \s*-joined regex so a phrase spanning two text items
+// still hits. Outcomes are what the user sees: a highlight, or the overlay.
 const pdfjs = await import("./pdfjs-dist/build/pdf.mjs");
 pdfjs.GlobalWorkerOptions.workerSrc = "./pdfjs-dist/build/pdf.worker.mjs";
-const foldPdf = (s) => normText(s).toLowerCase();
+const rxOf = (words) =>
+  new RegExp(words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s*"), "i");
 for (const book of manifest.pdf) {
+  let doc = null;
   try {
-    const doc = await pdfjs.getDocument({
+    doc = await pdfjs.getDocument({
       url: "./" + book.file,
       cMapUrl: "./pdfjs-assets/cmaps/", cMapPacked: true,
       standardFontDataUrl: "./pdfjs-assets/standard_fonts/",
       useWorkerFetch: false,
     }).promise;
+    const cache = new Map();
     const pageText = async (n) => {
-      if (n < 1 || n > doc.numPages) return "";
+      if (n < 1 || n > doc.numPages) return null;
+      if (cache.has(n)) return cache.get(n);
       const page = await doc.getPage(n);
-      const tc = await page.streamTextContent();
-      const reader = tc.getReader();
-      let out = "";
+      const reader = page.streamTextContent().getReader();
+      const items = [];
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
-        for (const it of value.items ?? []) out += (it.str ?? "") + " ";
+        if (value?.items) items.push(...value.items);
       }
+      let joined = "";
+      const starts = [];
+      for (const it of items) {
+        if (typeof it.str !== "string") continue;
+        starts.push(joined.length);
+        joined += it.str + (it.hasEOL ? "\n" : "");
+      }
+      const out = { joined, starts };
+      cache.set(n, out);
       return out;
     };
     for (const c of book.cases) {
-      const probe = foldPdf(probeOf(c.cite));
+      const words = probeOf(c.cite).split(" ");
+      const full = rxOf(words);
+      const short = words.length > 4 ? rxOf(words.slice(0, 4)) : null;
+      const hit = async (n, re) => {
+        const pt = await pageText(n);
+        return pt ? re.test(pt.joined) : false;
+      };
       let outcome;
       if (c.page == null || c.page < 0) outcome = "no-page";
-      else if (foldPdf(await pageText(c.page)).includes(probe)) outcome = "on-page";
-      else if (foldPdf(await pageText(c.page - 1)).includes(probe) ||
-               foldPdf(await pageText(c.page + 1)).includes(probe)) outcome = "near";
-      else outcome = "off-page";
+      else if (await hit(c.page, full)) outcome = "highlight-on-page";
+      else if (await hit(c.page - 1, full) || await hit(c.page + 1, full))
+        outcome = "highlight-near";
+      else if (short && await hit(c.page, short)) outcome = "highlight-short";
+      else outcome = "overlay-miss";
       results.pdf.push({ book: book.title, id: c.id, page: c.page, outcome });
     }
     log(`pdf ok: ${book.title} (${doc.numPages}p)`);
-    doc.destroy();
   } catch (e) {
     for (const c of book.cases)
       results.pdf.push({ book: book.title, id: c.id, outcome: "open-error:" + String(e).slice(0, 80) });
     log(`pdf OPEN FAIL: ${book.title}: ${e}`);
+  } finally {
+    // destroy() lives on the loading task in some builds; guard it.
+    try { doc?.destroy?.(); } catch { /* nothing to release */ }
   }
 }
 

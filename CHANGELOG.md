@@ -2,6 +2,22 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.16.3 — 2026-07-24
+
+Bump manifests 0.16.2 → 0.16.3.
+
+- **PDF citations now highlight the cited passage, not just its page.**
+  Opening a pdf citation scrolled to the right page and left you to find the
+  sentence yourself. The passage is now marked and scrolled into view, using
+  the same highlight the in-document find already used. Measured on the
+  citation harness: 24 of 24 sampled pdf citations highlight (23 on the cited
+  page, 1 via a shorter fallback needle). When the passage genuinely can't be
+  found, an explicit note says so rather than leaving you guessing — the page
+  navigation itself is unaffected.
+- Internal: the four citation matchers the three readers share now live in one
+  module (`frontend/src/lib/cite.ts`) instead of being copied per reader, with
+  the Rust metric replicas cross-pinned to it.
+
 ## v0.16.2 — 2026-07-24
 
 Bump manifests 0.16.1 → 0.16.2.

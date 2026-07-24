@@ -3,10 +3,11 @@
 //! same code that produced the chunks); the report header states the known
 //! inflation/deflation caveats. No models, no network.
 //!
-//! The matcher replicas below are VERBATIM ports; cross-pins:
-//! - norm_text / norm_chapter  ⇔ frontend/src/BookReader.tsx `normText`/`normChapter`
-//! - probe_of                  ⇔ frontend/src/BookReader.tsx `citeJump` probe selection
-//! - md_norm / md_fragments    ⇔ frontend/src/App.tsx TreeWalker norm + renderRich/renderInline
+//! The matcher replicas below are VERBATIM ports of `frontend/src/lib/cite.ts`
+//! (one shared TS home since v0.16.3) — norm_text, norm_chapter, probe_of,
+//! md_norm and find_label each mirror the export of the same name there.
+//! `md_blocks` has no TS twin: it reconstructs what `App.tsx`'s renderRich
+//! puts in the DOM so the proxy can match blocks the way the reader does.
 //!
 //! JS `\w` is ASCII-only — the dehyphenation classes here deliberately exclude
 //! Cyrillic (the frontend never dehyphenates RU; a Unicode `\w` port would
@@ -23,7 +24,7 @@ fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
     cell.get_or_init(|| Regex::new(pat).expect("static regex"))
 }
 
-/// ⇔ BookReader.tsx `normText` (soft hyphens, ASCII line-break hyphenation,
+/// ⇔ lib/cite.ts `normText` (soft hyphens, ASCII line-break hyphenation,
 /// whitespace collapse).
 pub fn norm_text(s: &str) -> String {
     static HYPH: OnceLock<Regex> = OnceLock::new();
@@ -38,7 +39,7 @@ pub fn fold(s: &str) -> String {
     s.to_lowercase()
 }
 
-/// ⇔ BookReader.tsx `normChapter` (A4c label drift + §17.2c roman numerals).
+/// ⇔ lib/cite.ts `normChapter` (A4c label drift + §17.2c roman numerals).
 pub fn norm_chapter(s: &str) -> String {
     static PREFIX: OnceLock<Regex> = OnceLock::new();
     static NUM: OnceLock<Regex> = OnceLock::new();
@@ -54,7 +55,7 @@ pub fn norm_chapter(s: &str) -> String {
     s.to_lowercase()
 }
 
-/// ⇔ BookReader.tsx `findTocEntry` (§17.2c tiered matching): exact →
+/// ⇔ lib/cite.ts `findTocEntry` (§17.2c tiered matching): exact →
 /// containment → best token overlap. Returns the index of the matched label.
 pub fn find_label<'a, I: Iterator<Item = &'a str> + Clone>(
     labels: I,
@@ -100,10 +101,10 @@ pub fn find_label<'a, I: Iterator<Item = &'a str> + Clone>(
     best.map(|(i, _)| i)
 }
 
-/// ⇔ BookReader.tsx `citeJump` probe selection: first run of eight
-/// consecutive "wordy" words (≥2 letter chars), else fall back to the first
-/// eight tokens INCLUDING junk (`at = 0`) — that fallback fires exactly on
-/// the junk-prefixed legacy chunks, so it must be ported, not idealized.
+/// ⇔ lib/cite.ts `probeOf`: first run of eight consecutive "wordy" words (≥2
+/// letter chars), else fall back to the first eight tokens INCLUDING junk
+/// (`at = 0`) — that fallback fires exactly on the junk-prefixed legacy
+/// chunks, so it must be ported, not idealized.
 pub fn probe_of(cite: &str) -> String {
     let normed = norm_text(cite);
     if normed.is_empty() {
@@ -124,7 +125,7 @@ pub fn probe_of(cite: &str) -> String {
     words[at..(at + 8).min(words.len())].join(" ")
 }
 
-/// ⇔ App.tsx TreeWalker `norm` (whitespace collapse + lowercase — weaker than
+/// ⇔ lib/cite.ts `mdNorm` (whitespace collapse + lowercase — weaker than
 /// normText by design; the md path never dehyphenates).
 pub fn md_norm(s: &str) -> String {
     static WS: OnceLock<Regex> = OnceLock::new();

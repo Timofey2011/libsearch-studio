@@ -11,6 +11,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { getDocument, GlobalWorkerOptions, TextLayer } from "pdfjs-dist";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { probeOf } from "./lib/cite";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -34,11 +35,13 @@ const MAX_SCALE = 6;
 export default function PdfReader({
   url,
   page,
+  citeText,
   full,
   onFail,
 }: {
   url: string;
   page?: number;
+  citeText?: string;
   full: boolean;
   onFail: (err: string) => void;
 }) {
@@ -56,6 +59,7 @@ export default function PdfReader({
   const [finding, setFinding] = useState(false);
   const [findAt, setFindAt] = useState(0);
   const [findError, setFindError] = useState<string | null>(null);
+  const [citeMiss, setCiteMiss] = useState(false);
 
   const docRef = useRef<PDFDocumentProxy | null>(null);
   const loadingRef = useRef<PDFDocumentLoadingTask | null>(null);
@@ -72,6 +76,7 @@ export default function PdfReader({
   const findRunRef = useRef(0);
   const foundForRef = useRef("");
   const activeRef = useRef<Match | null>(null);
+  const citeRunRef = useRef(0);
   const findInputRef = useRef<HTMLInputElement>(null);
 
   // ---- document lifecycle -------------------------------------------------
@@ -298,8 +303,64 @@ export default function PdfReader({
   useEffect(() => {
     if (!numPages || !page) return;
     requestAnimationFrame(() => scrollToPage(page));
+    setCiteMiss(false);
+    if (citeText?.trim()) void locateCite(page, citeText);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [numPages, page]);
+  }, [numPages, page, citeText]);
+
+  /// Highlight the cited passage itself, not just its page.
+  ///
+  /// The stored page ordinal is right ~87% of the time (§17.2c), so the cited
+  /// page is tried first and neighbours only as a fallback — landing on the
+  /// stamped page is the common case and must not be second-guessed. A miss
+  /// everywhere is surfaced, never silent: the page scroll already happened,
+  /// so the overlay says the highlight failed, not the navigation.
+  async function locateCite(want: number, cite: string) {
+    const probe = probeOf(cite);
+    if (!probe) return;
+    const run = ++citeRunRef.current;
+
+    // `joined` concatenates text items with no separator (only `\n` at EOL),
+    // so a phrase spanning two items has arbitrary whitespace between words —
+    // match the probe's words with `\s*` between them rather than literally.
+    // Offsets stay indexes into the raw string, which is what `starts` maps.
+    const rx = (words: string[]) =>
+      new RegExp(words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s*"), "i");
+    const words = probe.split(" ");
+    const full = rx(words);
+    // A 4-word needle is the fallback, and only on the cited page: shorter
+    // needles get less distinctive, and the page is already trusted.
+    const short = words.length > 4 ? rx(words.slice(0, 4)) : null;
+
+    const tryPage = async (p: number, re: RegExp): Promise<boolean> => {
+      if (p < 1 || p > numPages) return false;
+      let pt: PageText;
+      try {
+        pt = await pageText(p);
+      } catch {
+        return false; // an unreadable page is a miss, not a crash
+      }
+      if (citeRunRef.current !== run) return true; // superseded; stop quietly
+      const m = re.exec(pt.joined);
+      if (!m) return false;
+      activeRef.current = { page: p, item: itemAt(pt.starts, m.index) };
+      pendingMatchScrollRef.current = true;
+      if (p !== want) scrollToPage(p);
+      applyHighlight();
+      return true;
+    };
+
+    for (const [p, re] of [
+      [want, full],
+      [want - 1, full],
+      [want + 1, full],
+      ...(short ? [[want, short] as const] : []),
+    ] as Array<readonly [number, RegExp]>) {
+      if (await tryPage(p, re)) return;
+      if (citeRunRef.current !== run) return;
+    }
+    setCiteMiss(true);
+  }
 
   function scrollToPage(p: number) {
     const el = pageElsRef.current.get(Math.min(Math.max(p, 1), numPages || 1));
@@ -563,6 +624,17 @@ export default function PdfReader({
               ↓
             </button>
           </span>
+        </div>
+      )}
+      {citeMiss && citeText && (
+        <div className="cite-miss">
+          <div className="cite-miss-head">
+            Opened at the cited page, but couldn't highlight the passage — it reads:
+            <button className="ghost" onClick={() => setCiteMiss(false)} title="Dismiss">
+              ✕
+            </button>
+          </div>
+          <blockquote>{citeText}</blockquote>
         </div>
       )}
       <div className="pdf-scroll" ref={scrollRef} onScroll={onScroll} tabIndex={-1}>

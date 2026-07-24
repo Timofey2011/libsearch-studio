@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from "react";
 
 // Side-effect import registers the <foliate-view> custom element.
 import "./vendor/foliate/view.js";
+import { findTocEntry, probeOf } from "./lib/cite";
 
 type TocItem = { label: string; href: string; subitems?: TocItem[] | null };
 
@@ -39,68 +40,6 @@ interface FoliateView extends HTMLElement {
     toc?: TocItem[];
     resolveHref(href: string): Promise<{ index: number } | null> | { index: number } | null;
   };
-}
-
-/// Whitespace/hyphenation normalization shared by cite text and DOM text —
-/// extractor output and foliate-rendered text differ exactly there.
-/// CROSS-PIN: ported verbatim in crates/ls-cli/src/citemetric.rs (norm_text,
-/// norm_chapter, probe_of) for the §17.1 metric — change both together.
-function normText(s: string): string {
-  return s
-    .replace(/­/g, "") // soft hyphens
-    .replace(/(\w)-\s+(\w)/g, "$1$2") // line-break hyphenation
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/// TOC-label normalization (amendment A4c): stored chapter strings and
-/// foliate's parsed labels drift on numbering and whitespace. Roman-numeral
-/// prefixes ("Part V.", "I. Understanding …") are stripped like arabic ones —
-/// fitz TOCs number in arabic where publishers' nav docs use roman (§17.2c).
-function normChapter(s: string): string {
-  return normText(s)
-    .replace(/^(chapter|глава|часть|part)\s+(\d+|[ivxlcdm]+)\.?:?\s+/i, "")
-    .replace(/^[\d.]+\s*[.:—-]?\s*/, "")
-    .replace(/^[ivxlcdm]+\.\s+/i, "")
-    .toLowerCase();
-}
-
-/// Tiered chapter→TOC matching (§17.2c: exact equality resolved in only ~2 of
-/// 12 books — fitz labels carry broken words ("Pa rt") and different numbering
-/// than foliate's nav labels). A wrong pick is safe: phase-1 search verifies
-/// with the probe and falls back to the whole-book search on a miss.
-function findTocEntry(toc: TocItem[], stored: string): TocItem | null {
-  const want = normChapter(stored);
-  if (!want) return null;
-  // Tier 1: exact normalized equality.
-  const exact = toc.find((t) => normChapter(t.label ?? "") === want);
-  if (exact) return exact;
-  // Tier 2: containment either way (guard against tiny fragments).
-  if (want.length >= 6) {
-    const contained = toc.find((t) => {
-      const l = normChapter(t.label ?? "");
-      return l.length >= 6 && (l.includes(want) || want.includes(l));
-    });
-    if (contained) return contained;
-  }
-  // Tier 3: best token overlap — robust to broken words and numbering.
-  const tokens = (s: string) => new Set(s.split(" ").filter((w) => w.length >= 3));
-  const wt = tokens(want);
-  if (wt.size < 2) return null;
-  let best: TocItem | null = null;
-  let bestScore = 0;
-  for (const t of toc) {
-    const lt = tokens(normChapter(t.label ?? ""));
-    if (!lt.size) continue;
-    let common = 0;
-    for (const w of wt) if (lt.has(w)) common++;
-    const score = common / (wt.size + lt.size - common);
-    if (common >= 2 && score >= 0.6 && score > bestScore) {
-      best = t;
-      bestScore = score;
-    }
-  }
-  return best;
 }
 
 function flattenToc(items: TocItem[] | undefined, out: TocItem[] = []): TocItem[] {
@@ -191,17 +130,7 @@ export default function BookReader({
   // ---- cite-jump (§5.2): chapter-scoped, then async whole-book -------------
   async function citeJump(view: FoliateView, chap: string | null, cite?: string) {
     if (!cite?.trim()) return;
-    // A short probe: long enough to be distinctive, short enough for the
-    // matcher to hit despite extraction/rendering drift. Legacy-extracted
-    // chunks often START with code fragments/markup junk ("() }" etc.), so
-    // pick the first run of eight real words, not the first eight tokens.
-    const words = normText(cite).split(" ");
-    const wordy = (w: string) => (w.match(/\p{L}/gu) ?? []).length >= 2;
-    let at = words.findIndex(
-      (_, i) => i + 8 <= words.length && words.slice(i, i + 8).every(wordy)
-    );
-    if (at < 0) at = 0;
-    const probe = words.slice(at, at + 8).join(" ");
+    const probe = probeOf(cite);
     if (!probe) return;
 
     // Resolve the chapter to a section index via tiered TOC matching.

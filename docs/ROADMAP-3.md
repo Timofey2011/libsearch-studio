@@ -862,6 +862,31 @@ match harmless.
 land (direct+located), pdf ≥80% on-page. Proxy-side (`ls-cli cite-metric`)
 stays a fast integrity/regression signal with unfrozen reference rates.
 
+### 17.2d PDF cite highlight (v0.16.3) — 87.5% page-only → 100% highlighted
+
+The pdf reader scrolled to the cited page and stopped there; the passage was
+never marked. `PdfReader.locateCite` now highlights it, reusing the find
+infrastructure (`pageText`/`itemAt`/`.pdf-hit`/`applyHighlight`).
+
+Two details decide the hit rate, and both are measured, not assumed:
+
+- `joined` concatenates pdfjs text items with **no separator** (only `\n` at
+  EOL), so a cited phrase spanning two items has arbitrary whitespace — or
+  none — between its words. The probe is therefore matched as a `\s*`-joined
+  **regex**, not a literal `indexOf`. Offsets stay indexes into the raw string,
+  which is exactly what `starts` maps to text divs.
+- Ladder: full 8-word probe on the cited page → page ∓1 (scrolling there) →
+  4-word prefix on the cited page only (shorter needles are less distinctive,
+  and the stamped page is already trusted at ~87%). A miss everywhere shows
+  the explicit overlay — the page scroll still happened, so it says the
+  *highlight* failed, not the navigation.
+
+DOM harness, same 8 books × 3 sample: **highlight-on-page 23, highlight-short
+1, overlay-miss 0** (24/24). The earlier §17.2b/§17.2c "off-page" rows were an
+artifact of the harness joining items with a space; it now replicates the
+shipped matcher byte-for-byte, and gained `?only=pdf|epub` so a pdf iteration
+no longer pays the ~15-minute epub pass.
+
 ### 17.3 Explicitly out of scope (follow-ups, gated on measured rates)
 
 - DOM-side jump measurement (headless webview over the real foliate search) — the true
