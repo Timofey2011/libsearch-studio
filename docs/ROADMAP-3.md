@@ -831,6 +831,28 @@ Report: per-stratum table + provisional (unfrozen) reference rates: book ≥80% 
   **Located 90% · Miss 10%**, meeting the reference rate.
 - Extraction p50 374 ms · p95 2.9 s · max 3.4 s per book; no timeouts.
 
+### 17.2c DOM-side subsample (2026-07-24, tools/dom-cite-harness) — THRESHOLDS FROZEN
+
+Real store citations replayed through the ACTUAL matchers in a browser
+(vendored foliate-js `view.search` for epubs; pdfjs page text for pdfs) —
+the measurement §17.1's proxy cannot make:
+
+- **epub (12 books × 4):** direct 25% · located 60% (**85% land**) ·
+  miss-in-chapter 4% · cold-miss 10%. `chapterResolved` was false in ~10/12
+  books: stored fitz TOC labels rarely equal foliate's parsed labels even
+  after normChapter — the label drift, not search quality, caps "direct".
+  Direct hits take 0.5–2 s; whole-book fallbacks 4–15 s (worst 44 s), which
+  vindicates the async-fallback design. FOLLOW-UP (largest epub win, ~60%
+  located→direct): reconcile chapter labels — either widen normChapter or
+  re-stamp chapters from a foliate-compatible source at ingest.
+- **pdf (8 books × 3):** **87.5% on-page**, 12.5% off-page — fitz page stamps
+  align with pdfjs page ordinals; the §17.2b lopdf "probe nowhere" rows were
+  the proxy's noise (lopdf text extraction), not real jump failures.
+
+**Frozen thresholds** (DOM-side, re-run the harness to verify): epub ≥80%
+land (direct+located), pdf ≥80% on-page. Proxy-side (`ls-cli cite-metric`)
+stays a fast integrity/regression signal with unfrozen reference rates.
+
 ### 17.3 Explicitly out of scope (follow-ups, gated on measured rates)
 
 - DOM-side jump measurement (headless webview over the real foliate search) — the true

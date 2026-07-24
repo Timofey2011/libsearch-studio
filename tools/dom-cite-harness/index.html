@@ -1,0 +1,167 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>§17 DOM-side citation harness</title>
+<style>
+  body { font: 13px/1.4 -apple-system, sans-serif; margin: 16px; }
+  #log { white-space: pre-wrap; }
+  #view-host { position: absolute; left: -9999px; width: 800px; height: 600px; }
+  #done { font-weight: bold; }
+</style>
+</head>
+<body>
+<h3>§17 DOM-side citation harness</h3>
+<div id="log">starting…</div>
+<div id="done"></div>
+<pre id="json"></pre>
+<div id="view-host"></div>
+<script type="module">
+// Verbatim replicas of frontend/src/BookReader.tsx (§17 cross-pins).
+import "./foliate/view.js";
+
+function normText(s) {
+  return s
+    .replace(/­/g, "")
+    .replace(/(\w)-\s+(\w)/g, "$1$2")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function normChapter(s) {
+  return normText(s)
+    .replace(/^(chapter|глава|часть|part)\s+\d+[.:]?\s*/i, "")
+    .replace(/^[\d.]+\s*[.:—-]?\s*/, "")
+    .toLowerCase();
+}
+function flattenToc(items, out = []) {
+  for (const it of items ?? []) {
+    out.push(it);
+    flattenToc(it.subitems ?? undefined, out);
+  }
+  return out;
+}
+function probeOf(cite) {
+  const words = normText(cite).split(" ");
+  const wordy = (w) => (w.match(/\p{L}/gu) ?? []).length >= 2;
+  let at = words.findIndex((_, i) => i + 8 <= words.length && words.slice(i, i + 8).every(wordy));
+  if (at < 0) at = 0;
+  return words.slice(at, at + 8).join(" ");
+}
+
+const log = (m) => { document.getElementById("log").textContent += "\n" + m; };
+const manifest = await (await fetch("./manifest.json")).json();
+const results = { epub: [], pdf: [] };
+
+// ---- epub: the real foliate search ----------------------------------------
+const host = document.getElementById("view-host");
+for (const book of manifest.epub) {
+  let view = null;
+  try {
+    const res = await fetch("./" + book.file);
+    if (!res.ok) throw new Error("fetch " + res.status);
+    const blob = await res.blob();
+    const file = new File([blob], book.file.split("/").pop());
+    view = document.createElement("foliate-view");
+    host.append(view);
+    await view.open(file);
+    const toc = flattenToc(view.book.toc);
+    for (const c of book.cases) {
+      const t0 = performance.now();
+      const probe = probeOf(c.cite);
+      let outcome = "cold-miss";
+      let chapterResolved = false;
+      try {
+        let sectionIndex = null;
+        if (c.chapter) {
+          const want = normChapter(c.chapter);
+          const hit = toc.find((t) => normChapter(t.label ?? "") === want);
+          if (hit) {
+            chapterResolved = true;
+            const resolved = await view.book.resolveHref(hit.href);
+            if (resolved && typeof resolved.index === "number") sectionIndex = resolved.index;
+          }
+        }
+        const firstHit = async (index) => {
+          for await (const r of view.search({ query: probe, ...(index != null ? { index } : {}) })) {
+            if (typeof r === "string") break;
+            if (r.subitems?.length) return r.subitems[0].cfi;
+            if (r.cfi) return r.cfi;
+          }
+          return null;
+        };
+        if (sectionIndex != null && (await firstHit(sectionIndex))) outcome = "direct";
+        else if (await firstHit()) outcome = "located";
+        else outcome = chapterResolved ? "miss-in-chapter" : "cold-miss";
+        view.clearSearch?.();
+      } catch (e) {
+        outcome = "case-error:" + String(e).slice(0, 80);
+      }
+      results.epub.push({ book: book.title, id: c.id, chapterResolved, outcome,
+                          ms: Math.round(performance.now() - t0) });
+    }
+    log(`epub ok: ${book.title}`);
+  } catch (e) {
+    for (const c of book.cases)
+      results.epub.push({ book: book.title, id: c.id, outcome: "open-error:" + String(e).slice(0, 80) });
+    log(`epub OPEN FAIL: ${book.title}: ${e}`);
+  } finally {
+    view?.remove();
+  }
+}
+
+// ---- pdf: pdfjs page-ordinal check ----------------------------------------
+const pdfjs = await import("./pdfjs-dist/build/pdf.mjs");
+pdfjs.GlobalWorkerOptions.workerSrc = "./pdfjs-dist/build/pdf.worker.mjs";
+const foldPdf = (s) => normText(s).toLowerCase();
+for (const book of manifest.pdf) {
+  try {
+    const doc = await pdfjs.getDocument({
+      url: "./" + book.file,
+      cMapUrl: "./pdfjs-assets/cmaps/", cMapPacked: true,
+      standardFontDataUrl: "./pdfjs-assets/standard_fonts/",
+      useWorkerFetch: false,
+    }).promise;
+    const pageText = async (n) => {
+      if (n < 1 || n > doc.numPages) return "";
+      const page = await doc.getPage(n);
+      const tc = await page.streamTextContent();
+      const reader = tc.getReader();
+      let out = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        for (const it of value.items ?? []) out += (it.str ?? "") + " ";
+      }
+      return out;
+    };
+    for (const c of book.cases) {
+      const probe = foldPdf(probeOf(c.cite));
+      let outcome;
+      if (c.page == null || c.page < 0) outcome = "no-page";
+      else if (foldPdf(await pageText(c.page)).includes(probe)) outcome = "on-page";
+      else if (foldPdf(await pageText(c.page - 1)).includes(probe) ||
+               foldPdf(await pageText(c.page + 1)).includes(probe)) outcome = "near";
+      else outcome = "off-page";
+      results.pdf.push({ book: book.title, id: c.id, page: c.page, outcome });
+    }
+    log(`pdf ok: ${book.title} (${doc.numPages}p)`);
+    doc.destroy();
+  } catch (e) {
+    for (const c of book.cases)
+      results.pdf.push({ book: book.title, id: c.id, outcome: "open-error:" + String(e).slice(0, 80) });
+    log(`pdf OPEN FAIL: ${book.title}: ${e}`);
+  }
+}
+
+const tally = (rows) => {
+  const t = {};
+  for (const r of rows) t[r.outcome.split(":")[0]] = (t[r.outcome.split(":")[0]] ?? 0) + 1;
+  return t;
+};
+document.getElementById("json").textContent = JSON.stringify(
+  { epubTally: tally(results.epub), pdfTally: tally(results.pdf), results }, null, 1);
+document.getElementById("done").textContent =
+  "DONE epub=" + JSON.stringify(tally(results.epub)) + " pdf=" + JSON.stringify(tally(results.pdf));
+</script>
+</body>
+</html>
