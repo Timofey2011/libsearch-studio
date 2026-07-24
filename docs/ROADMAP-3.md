@@ -1079,6 +1079,41 @@ Resulting order of work:
   path, since its `pip install -U` would also upgrade torch under a pinned
   parity pipeline (§18.3.7).
 
+### 18.4c First real books OCR'd (2026-07-24)
+
+Two durable Russian books, run through `ocr_pdf.py` into the app's
+`<data_dir>/converted` cache:
+
+| book | pages | chars recovered | chars/page | conf | lines failed |
+|---|---|---|---|---|---|
+| Программирование компьютерного зрения | 312 | 451 483 | 1447 | 0.927 | 0 |
+| Мультиагентное обучение с подкреплением | 225 | 402 296 | 1788 | 0.906 | 0 |
+
+The second is one of the §18.1 ghosts: it was already "indexed" — with **22
+characters**. It now yields 402 296.
+
+Verified through the real matcher, not by inspection: the DOM harness scores
+**8/8 highlight-on-page** on citations sampled across both artifacts. (An
+ad-hoc probe check failed first and was itself the bug — it sliced arbitrary
+word ranges including code tokens, where `probeOf` deliberately takes the first
+run of eight wordy words.)
+
+Cost: 387 s and 119 s respectively — dominated by re-saving a large image PDF,
+not by recognition. Artifacts are ~44 MB and ~65 MB, i.e. roughly the size of
+the originals, which is the cache cost §18.3.1 predicted.
+
+**Pick-up status differs per book, because the planner checks skips before
+freshness** (`plan.rs`: stage 0.5 `Silenced` precedes stage 1 `Unchanged`):
+
+- The CV book has only a `skip_state` row. `SCRIPT_VERSION` 8 → 9 changes the
+  caps hash, so stage 0.5 falls through and — never having been indexed — it
+  is embedded on the next normal index run. **Automatic.**
+- The multi-agent book also has a `book_state` row, so it falls through stage
+  0.5 only to match stage 1 as `Unchanged`. It needs **Re-index this book**,
+  which is precisely the §18.3.3 finding that caps invalidate `skip_state` but
+  never `book_state`. The general fix is the per-page coverage trigger; until
+  that ships, every ghost needs the per-book action.
+
 ### 18.5 The open decision (why this is not built)
 
 Both critiques land on the same point: "index the 7" is the wrong unit.
