@@ -893,3 +893,150 @@ no longer pays the ~15-minute epub pass.
   §5.5 metric; unblocking threshold freeze.
 - Auto-highlight of citeText on PDF open; sharing one normalization helper across the
   three frontend paths; OCR for the scanned-PDF straggler.
+
+---
+
+## §18 — Unreadable PDFs: OCR + the "ghost book" problem (DESIGN, not built)
+
+Status 2026-07-24: designed, adversarially critiqued twice, **blocked on a
+curation decision** (§18.5). Nothing implemented. The v1 design is superseded;
+what follows is v2 with the critique amendments folded in.
+
+### 18.1 The problem is bigger than the skip list
+
+`skip_state` holds 7 PDFs skipped `no extractable text` — scanned books with no
+text layer, permanently unsearchable. But the whole-book 200-char floor
+(`gpu_embed.py:560`, summed over the entire book) means a scan whose title page
+carries a scrap of text CLEARS the floor and is committed as `indexed`. It then
+matches stage 1 `Unchanged` forever — **no caps change ever revisits it**,
+because caps invalidate `skip_state`, not `book_state`.
+
+A store census (462 indexed PDFs) found **10 such ghosts**:
+
+| chars indexed | chunks | file | title |
+|---|---|---|---|
+| 22 | 1 | 62.9 MB | Мультиагентное обучение с подкреплением |
+| 235 | 1 | 33.3 MB | UML для простых смертных |
+| 6 857 | 4 | 166.5 MB | Python. Самое полное руководство (Stack Overflow) |
+| 9 891 | 11 | 147.2 MB | Функциональное программирование на JavaScript |
+
+A 166 MB book represented by 6 857 characters is not indexed in any useful
+sense — it is findable by title and empty inside, with no skip row to show for
+it. **The ghosts are the larger quality problem, and they are invisible to
+every existing signal.** Any OCR work must fix the trigger, not just add OCR.
+
+### 18.2 Feasibility (measured, spike 2026-07-24)
+
+Apple Vision via `pyobjc-framework-Vision`, rasterizing with PyMuPDF at 200 dpi:
+RU textbook 1574 chars/page, EN 433 chars/page, **~0.3 s/page after a one-time
+~63 s Vision warm-up**. RU output is clean, correctly accented Cyrillic. All
+seven skipped books ≈ 2000 pages ≈ 10–12 min. Feasibility is not the blocker.
+
+### 18.3 What the critiques changed (v1 → v2)
+
+1. **OCR must emit an invisible text layer, not a string.** v1 claimed the
+   §17.2d highlight "works unchanged". It cannot: `PdfReader.pageText` reads
+   the *PDF's own* text layer via pdfjs, which is empty for a scan — so every
+   citation into an OCR'd book would show the v0.16.3 miss overlay, and
+   find-in-document would return nothing, with no explanation. Vision returns
+   per-line `boundingBox`; PyMuPDF writes invisible text (`render_mode=3`).
+   Cache the result as a searchable PDF keyed by `content_signature` and serve
+   it through the **existing** `displayPath` mechanism (already used for
+   `.pages` → embedded Preview.pdf, `resolve_display_path`). One artifact
+   fixes highlight, find, text selection, `cite-metric`, and re-OCR on
+   re-chunk. Costs to state plainly: PyMuPDF's built-in `helv` is Latin-1, so
+   the RU books need an embedded Cyrillic font or their text is silently lost;
+   and the cache is a second full copy of each PDF (~400 MB for these seven).
+2. **The insertion point in v1 was dead code.** `extract_pages()`
+   (`gpu_embed.py:436`) is never called; extraction is inlined at `:511` inside
+   a `with fitz.open(...)` that closes at `:519`, while the floor is evaluated
+   at `:560` — after chunking, with the document already closed, and *outside*
+   the per-book `try/except` that ends at `:556`. An exception there voids the
+   whole 40-book batch and triggers the bisect ladder. Real insertion point: a
+   per-page character census inside the `with` block, gated on `ext == "pdf"`
+   (the branch is `FITZ_EXTS` — epub/fb2/mobi/azw3/xps too; rasterizing an
+   epub is nonsense), entirely inside the existing per-book `except`.
+3. **Trigger per page, not per book**: OCR when the median page is under ~100
+   chars, or >60 % of pages under 50. This is what catches the ghosts, and it
+   must also apply to books already in `book_state`, which needs an explicit
+   re-examination path — caps invalidation alone will not reach them.
+4. **The "distinct skip reason" idea does nothing.** Stage 0.5 compares only
+   fingerprint and caps_ver (`plan.rs:169-177`); `reason` is not even selected
+   (`store.rs:634-639`). Worse, `script_version` is inside the hashed caps
+   payload, so **every future release re-OCRs every image-only book from
+   scratch**. Either persist a real OCR-attempted marker, or rely on the
+   content-addressed cache from (1) to make repeats cheap. The cache is the
+   better answer and subsumes the problem.
+5. **Cancellation and bisect currently destroy OCR work.** Stop kills the
+   helper and `cleanup()` deletes the batch parquet+sidecar; a crash bisects
+   40 → 20 → 10, re-OCRing and re-paying the warm-up each time. With the cache
+   this is survivable; without it, one Stop can discard an hour.
+6. **Memory: the risk is coexistence, not pixmaps.** Every PyObjC round-trip
+   autoreleases (NSData, CGImage, handler, observations) with no per-iteration
+   pool — ~25 MB/page × 700 pages retained until process exit, alongside the
+   ~2.2 GB fp16 bge-m3 already resident. This is the exact shape of the
+   v0.15.4 crash. Mitigations: `objc.autorelease_pool()` per page, clamp dpi by
+   page area, and preferably **run OCR as a separate pre-pass process** before
+   the model loads — which also answers the warm-up ordering question and
+   produces the cache artifact.
+7. **Plumbing corrections**: `--ocr-max-pages` is unreachable (`run_py_batch`
+   builds a fixed argv); a progress line starting with `[` would be parsed as a
+   book event and corrupt the counter (the v0.15.3 bug); `SidecarOutcome`
+   silently drops unknown fields, so a coverage count cannot round-trip; and
+   `pyobjc` is NOT "a pure-Python wheel" (it is compiled, ABI-specific) — nor
+   can users get it, since the only install path is the full one-click setup
+   whose `pip install -U` would also upgrade torch under a pinned-parity
+   pipeline. A dedicated "install optional deps" command is required, or the
+   caps bump ships pure cost: all skip rows retried, nothing OCR-able.
+8. **Drop partial mode.** A capped book commits as `indexed` and can never be
+   revisited. Over the cap, skip the whole book with a retryable reason.
+9. **Clean the text at OCR time**: drop lines repeating on >30 % of pages
+   (running heads, the `TIgm: @it_boooks` watermark these scans carry — which
+   passes `probe_of`'s wordiness test and would land in quoted citations),
+   drop bare-numeral lines, and dehyphenate line ends. The lexical half of
+   retrieval needs this: FTS cannot match a hyphen-split token, and Cyrillic
+   has no fuzzy fallback (`fts_search_fuzzy` filters to ASCII).
+
+### 18.4 Measurement (required before indexing anything)
+
+§17's rule applies: no quality claim without a number on real data. The spike
+measured throughput and judged quality by eye — not sufficient.
+
+- **Calibrate against ground truth we already own.** Take 4 PDFs that DO have
+  text layers (2 RU, 2 EN, one two-column), OCR 20 pages of each, and score
+  against `page.get_text("text")`: character error rate and word recall. That
+  measures this exact rasterizer, dpi and script pair against truth. Re-run at
+  300 dpi to settle the dpi question with a number.
+- **Per-book garbage score, no new deps**: bge-m3 subword fragmentation
+  (tokens ÷ words — the tokenizer is already loaded, and it measures the thing
+  that actually degrades the vector), intra-token Cyrillic/Latin homoglyph
+  mixing (the failure that passes an eyeball check and still makes a book
+  unfindable), short-token fraction, repeated-line rate. Vision's own
+  confidence is free but is a weak, optimistically-biased proxy — report it,
+  never gate on it alone.
+- **A 20-minute human page-read** of 3 pages per book. Non-optional: column
+  interleaving and equation garbage are invisible to every intrinsic metric.
+- **A pollution diff**: ~30 queries, top-10 before vs after, read every
+  displacement. Converts "does this make search worse" into a count.
+
+### 18.5 The open decision (why this is not built)
+
+Both critiques land on the same point: "index the 7" is the wrong unit.
+
+- **Worth it**: the RU computer-vision textbook and the multi-agent RL book —
+  durable content, genuine language-gap fill, and OCR measured well on the
+  former. Likewise the four ghosts above, which are large Russian references
+  the library currently pretends to contain.
+- **Doubtful**: *250 Python One-Liners* — 433 chars/page on a code-heavy book
+  is a warning, not a datapoint. Code is what OCR handles worst (indentation,
+  `l`/`1`/`I`, `0`/`O`, quotes), and a citation quoting mangled Python is worse
+  than none, because it will be copied.
+- **Actively risky**: the Next.js / Cloud / JS guides. A Next.js book old
+  enough to be a scan predates the App Router; indexing it means the ask path
+  will confidently cite obsolete API. **Better OCR makes this worse, not
+  better.** This is a curation question, not an OCR question.
+
+Recommendation: build the capability (a file class the library silently cannot
+read is against the project's ethos), gate per book on §18.4, expect 2–3 of the
+7 to pass — and treat the stale framework guides as a Maintenance/curation
+decision separate from OCR.
