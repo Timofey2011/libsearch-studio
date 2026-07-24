@@ -49,6 +49,36 @@ CYRILLIC = re.compile(r"[Ѐ-ӿ]")
 LATIN = re.compile(r"[A-Za-z]")
 
 
+def ocr_cache_key(path) -> str:
+    """FNV-1a over length + 64 KiB head/tail.
+
+    CROSS-PIN: ls-extract/src/convert.rs `ocr_cache_key` — the Rust side names
+    the same artifact and the two must agree byte for byte. Deliberately not
+    the repo's other hashes: `cache_key`/`content_signature` use Rust's
+    DefaultHasher, which has no Python equivalent and is not guaranteed stable
+    across Rust versions.
+    """
+    import os
+
+    SAMPLE = 64 * 1024
+    h = 0xCBF29CE484222325
+    MASK = 0xFFFFFFFFFFFFFFFF
+
+    def eat(bs):
+        nonlocal h
+        for b in bs:
+            h = ((h ^ b) * 0x100000001B3) & MASK
+
+    size = os.path.getsize(path)
+    eat(size.to_bytes(8, "little"))
+    with open(path, "rb") as f:
+        eat(f.read(SAMPLE))
+        if size > SAMPLE:
+            f.seek(-SAMPLE, os.SEEK_END)
+            eat(f.read(SAMPLE))
+    return f"{h:016x}"
+
+
 class OcrUnavailable(RuntimeError):
     """Vision (or its bridge) is not usable — a directed skip, not a crash."""
 

@@ -16,7 +16,10 @@ pub mod convert;
 pub mod ebook;
 pub mod office;
 pub mod text;
-pub use convert::{extract_with_cache, pages_display_pdf, webarchive_html, CONVERTED_EXTS};
+pub use convert::{
+    extract_with_cache, looks_scanned, ocr_cache_key, ocr_cache_path, ocr_display_pdf,
+    pages_display_pdf, webarchive_html, CONVERTED_EXTS,
+};
 pub use ebook::{cpu_directed_skip, extract_ebook};
 pub use office::extract_office;
 pub use text::extract_text_family;

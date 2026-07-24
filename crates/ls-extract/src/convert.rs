@@ -224,6 +224,105 @@ pub fn pages_display_pdf(path: &Path, cache_dir: &Path) -> Result<PathBuf, Extra
     Ok(cache)
 }
 
+// ---- scanned pdf (OCR) ---------------------------------------------------------
+
+/// Fraction of pages carrying so little text that the page is certainly an
+/// image. The whole-book 200-char floor cannot see this: a scan whose title
+/// page holds a scrap of text clears it, commits as `indexed`, and is never
+/// revisited (ROADMAP-3 §18.1 — 10 such "ghosts" among 462 indexed PDFs).
+const SCANNED_PAGE_CHARS: usize = 50;
+const SCANNED_PAGE_RATIO: f32 = 0.60;
+
+/// True when most of `total_pages` carry no usable text — i.e. OCR is the only
+/// way to read the book.
+///
+/// `total_pages` must come from the document, NOT from `doc.blocks`: a scanned
+/// page yields no block at all, so the pages this needs to count are precisely
+/// the ones missing from the extraction.
+pub fn looks_scanned(doc: &BookDoc, total_pages: usize) -> bool {
+    if total_pages == 0 {
+        return doc.blocks.is_empty();
+    }
+    let mut per_page: std::collections::BTreeMap<u32, usize> = Default::default();
+    for b in &doc.blocks {
+        *per_page.entry(b.page.unwrap_or(0)).or_default() += b.text.chars().count();
+    }
+    let thin = (1..=total_pages)
+        .filter(|p| per_page.get(&(*p as u32)).copied().unwrap_or(0) < SCANNED_PAGE_CHARS)
+        .count();
+    thin as f32 / total_pages as f32 >= SCANNED_PAGE_RATIO
+}
+
+/// FNV-1a over length + head/tail sample.
+///
+/// Deliberately NOT `cache_key`/`content_signature`, which both use Rust's
+/// `DefaultHasher` — unspecified across Rust versions and impossible to
+/// reproduce in Python. The OCR helper is a Python process that must be able
+/// to name the same artifact, and FNV-1a is this repo's existing
+/// cross-language primitive (see `ls-cli`'s `fnv1a`). Keep the two in step.
+pub fn ocr_cache_key(path: &Path) -> Result<String, ExtractError> {
+    use std::io::{Read, Seek, SeekFrom};
+    const SAMPLE: usize = 64 * 1024;
+    let mut f = std::fs::File::open(path).map_err(|e| ExtractError::Io(e.to_string()))?;
+    let len = f
+        .metadata()
+        .map_err(|e| ExtractError::Io(e.to_string()))?
+        .len();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let eat = |bytes: &[u8], h: &mut u64| {
+        for b in bytes {
+            *h ^= *b as u64;
+            *h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    eat(&len.to_le_bytes(), &mut h);
+    let mut buf = vec![0u8; SAMPLE];
+    let n = f
+        .read(&mut buf)
+        .map_err(|e| ExtractError::Io(e.to_string()))?;
+    eat(&buf[..n], &mut h);
+    if len > SAMPLE as u64 {
+        f.seek(SeekFrom::End(-(SAMPLE as i64)))
+            .map_err(|e| ExtractError::Io(e.to_string()))?;
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| ExtractError::Io(e.to_string()))?;
+        eat(&buf[..n], &mut h);
+    }
+    Ok(format!("{h:016x}"))
+}
+
+/// Path of the OCR artifact for `path`, whether or not it exists yet.
+pub fn ocr_cache_path(path: &Path, cache_dir: &Path) -> Result<PathBuf, ExtractError> {
+    cache_file(cache_dir, &format!("{}.ocr", ocr_cache_key(path)?), "pdf")
+}
+
+/// The searchable copy, if one has already been produced. Used both by
+/// extraction (to read the text) and by the bridge's `resolve_display_path`
+/// (to show the reader a copy whose text layer can actually be highlighted).
+pub fn ocr_display_pdf(path: &Path, cache_dir: &Path) -> Option<PathBuf> {
+    let p = ocr_cache_path(path, cache_dir).ok()?;
+    p.exists().then_some(p)
+}
+
+/// Extract a pdf, preferring an existing OCR artifact for a scanned one.
+///
+/// Producing the artifact is deliberately NOT done here: it costs minutes and
+/// needs a Python interpreter, so it belongs to an explicit, cancellable step
+/// (§18.4b), not to an extraction call that runs inside an index batch.
+fn extract_pdf_cached(path: &Path, cache_dir: &Path) -> Result<BookDoc, ExtractError> {
+    if let Some(ocr) = ocr_display_pdf(path, cache_dir) {
+        // Restamp the ORIGINAL identity (§0.b), exactly as .pages does: the
+        // moved-file guard, dedup and "Open in default app" track the source.
+        let mut doc = crate::extract_pdf(&ocr)?;
+        doc.book_id = stable_book_id(path);
+        doc.source_path = path.to_string_lossy().to_string();
+        doc.title = title_of(path);
+        return Ok(doc);
+    }
+    crate::extract_pdf(path)
+}
+
 // ---- .webarchive ---------------------------------------------------------------
 
 /// Cross-platform: a Safari webarchive is a plist whose
@@ -317,6 +416,7 @@ pub fn extract_with_cache(path: &Path, cache_dir: &Path) -> Result<BookDoc, Extr
         Some("pages") => extract_pages(path, cache_dir),
         Some("webarchive") => extract_webarchive(path),
         Some("djvu") => extract_djvu(path, cache_dir),
+        Some("pdf") => extract_pdf_cached(path, cache_dir),
         _ => crate::extract(path),
     }
 }
@@ -331,6 +431,62 @@ mod tests {
             .join(name);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The OCR cache key must match `scripts/ocr_pdf.py::ocr_cache_key` byte
+    /// for byte, or Rust and the helper name different artifacts and the cache
+    /// silently never hits. Vectors below are produced by the Python side; if
+    /// this fails, the two implementations have drifted.
+    #[test]
+    fn ocr_cache_key_matches_the_python_helper() {
+        let dir = tmpdir("ocr-key");
+        // Small (single read, no tail sample) and large (head+tail) cases.
+        let small = dir.join("small.bin");
+        std::fs::write(&small, b"libsearch ocr key vector").unwrap();
+        assert_eq!(ocr_cache_key(&small).unwrap(), "ffc35cad99b2a12a");
+
+        let big = dir.join("big.bin");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&big, &bytes).unwrap();
+        assert_eq!(ocr_cache_key(&big).unwrap(), "cfc6243be73dcb78");
+    }
+
+    /// A book whose pages are nearly all text-less is a scan, even when its
+    /// front matter clears the whole-book 200-char floor (ROADMAP-3 §18.1).
+    #[test]
+    fn looks_scanned_sees_ghosts_the_whole_book_floor_misses() {
+        let mut doc = BookDoc {
+            book_id: "b".into(),
+            title: "t".into(),
+            author: None,
+            source_path: "/x.pdf".into(),
+            format: Format::Pdf,
+            blocks: vec![],
+        };
+        // 1 page of real text, 19 image pages: 250 chars total clears the
+        // 200-char floor, yet 95% of the book is unreadable.
+        doc.blocks.push(Block::new("x".repeat(250), None, Some(1)));
+        assert!(
+            looks_scanned(&doc, 20),
+            "a 1-of-20-page ghost must read as scanned"
+        );
+
+        // A normal book: every page carries text.
+        doc.blocks = (1..=20)
+            .map(|p| Block::new("y".repeat(400), None, Some(p)))
+            .collect();
+        assert!(!looks_scanned(&doc, 20));
+
+        // Front-matter-only scan: those pages are genuinely text, but they are
+        // a small minority of the document.
+        doc.blocks = (1..=6)
+            .map(|p| Block::new("z".repeat(400), None, Some(p)))
+            .collect();
+        assert!(looks_scanned(&doc, 100));
+
+        // No text at all.
+        doc.blocks.clear();
+        assert!(looks_scanned(&doc, 20));
     }
 
     /// A minimal but valid one-page PDF with real text, via lopdf.
