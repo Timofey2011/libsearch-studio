@@ -826,7 +826,9 @@ Report: per-stratum table + provisional (unfrozen) reference rates: book ≥80% 
   fidelity, not text match — unmeasured until the pdfjs spot-check.
 - **Text/en (48):** Located 77% · Miss 23% — a REAL frontend gap (needle
   spanning inline markup / weaker md normalizer), the strongest candidate
-  for an actual UX fix from this baseline.
+  for an actual UX fix from this baseline. **FIXED in v0.16.1** (block-level
+  textContent matching + heading-skip fallback needle): same sample re-ran at
+  **Located 90% · Miss 10%**, meeting the reference rate.
 - Extraction p50 374 ms · p95 2.9 s · max 3.4 s per book; no timeouts.
 
 ### 17.3 Explicitly out of scope (follow-ups, gated on measured rates)

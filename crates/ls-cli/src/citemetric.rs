@@ -79,12 +79,13 @@ pub fn md_norm(s: &str) -> String {
     re(&WS, r"\s+").replace_all(s, " ").trim().to_lowercase()
 }
 
-/// ⇔ App.tsx `renderRich` + `renderInline`: the DOM text nodes the TreeWalker
-/// actually visits. Block markers are stripped; paragraphs join wrapped lines
-/// with spaces; every `**bold**`/`*em*`/`` `code` `` boundary starts a new
-/// text node; `[n]` citation tokens become links (no text node from the
-/// brackets themselves).
-pub fn md_fragments(text: &str) -> Vec<String> {
+/// ⇔ App.tsx `renderRich` block model as seen through `el.textContent`
+/// (v0.16.1 block-level matching): one string per rendered block element,
+/// block markers stripped, wrapped paragraph lines joined with spaces, and
+/// inline `**`/`*`/`` ` `` markers removed (textContent re-joins the inline
+/// fragments seamlessly — that re-join is exactly what fixed the §17.2b 23%
+/// md miss rate). `[n]` citation tokens contribute no block text.
+pub fn md_blocks(text: &str) -> Vec<String> {
     static HEAD: OnceLock<Regex> = OnceLock::new();
     static BULLET: OnceLock<Regex> = OnceLock::new();
     static NUMBERED: OnceLock<Regex> = OnceLock::new();
@@ -150,34 +151,34 @@ pub fn md_fragments(text: &str) -> Vec<String> {
         blocks.push(para.join(" "));
     }
 
-    // renderInline: split each block at inline-markup boundaries.
+    // renderInline through textContent: inline markers vanish, their inner
+    // text re-joins the surrounding text seamlessly; [n] tokens render as
+    // links whose text isn't the source markup — treat as removed.
     static INLINE: OnceLock<Regex> = OnceLock::new();
     let inline = re(
         &INLINE,
         r"\*\*([^*]+)\*\*|\*([^*]+)\*|`([^`]+)`|\[[\d,\s]+\]",
     );
-    let mut frags = Vec::new();
+    let mut out = Vec::new();
     for b in blocks {
+        let mut joined = String::new();
         let mut last = 0;
         for m in inline.find_iter(&b) {
-            if m.start() > last {
-                frags.push(b[last..m.start()].to_string());
-            }
+            joined.push_str(&b[last..m.start()]);
             let cap = inline.captures(&b[m.start()..m.end()]).unwrap();
             for g in 1..=3 {
                 if let Some(inner) = cap.get(g) {
-                    frags.push(inner.as_str().to_string());
+                    joined.push_str(inner.as_str());
                 }
             }
-            // [n] citation tokens contribute no matchable text node.
             last = m.end();
         }
-        if last < b.len() {
-            frags.push(b[last..].to_string());
+        joined.push_str(&b[last..]);
+        if !joined.trim().is_empty() {
+            out.push(joined);
         }
     }
-    frags.retain(|f| !f.trim().is_empty());
-    frags
+    out
 }
 
 /// JS `.slice(0, n)` operates on UTF-16 code units; for BMP text (all of this
@@ -186,15 +187,25 @@ fn js_slice(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// Frontend md matcher: 60-char needle, matched on its first 40 chars per
-/// DOM fragment (App.tsx: needle.slice(0,40) inside norm(node text)).
-pub fn md_match(chunk_text: &str, fragments: &[String]) -> bool {
-    let needle = js_slice(&md_norm(chunk_text), 60);
-    if needle.is_empty() {
-        return false;
+/// Frontend md matcher (v0.16.1): candidate needles — first 40 normalized
+/// chars of the cite, plus the same with the cite's FIRST LINE dropped (chunk
+/// text often starts with its section heading, rendered as a separate block)
+/// — matched against per-block textContent.
+pub fn md_match(chunk_text: &str, blocks: &[String]) -> bool {
+    let mut candidates: Vec<String> = Vec::new();
+    let full = js_slice(&md_norm(chunk_text), 40);
+    if !full.is_empty() {
+        candidates.push(full);
     }
-    let n40 = js_slice(&needle, 40);
-    fragments.iter().any(|f| md_norm(f).contains(&n40))
+    if let Some(nl) = chunk_text.find('\n') {
+        let rest = js_slice(&md_norm(&chunk_text[nl + 1..]), 40);
+        if !rest.is_empty() && !candidates.contains(&rest) {
+            candidates.push(rest);
+        }
+    }
+    candidates
+        .iter()
+        .any(|cand| blocks.iter().any(|b| md_norm(b).contains(cand)))
 }
 
 // ---------------------------------------------------------------------------
@@ -442,25 +453,25 @@ mod tests {
     }
 
     #[test]
-    fn md_fragments_mirror_render_inline_splits() {
-        let frags = md_fragments("# Head\n\npara with **bold part** and `code` end [1]\n\n```\nfence line\n```\n- item one");
+    fn md_blocks_join_inline_fragments_like_text_content() {
+        let blocks = md_blocks("# Head\n\npara with **bold part** and `code` end [1]\n\n```\nfence line\n```\n- item one");
         assert_eq!(
-            frags,
+            blocks,
             vec![
                 "Head",
-                "para with ",
-                "bold part",
-                " and ",
-                "code",
-                " end ",
+                "para with bold part and code end ",
                 "fence line",
                 "item one"
             ]
         );
-        // A needle spanning a bold boundary cannot match one fragment.
-        assert!(!md_match("para with bold part", &frags));
-        // One inside a single fragment can.
-        assert!(md_match("bold part", &frags));
+        // The §17.2b 23%-miss case: a needle spanning a bold boundary now
+        // matches the block's re-joined textContent.
+        assert!(md_match("para with bold part and code", &blocks));
+        assert!(md_match("bold part", &blocks));
+        assert!(!md_match("text that appears nowhere in the doc", &blocks));
+        // Heading-skip fallback: chunk text starting with its section heading
+        // (own block in the DOM) matches via the second candidate needle.
+        assert!(md_match("Head\npara with bold part and code end", &blocks));
     }
 
     fn doc_of(blocks: Vec<ls_core::Block>) -> ls_core::BookDoc {

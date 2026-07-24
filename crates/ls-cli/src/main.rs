@@ -137,7 +137,7 @@ async fn run_cite_metric(
     per_book: usize,
 ) -> Result<()> {
     use citemetric::{
-        classify_book, classify_pdf, family_of, fnv1a, md_fragments, md_match, script_of, BookText,
+        classify_book, classify_pdf, family_of, fnv1a, md_blocks, md_match, script_of, BookText,
         Family, Outcome,
     };
     const SEED: u64 = 0xC17E_0017;
@@ -218,10 +218,10 @@ async fn run_cite_metric(
                         // 8 MiB display cap (read_source_text semantics).
                         let cap = bytes.len().min(8 * 1024 * 1024);
                         let content = String::from_utf8_lossy(&bytes[..cap]);
-                        let frags = md_fragments(&content);
+                        let blocks = md_blocks(&content);
                         for c in &chunks {
                             let Some(t) = texts.get(&c.id) else { continue };
-                            if md_match(t, &frags) {
+                            if md_match(t, &blocks) {
                                 mark(Outcome::ChapterlessLocated, 1);
                             } else {
                                 mark(Outcome::ChapterlessMiss, 1);

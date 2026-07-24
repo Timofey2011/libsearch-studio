@@ -376,20 +376,33 @@ export default function App() {
     if (!host || !(reader?.text || reader?.html) || !cite) return;
     // CROSS-PIN: ported verbatim in crates/ls-cli/src/citemetric.rs (md_norm,
     // md_match) for the §17.1 metric — change both together.
+    //
+    // v0.16.1: match against BLOCK elements, not single text nodes — inline
+    // markup (**bold**, `code`, [n]) fragments a paragraph into several text
+    // nodes, so any needle spanning a marker could never match one node
+    // (§17.2b baseline: 23% of md citations missed). textContent re-joins the
+    // fragments. A second candidate needle skips the cite's first line: chunk
+    // text often STARTS with its section heading, which renders as a separate
+    // h1-h4 block the paragraph needle must not straddle.
     const norm = (x: string) => x.replace(/\s+/g, " ").trim().toLowerCase();
-    const needle = norm(cite).slice(0, 60);
-    if (!needle) return;
-    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
-    let node: Node | null;
-    while ((node = walker.nextNode())) {
-      if (norm(node.textContent ?? "").includes(needle.slice(0, 40))) {
-        const el = node.parentElement;
-        if (el) {
+    const candidates: string[] = [];
+    const full = norm(cite).slice(0, 40);
+    if (full) candidates.push(full);
+    const nl = cite.indexOf("\n");
+    if (nl >= 0) {
+      const rest = norm(cite.slice(nl + 1)).slice(0, 40);
+      if (rest && !candidates.includes(rest)) candidates.push(rest);
+    }
+    if (!candidates.length) return;
+    const blocks = host.querySelectorAll("p, li, h1, h2, h3, h4, pre, blockquote");
+    for (const cand of candidates) {
+      for (const el of blocks) {
+        if (norm(el.textContent ?? "").includes(cand)) {
           el.scrollIntoView({ block: "center" });
           el.classList.add("cite-flash");
           setTimeout(() => el.classList.remove("cite-flash"), 2500);
+          return;
         }
-        break;
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

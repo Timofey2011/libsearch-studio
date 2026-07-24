@@ -2,6 +2,18 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.16.1 — 2026-07-24
+
+Bump manifests 0.16.0 → 0.16.1.
+
+- **Fixed: ~1 in 4 markdown/text citations failed to highlight on open.**
+  The reader matched the cited passage against individual DOM text nodes,
+  and inline formatting (bold, italic, code, citation links) splits a
+  paragraph into several nodes — any cited span crossing a marker could
+  never match. Matching now runs against whole rendered blocks, with a
+  fallback that skips the citation's leading section heading. Measured on
+  the v0.16.0 metric baseline (same sample): located rate 77% → 90%.
+
 ## v0.16.0 — 2026-07-24
 
 Bump manifests 0.15.5 → 0.16.0. Citation accuracy becomes measurable
