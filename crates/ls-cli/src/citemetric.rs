@@ -38,14 +38,66 @@ pub fn fold(s: &str) -> String {
     s.to_lowercase()
 }
 
-/// ⇔ BookReader.tsx `normChapter` (A4c label drift).
+/// ⇔ BookReader.tsx `normChapter` (A4c label drift + §17.2c roman numerals).
 pub fn norm_chapter(s: &str) -> String {
     static PREFIX: OnceLock<Regex> = OnceLock::new();
     static NUM: OnceLock<Regex> = OnceLock::new();
+    static ROMAN: OnceLock<Regex> = OnceLock::new();
     let s = norm_text(s);
-    let s = re(&PREFIX, r"(?i)^(chapter|глава|часть|part)\s+\d+[.:]?\s*").replace(&s, "");
+    let s = re(
+        &PREFIX,
+        r"(?i)^(chapter|глава|часть|part)\s+(\d+|[ivxlcdm]+)\.?:?\s+",
+    )
+    .replace(&s, "");
     let s = re(&NUM, r"^[\d.]+\s*[.:—-]?\s*").replace(&s, "");
+    let s = re(&ROMAN, r"(?i)^[ivxlcdm]+\.\s+").replace(&s, "");
     s.to_lowercase()
+}
+
+/// ⇔ BookReader.tsx `findTocEntry` (§17.2c tiered matching): exact →
+/// containment → best token overlap. Returns the index of the matched label.
+pub fn find_label<'a, I: Iterator<Item = &'a str> + Clone>(
+    labels: I,
+    stored: &str,
+) -> Option<usize> {
+    let want = norm_chapter(stored);
+    if want.is_empty() {
+        return None;
+    }
+    let normed: Vec<String> = labels.map(norm_chapter).collect();
+    if let Some(i) = normed.iter().position(|l| *l == want) {
+        return Some(i);
+    }
+    if want.chars().count() >= 6 {
+        if let Some(i) = normed.iter().position(|l| {
+            l.chars().count() >= 6 && (l.contains(&want) || want.contains(l.as_str()))
+        }) {
+            return Some(i);
+        }
+    }
+    let tokens = |s: &str| -> std::collections::HashSet<String> {
+        s.split(' ')
+            .filter(|w| w.chars().count() >= 3)
+            .map(str::to_string)
+            .collect()
+    };
+    let wt = tokens(&want);
+    if wt.len() < 2 {
+        return None;
+    }
+    let mut best: Option<(usize, f64)> = None;
+    for (i, l) in normed.iter().enumerate() {
+        let lt = tokens(l);
+        if lt.is_empty() {
+            continue;
+        }
+        let common = wt.intersection(&lt).count();
+        let score = common as f64 / (wt.len() + lt.len() - common) as f64;
+        if common >= 2 && score >= 0.6 && best.is_none_or(|(_, b)| score > b) {
+            best = Some((i, score));
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 /// ⇔ BookReader.tsx `citeJump` probe selection: first run of eight
@@ -303,8 +355,9 @@ pub fn classify_book(chapter: Option<&str>, cite_text: &str, book: &BookText) ->
     let anywhere = book.all.contains(&probe);
     match chapter {
         Some(ch) => {
-            let want = norm_chapter(ch);
-            match book.first_runs.iter().find(|(l, _)| *l == want) {
+            let hit = find_label(book.first_runs.iter().map(|(l, _)| l.as_str()), ch)
+                .map(|i| &book.first_runs[i]);
+            match hit {
                 Some((_, run_text)) => {
                     if run_text.contains(&probe) {
                         Outcome::Direct
@@ -438,6 +491,41 @@ mod tests {
         assert_eq!(norm_chapter("Глава 12. Репликация"), "репликация");
         assert_eq!(norm_chapter("2.4 — Consensus"), "consensus");
         assert_eq!(norm_chapter("  Intro  "), "intro");
+        // §17.2c roman numerals — publishers' nav docs number in roman where
+        // fitz TOCs use arabic.
+        assert_eq!(norm_chapter("Part V. Appendixes"), "appendixes");
+        assert_eq!(
+            norm_chapter("Part I. Simplify Your Projects"),
+            "simplify your projects"
+        );
+        assert_eq!(
+            norm_chapter("I. Understanding RESTful Hypermedia"),
+            "understanding restful hypermedia"
+        );
+        // Words starting with roman letters must survive.
+        assert_eq!(norm_chapter("Ideas and Index"), "ideas and index");
+    }
+
+    #[test]
+    fn find_label_tiers_handle_observed_drift() {
+        // Real §17.2c drift pairs (stored fitz label vs foliate nav label).
+        let toc = [
+            "Change History",
+            "Part I. Simplify Your Projects",
+            "1. Orient; Step; Learn",
+            "Part V. Appendixes",
+            "3. Simplify Your Projects",
+        ];
+        let find = |stored: &str| find_label(toc.iter().copied(), stored);
+        // Tier 1 exact (after roman stripping both sides).
+        assert_eq!(find("Part 5: Appendixes"), Some(3));
+        // Tier 3 token overlap: fitz broke the word ("Pa rt 1") — the tokens
+        // {simplify, your, projects} still pin the right entry.
+        assert_eq!(find("Pa rt 1 Simplify Your Projects"), Some(1));
+        // Plain titles still exact-match.
+        assert_eq!(find("Orient; Step; Learn"), Some(2));
+        // Garbage matches nothing.
+        assert_eq!(find("Completely Unrelated Heading Words"), None);
     }
 
     #[test]

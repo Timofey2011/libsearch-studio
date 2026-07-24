@@ -29,14 +29,48 @@ function normText(s) {
 }
 function normChapter(s) {
   return normText(s)
-    .replace(/^(chapter|глава|часть|part)\s+\d+[.:]?\s*/i, "")
+    .replace(/^(chapter|глава|часть|part)\s+(\d+|[ivxlcdm]+)\.?:?\s+/i, "")
     .replace(/^[\d.]+\s*[.:—-]?\s*/, "")
+    .replace(/^[ivxlcdm]+\.\s+/i, "")
     .toLowerCase();
+}
+function findTocEntry(toc, stored) {
+  const want = normChapter(stored);
+  if (!want) return null;
+  const exact = toc.find((t) => normChapter(t.label ?? "") === want);
+  if (exact) return exact;
+  if (want.length >= 6) {
+    const contained = toc.find((t) => {
+      const l = normChapter(t.label ?? "");
+      return l.length >= 6 && (l.includes(want) || want.includes(l));
+    });
+    if (contained) return contained;
+  }
+  const tokens = (s) => new Set(s.split(" ").filter((w) => w.length >= 3));
+  const wt = tokens(want);
+  if (wt.size < 2) return null;
+  let best = null, bestScore = 0;
+  for (const t of toc) {
+    const lt = tokens(normChapter(t.label ?? ""));
+    if (!lt.size) continue;
+    let common = 0;
+    for (const w of wt) if (lt.has(w)) common++;
+    const score = common / (wt.size + lt.size - common);
+    if (common >= 2 && score >= 0.6 && score > bestScore) { best = t; bestScore = score; }
+  }
+  return best;
 }
 function flattenToc(items, out = []) {
   for (const it of items ?? []) {
     out.push(it);
     flattenToc(it.subitems ?? undefined, out);
+  }
+  return out;
+}
+function flattenTocDepth(items, depth = 0, out = []) {
+  for (const it of items ?? []) {
+    out.push({ item: it, depth });
+    flattenTocDepth(it.subitems ?? undefined, depth + 1, out);
   }
   return out;
 }
@@ -64,7 +98,8 @@ for (const book of manifest.epub) {
     view = document.createElement("foliate-view");
     host.append(view);
     await view.open(file);
-    const toc = flattenToc(view.book.toc);
+    const tocd = flattenTocDepth(view.book.toc);
+    const toc = tocd.map((t) => t.item);
     for (const c of book.cases) {
       const t0 = performance.now();
       const probe = probeOf(c.cite);
@@ -72,13 +107,26 @@ for (const book of manifest.epub) {
       let chapterResolved = false;
       try {
         let sectionIndex = null;
+        let sectionEnd = null;
         if (c.chapter) {
-          const want = normChapter(c.chapter);
-          const hit = toc.find((t) => normChapter(t.label ?? "") === want);
+          const hit = findTocEntry(toc, c.chapter);
           if (hit) {
             chapterResolved = true;
             const resolved = await view.book.resolveHref(hit.href);
-            if (resolved && typeof resolved.index === "number") sectionIndex = resolved.index;
+            if (resolved && typeof resolved.index === "number") {
+              sectionIndex = resolved.index;
+              sectionEnd = sectionIndex + 40;
+              const at = tocd.findIndex((t) => t.item === hit);
+              const hitDepth = at >= 0 ? tocd[at].depth : 0;
+              for (let i = at + 1; i < tocd.length; i++) {
+                if (tocd[i].depth > hitDepth) continue;
+                const r = await Promise.resolve(view.book.resolveHref(tocd[i].item.href)).catch(() => null);
+                if (r && typeof r.index === "number" && r.index > sectionIndex) {
+                  sectionEnd = Math.min(sectionEnd, r.index);
+                  break;
+                }
+              }
+            }
           }
         }
         const firstHit = async (index) => {
@@ -89,7 +137,13 @@ for (const book of manifest.epub) {
           }
           return null;
         };
-        if (sectionIndex != null && (await firstHit(sectionIndex))) outcome = "direct";
+        let phase1 = null;
+        if (sectionIndex != null) {
+          for (let i = sectionIndex; i < (sectionEnd ?? sectionIndex + 1) && !phase1; i++) {
+            phase1 = await firstHit(i);
+          }
+        }
+        if (phase1) outcome = "direct";
         else if (await firstHit()) outcome = "located";
         else outcome = chapterResolved ? "miss-in-chapter" : "cold-miss";
         view.clearSearch?.();

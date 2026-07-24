@@ -2,6 +2,22 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.16.2 — 2026-07-24
+
+Bump manifests 0.16.1 → 0.16.2.
+
+- **Book citations now jump straight to the cited chapter 60% of the time
+  (was 25%)** — measured on the DOM-side harness against real library
+  citations. Two fixes: (a) tiered chapter→TOC matching (exact, then
+  containment, then token overlap, with roman-numeral prefix handling) —
+  stored chapter labels come from a different TOC parser than the reader's
+  and rarely matched exactly (labels now resolve in 85% of sampled books,
+  was ~29%); (b) the chapter-scoped search now covers the chapter's whole
+  section range at the correct TOC depth — a "Part" label spans all its
+  chapters, not just its title page. Direct jumps land in ~0.6 s median vs
+  4–15 s for whole-book fallbacks; a wrong label match stays harmless (the
+  probe search verifies, and the whole-book fallback is unchanged).
+
 ## v0.16.1 — 2026-07-24
 
 Bump manifests 0.16.0 → 0.16.1.

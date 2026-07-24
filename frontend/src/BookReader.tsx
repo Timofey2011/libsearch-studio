@@ -54,18 +54,74 @@ function normText(s: string): string {
 }
 
 /// TOC-label normalization (amendment A4c): stored chapter strings and
-/// foliate's parsed labels drift on numbering and whitespace.
+/// foliate's parsed labels drift on numbering and whitespace. Roman-numeral
+/// prefixes ("Part V.", "I. Understanding …") are stripped like arabic ones —
+/// fitz TOCs number in arabic where publishers' nav docs use roman (§17.2c).
 function normChapter(s: string): string {
   return normText(s)
-    .replace(/^(chapter|глава|часть|part)\s+\d+[.:]?\s*/i, "")
+    .replace(/^(chapter|глава|часть|part)\s+(\d+|[ivxlcdm]+)\.?:?\s+/i, "")
     .replace(/^[\d.]+\s*[.:—-]?\s*/, "")
+    .replace(/^[ivxlcdm]+\.\s+/i, "")
     .toLowerCase();
+}
+
+/// Tiered chapter→TOC matching (§17.2c: exact equality resolved in only ~2 of
+/// 12 books — fitz labels carry broken words ("Pa rt") and different numbering
+/// than foliate's nav labels). A wrong pick is safe: phase-1 search verifies
+/// with the probe and falls back to the whole-book search on a miss.
+function findTocEntry(toc: TocItem[], stored: string): TocItem | null {
+  const want = normChapter(stored);
+  if (!want) return null;
+  // Tier 1: exact normalized equality.
+  const exact = toc.find((t) => normChapter(t.label ?? "") === want);
+  if (exact) return exact;
+  // Tier 2: containment either way (guard against tiny fragments).
+  if (want.length >= 6) {
+    const contained = toc.find((t) => {
+      const l = normChapter(t.label ?? "");
+      return l.length >= 6 && (l.includes(want) || want.includes(l));
+    });
+    if (contained) return contained;
+  }
+  // Tier 3: best token overlap — robust to broken words and numbering.
+  const tokens = (s: string) => new Set(s.split(" ").filter((w) => w.length >= 3));
+  const wt = tokens(want);
+  if (wt.size < 2) return null;
+  let best: TocItem | null = null;
+  let bestScore = 0;
+  for (const t of toc) {
+    const lt = tokens(normChapter(t.label ?? ""));
+    if (!lt.size) continue;
+    let common = 0;
+    for (const w of wt) if (lt.has(w)) common++;
+    const score = common / (wt.size + lt.size - common);
+    if (common >= 2 && score >= 0.6 && score > bestScore) {
+      best = t;
+      bestScore = score;
+    }
+  }
+  return best;
 }
 
 function flattenToc(items: TocItem[] | undefined, out: TocItem[] = []): TocItem[] {
   for (const it of items ?? []) {
     out.push(it);
     flattenToc(it.subitems ?? undefined, out);
+  }
+  return out;
+}
+
+/// Flatten with depth — the §17.2c section-range fix needs to know where a
+/// matched entry's SCOPE ends: a "Part N" label spans everything up to the
+/// next same-or-shallower entry, not just up to its own first chapter.
+function flattenTocDepth(
+  items: TocItem[] | undefined,
+  depth = 0,
+  out: { item: TocItem; depth: number }[] = []
+): { item: TocItem; depth: number }[] {
+  for (const it of items ?? []) {
+    out.push({ item: it, depth });
+    flattenTocDepth(it.subitems ?? undefined, depth + 1, out);
   }
   return out;
 }
@@ -148,17 +204,40 @@ export default function BookReader({
     const probe = words.slice(at, at + 8).join(" ");
     if (!probe) return;
 
-    // Resolve the chapter to a section index via normalized TOC labels.
+    // Resolve the chapter to a section index via tiered TOC matching.
     let sectionIndex: number | null = null;
     let chapterHref: string | null = null;
+    // A chapter often spans SEVERAL spine sections while foliate's search is
+    // per-section (§17.2c: half the sample resolved the chapter yet phase-1
+    // missed) — so resolve a section RANGE: the entry's section up to the
+    // next TOC entry that starts a different section, capped.
+    let sectionEnd: number | null = null;
     if (chap) {
-      const want = normChapter(chap);
-      const hit = flattenToc(view.book.toc).find((t) => normChapter(t.label) === want);
+      const tocd = flattenTocDepth(view.book.toc);
+      const hit = findTocEntry(tocd.map((t) => t.item), chap);
       if (hit) {
         chapterHref = hit.href;
         try {
           const resolved = await view.book.resolveHref(hit.href);
-          if (resolved && typeof resolved.index === "number") sectionIndex = resolved.index;
+          if (resolved && typeof resolved.index === "number") {
+            sectionIndex = resolved.index;
+            sectionEnd = sectionIndex + 40; // cap the scoped sweep
+            const at = tocd.findIndex((t) => t.item === hit);
+            const hitDepth = at >= 0 ? tocd[at].depth : 0;
+            for (let i = at + 1; i < tocd.length; i++) {
+              // The entry's scope ends at the next SAME-OR-SHALLOWER entry
+              // (a Part label spans all its chapters). resolveHref may return
+              // a plain value OR a promise.
+              if (tocd[i].depth > hitDepth) continue;
+              const r = await Promise.resolve(view.book.resolveHref(tocd[i].item.href)).catch(
+                () => null
+              );
+              if (r && typeof r.index === "number" && r.index > sectionIndex) {
+                sectionEnd = Math.min(sectionEnd, r.index);
+                break;
+              }
+            }
+          }
         } catch {
           /* fall through to whole-book */
         }
@@ -179,15 +258,18 @@ export default function BookReader({
       return null;
     };
 
-    // (1) chapter-scoped search.
+    // (1) chapter-scoped search across the chapter's section range.
     if (sectionIndex != null) {
-      const cfi = await firstHit(sectionIndex);
-      if (cfi) {
-        await view.goTo(cfi).catch(() => {});
-        setTimeout(() => viewRef.current === view && view.clearSearch(), 2500);
-        return;
+      for (let i = sectionIndex; i < (sectionEnd ?? sectionIndex + 1); i++) {
+        const cfi = await firstHit(i);
+        if (viewRef.current !== view) return;
+        if (cfi) {
+          await view.goTo(cfi).catch(() => {});
+          setTimeout(() => viewRef.current === view && view.clearSearch(), 2500);
+          return;
+        }
+        view.clearSearch();
       }
-      view.clearSearch();
     }
     // (2) land somewhere sensible immediately, then search the whole book
     // asynchronously — the UI must never block on a multi-MB epub.

@@ -849,6 +849,15 @@ the measurement §17.1's proxy cannot make:
   align with pdfjs page ordinals; the §17.2b lopdf "probe nowhere" rows were
   the proxy's noise (lopdf text extraction), not real jump failures.
 
+**v0.16.2 label reconciliation (same day):** tiered chapter→TOC matching
+(exact → containment → token overlap; roman-numeral prefixes stripped) raised
+label resolution 29%→85% of sampled books; depth-aware section-range search
+(a Part label's scope runs to the next same-or-shallower TOC entry, cap 40
+sections) converted the scoped misses: **direct 25% → 60%**, located 25%,
+land rate 85% (median direct 0.6 s vs 4–15 s whole-book). Verified on the
+DOM harness; probe verification + whole-book fallback make a wrong label
+match harmless.
+
 **Frozen thresholds** (DOM-side, re-run the harness to verify): epub ≥80%
 land (direct+located), pdf ≥80% on-page. Proxy-side (`ls-cli cite-metric`)
 stays a fast integrity/regression signal with unfrozen reference rates.
