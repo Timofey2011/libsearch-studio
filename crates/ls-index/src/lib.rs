@@ -9,4 +9,4 @@ pub mod store;
 
 pub use chunk::{chunk_book, ChunkParams};
 pub use ls_core::{TokenCounter, WhitespaceCounter};
-pub use store::{RetrievedChunk, Store, StoreError};
+pub use store::{ChunkMeta, RetrievedChunk, Store, StoreError};

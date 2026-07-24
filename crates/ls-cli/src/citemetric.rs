@@ -1,0 +1,579 @@
+//! §17.1 citation-integrity metric — store↔display integrity over the real
+//! store. NOT a DOM-side jump measurement (the harness re-extracts with the
+//! same code that produced the chunks); the report header states the known
+//! inflation/deflation caveats. No models, no network.
+//!
+//! The matcher replicas below are VERBATIM ports; cross-pins:
+//! - norm_text / norm_chapter  ⇔ frontend/src/BookReader.tsx `normText`/`normChapter`
+//! - probe_of                  ⇔ frontend/src/BookReader.tsx `citeJump` probe selection
+//! - md_norm / md_fragments    ⇔ frontend/src/App.tsx TreeWalker norm + renderRich/renderInline
+//!
+//! JS `\w` is ASCII-only — the dehyphenation classes here deliberately exclude
+//! Cyrillic (the frontend never dehyphenates RU; a Unicode `\w` port would
+//! silently diverge). The extra lowercase in `fold` emulates foliate's
+//! case-insensitive collator (sensitivity 'base'); diacritic folding is NOT
+//! emulated (rare in this library, noted in the report).
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use regex::Regex;
+
+fn re(cell: &'static OnceLock<Regex>, pat: &str) -> &'static Regex {
+    cell.get_or_init(|| Regex::new(pat).expect("static regex"))
+}
+
+/// ⇔ BookReader.tsx `normText` (soft hyphens, ASCII line-break hyphenation,
+/// whitespace collapse).
+pub fn norm_text(s: &str) -> String {
+    static HYPH: OnceLock<Regex> = OnceLock::new();
+    static WS: OnceLock<Regex> = OnceLock::new();
+    let s = s.replace('\u{00AD}', "");
+    let s = re(&HYPH, r"([0-9A-Za-z_])-\s+([0-9A-Za-z_])").replace_all(&s, "$1$2");
+    re(&WS, r"\s+").replace_all(&s, " ").trim().to_string()
+}
+
+/// Foliate collator emulation (case-insensitivity only).
+pub fn fold(s: &str) -> String {
+    s.to_lowercase()
+}
+
+/// ⇔ BookReader.tsx `normChapter` (A4c label drift).
+pub fn norm_chapter(s: &str) -> String {
+    static PREFIX: OnceLock<Regex> = OnceLock::new();
+    static NUM: OnceLock<Regex> = OnceLock::new();
+    let s = norm_text(s);
+    let s = re(&PREFIX, r"(?i)^(chapter|глава|часть|part)\s+\d+[.:]?\s*").replace(&s, "");
+    let s = re(&NUM, r"^[\d.]+\s*[.:—-]?\s*").replace(&s, "");
+    s.to_lowercase()
+}
+
+/// ⇔ BookReader.tsx `citeJump` probe selection: first run of eight
+/// consecutive "wordy" words (≥2 letter chars), else fall back to the first
+/// eight tokens INCLUDING junk (`at = 0`) — that fallback fires exactly on
+/// the junk-prefixed legacy chunks, so it must be ported, not idealized.
+pub fn probe_of(cite: &str) -> String {
+    let normed = norm_text(cite);
+    if normed.is_empty() {
+        return String::new();
+    }
+    let words: Vec<&str> = normed.split(' ').collect();
+    let wordy = |w: &str| w.chars().filter(|c| c.is_alphabetic()).count() >= 2;
+    let mut at = None;
+    if words.len() >= 8 {
+        for i in 0..=(words.len() - 8) {
+            if words[i..i + 8].iter().all(|w| wordy(w)) {
+                at = Some(i);
+                break;
+            }
+        }
+    }
+    let at = at.unwrap_or(0);
+    words[at..(at + 8).min(words.len())].join(" ")
+}
+
+/// ⇔ App.tsx TreeWalker `norm` (whitespace collapse + lowercase — weaker than
+/// normText by design; the md path never dehyphenates).
+pub fn md_norm(s: &str) -> String {
+    static WS: OnceLock<Regex> = OnceLock::new();
+    re(&WS, r"\s+").replace_all(s, " ").trim().to_lowercase()
+}
+
+/// ⇔ App.tsx `renderRich` + `renderInline`: the DOM text nodes the TreeWalker
+/// actually visits. Block markers are stripped; paragraphs join wrapped lines
+/// with spaces; every `**bold**`/`*em*`/`` `code` `` boundary starts a new
+/// text node; `[n]` citation tokens become links (no text node from the
+/// brackets themselves).
+pub fn md_fragments(text: &str) -> Vec<String> {
+    static HEAD: OnceLock<Regex> = OnceLock::new();
+    static BULLET: OnceLock<Regex> = OnceLock::new();
+    static NUMBERED: OnceLock<Regex> = OnceLock::new();
+    let head = re(&HEAD, r"^\s*#{1,4}\s+(.*)$");
+    let bullet = re(&BULLET, r"^\s*[-*]\s+(.*)$");
+    let numbered = re(&NUMBERED, r"^\s*\d+\.\s+(.*)$");
+
+    let mut blocks: Vec<String> = Vec::new();
+    let mut para: Vec<String> = Vec::new();
+    let mut in_code = false;
+    let mut code: Vec<String> = Vec::new();
+    for raw in text.split('\n') {
+        let line = raw.trim_end();
+        if in_code {
+            if line.trim_start().starts_with("```") {
+                blocks.push(code.join("\n"));
+                code.clear();
+                in_code = false;
+            } else {
+                code.push(raw.to_string());
+            }
+            continue;
+        }
+        if line.trim_start().starts_with("```") {
+            if !para.is_empty() {
+                blocks.push(para.join(" "));
+                para.clear();
+            }
+            in_code = true;
+            continue;
+        }
+        if let Some(c) = head.captures(line) {
+            if !para.is_empty() {
+                blocks.push(para.join(" "));
+                para.clear();
+            }
+            blocks.push(c[1].to_string());
+        } else if let Some(c) = bullet.captures(line) {
+            if !para.is_empty() {
+                blocks.push(para.join(" "));
+                para.clear();
+            }
+            blocks.push(c[1].to_string());
+        } else if let Some(c) = numbered.captures(line) {
+            if !para.is_empty() {
+                blocks.push(para.join(" "));
+                para.clear();
+            }
+            blocks.push(c[1].to_string());
+        } else if line.trim().is_empty() {
+            if !para.is_empty() {
+                blocks.push(para.join(" "));
+                para.clear();
+            }
+        } else {
+            para.push(line.to_string());
+        }
+    }
+    if in_code {
+        blocks.push(code.join("\n"));
+    }
+    if !para.is_empty() {
+        blocks.push(para.join(" "));
+    }
+
+    // renderInline: split each block at inline-markup boundaries.
+    static INLINE: OnceLock<Regex> = OnceLock::new();
+    let inline = re(
+        &INLINE,
+        r"\*\*([^*]+)\*\*|\*([^*]+)\*|`([^`]+)`|\[[\d,\s]+\]",
+    );
+    let mut frags = Vec::new();
+    for b in blocks {
+        let mut last = 0;
+        for m in inline.find_iter(&b) {
+            if m.start() > last {
+                frags.push(b[last..m.start()].to_string());
+            }
+            let cap = inline.captures(&b[m.start()..m.end()]).unwrap();
+            for g in 1..=3 {
+                if let Some(inner) = cap.get(g) {
+                    frags.push(inner.as_str().to_string());
+                }
+            }
+            // [n] citation tokens contribute no matchable text node.
+            last = m.end();
+        }
+        if last < b.len() {
+            frags.push(b[last..].to_string());
+        }
+    }
+    frags.retain(|f| !f.trim().is_empty());
+    frags
+}
+
+/// JS `.slice(0, n)` operates on UTF-16 code units; for BMP text (all of this
+/// library) that equals chars.
+fn js_slice(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// Frontend md matcher: 60-char needle, matched on its first 40 chars per
+/// DOM fragment (App.tsx: needle.slice(0,40) inside norm(node text)).
+pub fn md_match(chunk_text: &str, fragments: &[String]) -> bool {
+    let needle = js_slice(&md_norm(chunk_text), 60);
+    if needle.is_empty() {
+        return false;
+    }
+    let n40 = js_slice(&needle, 40);
+    fragments.iter().any(|f| md_norm(f).contains(&n40))
+}
+
+// ---------------------------------------------------------------------------
+// Outcome classification
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Outcome {
+    /// Book: chapter label resolved AND probe in the FIRST block-run carrying
+    /// that label (frontend phase-1 scope). Pdf: probe on the stored page.
+    Direct,
+    /// Pdf only: probe on page ±1 (chunk crossing its page boundary).
+    Near,
+    /// Probe found, but not where the citation claims (frontend phase-2 hit).
+    Located,
+    /// Chapter label resolved, probe nowhere — the app still lands the user
+    /// in the chapter and shows the explicit-miss overlay.
+    MissInChapter,
+    /// Nothing resolved, probe nowhere — overlay at text start.
+    ColdMiss,
+    /// Chunk carries no chapter (excluded from the direct denominator).
+    ChapterlessLocated,
+    ChapterlessMiss,
+    /// mobi/azw3 — extractor is best-effort; not comparable, never "miss".
+    Unverifiable,
+    /// Family with a different render pipeline (html/office/pages/djvu).
+    UnverifiedFamily,
+    ExtractTimeout,
+    ExtractError,
+}
+
+pub struct BookText {
+    /// (normalized+folded chapter label, folded text of that label's FIRST
+    /// consecutive block-run).
+    pub first_runs: Vec<(String, String)>,
+    /// Folded whole-book text.
+    pub all: String,
+    /// Folded text per page (pdf only).
+    pub pages: HashMap<u32, String>,
+}
+
+impl BookText {
+    pub fn from_doc(doc: &ls_core::BookDoc) -> Self {
+        let mut first_runs: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cur_label: Option<String> = None;
+        let mut cur_text = String::new();
+        let mut all = String::new();
+        let mut pages: HashMap<u32, String> = HashMap::new();
+        let mut flush =
+            |label: &Option<String>, text: &mut String, runs: &mut Vec<(String, String)>| {
+                if let Some(l) = label {
+                    if !seen.contains(l) {
+                        seen.insert(l.clone());
+                        runs.push((l.clone(), std::mem::take(text)));
+                        return;
+                    }
+                }
+                text.clear();
+            };
+        for b in &doc.blocks {
+            let label = b.chapter.as_deref().map(norm_chapter);
+            if label != cur_label {
+                flush(&cur_label, &mut cur_text, &mut first_runs);
+                cur_label = label;
+            }
+            let folded = fold(&norm_text(&b.text));
+            if cur_label.is_some() {
+                cur_text.push_str(&folded);
+                cur_text.push(' ');
+            }
+            all.push_str(&folded);
+            all.push(' ');
+            if let Some(p) = b.page {
+                let e = pages.entry(p).or_default();
+                e.push_str(&folded);
+                e.push(' ');
+            }
+        }
+        flush(&cur_label, &mut cur_text, &mut first_runs);
+        BookText {
+            first_runs,
+            all,
+            pages,
+        }
+    }
+}
+
+/// Book-family classification (epub/fb2): §17.1 taxonomy.
+pub fn classify_book(chapter: Option<&str>, cite_text: &str, book: &BookText) -> Outcome {
+    let probe = fold(&probe_of(cite_text));
+    if probe.is_empty() {
+        return Outcome::ColdMiss;
+    }
+    let anywhere = book.all.contains(&probe);
+    match chapter {
+        Some(ch) => {
+            let want = norm_chapter(ch);
+            match book.first_runs.iter().find(|(l, _)| *l == want) {
+                Some((_, run_text)) => {
+                    if run_text.contains(&probe) {
+                        Outcome::Direct
+                    } else if anywhere {
+                        Outcome::Located
+                    } else {
+                        Outcome::MissInChapter
+                    }
+                }
+                None => {
+                    if anywhere {
+                        Outcome::Located
+                    } else {
+                        Outcome::ColdMiss
+                    }
+                }
+            }
+        }
+        None => {
+            if anywhere {
+                Outcome::ChapterlessLocated
+            } else {
+                Outcome::ChapterlessMiss
+            }
+        }
+    }
+}
+
+/// Pdf classification: "stored page still contains the passage per lopdf".
+pub fn classify_pdf(page: Option<u32>, cite_text: &str, book: &BookText) -> Outcome {
+    let probe = fold(&probe_of(cite_text));
+    if probe.is_empty() {
+        return Outcome::ColdMiss;
+    }
+    let anywhere = book.all.contains(&probe);
+    match page {
+        Some(p) => {
+            let on = |q: u32| book.pages.get(&q).is_some_and(|t| t.contains(&probe));
+            if on(p) {
+                Outcome::Direct
+            } else if on(p.saturating_sub(1)) || on(p + 1) {
+                Outcome::Near
+            } else if anywhere {
+                Outcome::Located
+            } else {
+                Outcome::MissInChapter // page stamp exists, passage gone
+            }
+        }
+        None => {
+            if anywhere {
+                Outcome::ChapterlessLocated
+            } else {
+                Outcome::ChapterlessMiss
+            }
+        }
+    }
+}
+
+/// Display family for a raw stored format string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Family {
+    Book,
+    BookUnverifiable, // mobi/azw3
+    Text,             // md/txt (raw-file render path)
+    Pdf,
+    Unverified, // html/office/pages/djvu — different render pipelines
+    Unknown,
+}
+
+pub fn family_of(format: &str) -> Family {
+    match format {
+        "epub" | "fb2" | "fb2.zip" => Family::Book,
+        "mobi" | "azw3" => Family::BookUnverifiable,
+        "md" | "markdown" | "txt" | "text" => Family::Text,
+        "pdf" => Family::Pdf,
+        "html" | "htm" | "docx" | "rtf" | "odt" | "doc" | "pages" | "webarchive" | "djvu"
+        | "rst" | "adoc" | "org" | "tex" | "ipynb" | "xps" => Family::Unverified,
+        _ => Family::Unknown,
+    }
+}
+
+/// RU/EN stratum from the book title's Cyrillic letter fraction (title is the
+/// only text available in the metadata pass; documented proxy).
+pub fn script_of(title: &str) -> &'static str {
+    let letters: Vec<char> = title.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.is_empty() {
+        return "en";
+    }
+    let cyr = letters
+        .iter()
+        .filter(|c| ('\u{0400}'..='\u{04FF}').contains(*c))
+        .count();
+    // Ties (mixed titles like "Чистый Python") count as ru — the body text
+    // of such books is Russian.
+    if cyr * 2 >= letters.len() {
+        "ru"
+    } else {
+        "en"
+    }
+}
+
+/// FNV-1a over a chunk/book id XOR a fixed seed — deterministic, dependency-
+/// free, keyed on identity (survives lance compaction and version churn;
+/// std's DefaultHasher is version-unstable and unfit for a baseline).
+pub fn fnv1a(key: &str, seed: u64) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325 ^ seed;
+    for b in key.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn norm_text_matches_frontend_semantics() {
+        // Soft hyphen stripped; ASCII hyphenation joined; whitespace collapsed.
+        assert_eq!(norm_text("cash\u{00AD}flow"), "cashflow");
+        assert_eq!(norm_text("data-\n  base systems"), "database systems");
+        assert_eq!(norm_text("  a\t b\nc "), "a b c");
+        // JS \w is ASCII: Cyrillic hyphenation must NOT join (frontend parity).
+        assert_eq!(norm_text("програм-\nмирование"), "програм- мирование");
+    }
+
+    #[test]
+    fn norm_chapter_strips_prefixes() {
+        assert_eq!(norm_chapter("Chapter 3: Sagas"), "sagas");
+        assert_eq!(norm_chapter("Глава 12. Репликация"), "репликация");
+        assert_eq!(norm_chapter("2.4 — Consensus"), "consensus");
+        assert_eq!(norm_chapter("  Intro  "), "intro");
+    }
+
+    #[test]
+    fn probe_skips_junk_prefix_with_at_zero_fallback() {
+        // Junk prefix followed by 8 wordy words → skips the junk.
+        let cite = "() } ; the quick brown foxes jump over lazy dogs today";
+        assert_eq!(probe_of(cite), "the quick brown foxes jump over lazy dogs");
+        // No run of 8 wordy words anywhere → falls back to the first 8 tokens.
+        let junk = "x1 y2 } { ~ q4 z9 !! ?? aa";
+        assert_eq!(probe_of(junk), "x1 y2 } { ~ q4 z9 !!");
+        // Shorter than 8 words → whole thing.
+        assert_eq!(probe_of("only three words"), "only three words");
+    }
+
+    #[test]
+    fn md_fragments_mirror_render_inline_splits() {
+        let frags = md_fragments("# Head\n\npara with **bold part** and `code` end [1]\n\n```\nfence line\n```\n- item one");
+        assert_eq!(
+            frags,
+            vec![
+                "Head",
+                "para with ",
+                "bold part",
+                " and ",
+                "code",
+                " end ",
+                "fence line",
+                "item one"
+            ]
+        );
+        // A needle spanning a bold boundary cannot match one fragment.
+        assert!(!md_match("para with bold part", &frags));
+        // One inside a single fragment can.
+        assert!(md_match("bold part", &frags));
+    }
+
+    fn doc_of(blocks: Vec<ls_core::Block>) -> ls_core::BookDoc {
+        ls_core::BookDoc {
+            book_id: "b".into(),
+            title: "t".into(),
+            author: None,
+            source_path: "/lib/t.epub".into(),
+            format: ls_core::Format::Epub,
+            blocks,
+        }
+    }
+
+    #[test]
+    fn book_classification_taxonomy() {
+        use ls_core::Block;
+        let doc = doc_of(vec![
+            Block::new(
+                "Alpha beta gamma delta epsilon zeta eta theta",
+                Some("Chapter 1: Intro".into()),
+                None,
+            ),
+            Block::new(
+                "Second chapter body words entirely different content here",
+                Some("Chapter 2: Sagas".into()),
+                None,
+            ),
+        ]);
+        let bt = BookText::from_doc(&doc);
+        // Probe within the named chapter's first run → Direct.
+        assert_eq!(
+            classify_book(
+                Some("Intro"),
+                "Alpha beta gamma delta epsilon zeta eta theta",
+                &bt
+            ),
+            Outcome::Direct
+        );
+        // Right text, wrong chapter label → Located (phase-2 hit).
+        assert_eq!(
+            classify_book(
+                Some("Sagas"),
+                "Alpha beta gamma delta epsilon zeta eta theta",
+                &bt
+            ),
+            Outcome::Located
+        );
+        // Chapter resolves, probe nowhere → MissInChapter.
+        assert_eq!(
+            classify_book(
+                Some("Intro"),
+                "totally absent probe words go here now ok",
+                &bt
+            ),
+            Outcome::MissInChapter
+        );
+        // No label match, probe nowhere → ColdMiss.
+        assert_eq!(
+            classify_book(
+                Some("Nope"),
+                "totally absent probe words go here now ok",
+                &bt
+            ),
+            Outcome::ColdMiss
+        );
+        // Chapterless chunk rows.
+        assert_eq!(
+            classify_book(
+                None,
+                "Second chapter body words entirely different content here",
+                &bt
+            ),
+            Outcome::ChapterlessLocated
+        );
+    }
+
+    #[test]
+    fn pdf_on_page_and_near() {
+        use ls_core::Block;
+        let doc = doc_of(vec![
+            Block::new(
+                "first page words for the probe matching test here",
+                None,
+                Some(1),
+            ),
+            Block::new(
+                "second page other content lives here entirely now yes",
+                None,
+                Some(2),
+            ),
+        ]);
+        let bt = BookText::from_doc(&doc);
+        let cite = "first page words for the probe matching test";
+        assert_eq!(classify_pdf(Some(1), cite, &bt), Outcome::Direct);
+        assert_eq!(classify_pdf(Some(2), cite, &bt), Outcome::Near);
+        assert_eq!(classify_pdf(Some(9), cite, &bt), Outcome::Located);
+    }
+
+    #[test]
+    fn sampling_hash_is_stable() {
+        assert_eq!(fnv1a("book-1", 42), fnv1a("book-1", 42));
+        assert_ne!(fnv1a("book-1", 42), fnv1a("book-2", 42));
+        assert_ne!(fnv1a("book-1", 42), fnv1a("book-1", 43));
+    }
+
+    #[test]
+    fn family_and_script_strata() {
+        assert_eq!(family_of("epub"), Family::Book);
+        assert_eq!(family_of("mobi"), Family::BookUnverifiable);
+        assert_eq!(family_of("md"), Family::Text);
+        assert_eq!(family_of("docx"), Family::Unverified);
+        assert_eq!(family_of("weird"), Family::Unknown);
+        assert_eq!(script_of("Чистый Python"), "ru");
+        assert_eq!(script_of("Effective Kotlin"), "en");
+    }
+}

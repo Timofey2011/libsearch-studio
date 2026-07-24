@@ -12,10 +12,11 @@ path = "src/main.rs"
 [dependencies]
 ls-app = { workspace = true }
 ls-core = { workspace = true }
+regex = { workspace = true }
 ls-index = { workspace = true }
 ls-embed = { workspace = true }
 ls-extract = { workspace = true }
 ls-query = { workspace = true }
 ls-llm = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 anyhow = "1"

@@ -94,27 +94,34 @@ const CORPUS: &[(&str, &str, &str)] = &[
 ];
 
 /// Paragraph-per-chunk (chunking has its own unit tests; this harness targets
-/// retrieval). Returns unembedded chunks.
+/// retrieval). A standalone `# Heading` paragraph is CONSUMED as the running
+/// chapter label (mirroring the md ingest scanner) — it never becomes a chunk,
+/// so adding headings to a fixture leaves every existing chunk byte-identical.
+/// A book with headings is stored as Epub with no page stamps (chapters render
+/// as `Ch. …`); a heading-free book keeps the original Pdf/page shape.
 fn chunks_for(book_id: &str, title: &str, text: &str) -> Vec<Chunk> {
+    let mut labeled: Vec<(Option<String>, &str)> = Vec::new();
+    let mut current: Option<String> = None;
+    for para in text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some(rest) = para.strip_prefix("# ").or_else(|| para.strip_prefix("## ")) {
+            current = Some(rest.trim().to_string());
+        } else {
+            labeled.push((current.clone(), para));
+        }
+    }
+    let chaptered = labeled.iter().any(|(c, _)| c.is_some());
     let mut out = Vec::new();
     let mut offset = 0usize;
-    for (i, para) in text
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .enumerate()
-    {
+    for (i, (chapter, para)) in labeled.into_iter().enumerate() {
         out.push(Chunk {
             id: format!("{book_id}:{i}"),
             book_id: book_id.into(),
             title: title.into(),
             author: None,
             source_path: format!("/fixtures/{book_id}.md"),
-            // The corpus is .md but Format has no Md variant at the store level
-            // the harness cares about; Pdf keeps citations page-shaped.
-            format: Format::Pdf,
-            chapter: None,
-            page: Some(i as u32 + 1),
+            format: if chaptered { Format::Epub } else { Format::Pdf },
+            chapter,
+            page: if chaptered { None } else { Some(i as u32 + 1) },
             loc_start: offset,
             loc_end: offset + para.chars().count(),
             text: para.replace('\n', " "),
@@ -154,6 +161,11 @@ struct Case {
     /// The book that must appear within `within_top` results (None = noise probe).
     expect_book: Option<&'static str>,
     within_top: usize,
+    /// §17.2: at least ONE expected-book hit within FINAL_K must carry a
+    /// chapter containing this substring (case-insensitive). Deliberately not
+    /// pinned to the top chunk — intra-book tie-breaks depend on which
+    /// reranker build (int8 vs f32) a developer runs.
+    expect_chapter: Option<&'static str>,
 }
 
 const fn case(name: &'static str, query: &'static str, expect: &'static str, top: usize) -> Case {
@@ -163,6 +175,24 @@ const fn case(name: &'static str, query: &'static str, expect: &'static str, top
         context: None,
         expect_book: Some(expect),
         within_top: top,
+        expect_chapter: None,
+    }
+}
+
+const fn case_ch(
+    name: &'static str,
+    query: &'static str,
+    expect: &'static str,
+    top: usize,
+    chapter: &'static str,
+) -> Case {
+    Case {
+        name,
+        query,
+        context: None,
+        expect_book: Some(expect),
+        within_top: top,
+        expect_chapter: Some(chapter),
     }
 }
 
@@ -296,6 +326,36 @@ async fn golden_set() {
             "port-ru",
             3,
         ),
+        // §17.2 golden chapter Q/A: the citation must carry the RIGHT chapter,
+        // guarding embed→store→retrieve→citation chapter plumbing end to end.
+        case_ch(
+            "chapter-en-compensation",
+            "undoing finished saga steps with explicit compensating actions",
+            "sagas",
+            3,
+            "compensat",
+        ),
+        case_ch(
+            "chapter-en-orchestration",
+            "choreography versus a central orchestrator coordinating a saga",
+            "sagas",
+            3,
+            "choreography",
+        ),
+        case_ch(
+            "chapter-ru-quorum",
+            "запись подтверждена w узлами из n при кворумной репликации",
+            "repl-ru",
+            3,
+            "кворум",
+        ),
+        case_ch(
+            "chapter-ru-conflicts",
+            "как разрешаются конфликты при мультилидерной репликации",
+            "repl-ru",
+            3,
+            "конфликт",
+        ),
         // Follow-up fusion: bare query is contentless; the context must widen it.
         Case {
             name: "fusion-followup",
@@ -303,6 +363,7 @@ async fn golden_set() {
             context: Some("saga pattern compensating transactions"),
             expect_book: Some("sagas"),
             within_top: 3,
+            expect_chapter: None,
         },
         // Noise probe: nothing in the corpus — the confident tier must stay empty.
         Case {
@@ -311,6 +372,7 @@ async fn golden_set() {
             context: None,
             expect_book: None,
             within_top: 0,
+            expect_chapter: None,
         },
     ];
 
@@ -340,6 +402,28 @@ async fn golden_set() {
                         "{}: wanted {book} within top {}, got rank {rank:?} (results: {got:?})",
                         c.name, c.within_top
                     ));
+                }
+                // §17.2: some expected-book hit within FINAL_K must carry the
+                // expected chapter (case-insensitive substring).
+                if let Some(want) = c.expect_chapter {
+                    let want_lc = want.to_lowercase();
+                    let hit = results.iter().any(|r| {
+                        r.book_id == book
+                            && r.chapter
+                                .as_deref()
+                                .is_some_and(|ch| ch.to_lowercase().contains(&want_lc))
+                    });
+                    if !hit {
+                        let got: Vec<String> = results
+                            .iter()
+                            .filter(|r| r.book_id == book)
+                            .map(|r| format!("{:?}", r.chapter))
+                            .collect();
+                        failures.push(format!(
+                            "{}: no {book} hit carries chapter ~ \"{want}\" (chapters: {got:?})",
+                            c.name
+                        ));
+                    }
                 }
             }
             None => {

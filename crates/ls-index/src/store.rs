@@ -33,6 +33,21 @@ pub enum StoreError {
     Schema(String),
 }
 
+/// Per-chunk metadata from a full-table scan — text and vector excluded by
+/// projection (see [`Store::scan_chunk_meta`]). Format is the raw stored
+/// string, unparsed: classification happens in the caller so unparseable
+/// stamps are flagged, never silently skipped.
+#[derive(Debug, Clone)]
+pub struct ChunkMeta {
+    pub id: String,
+    pub book_id: String,
+    pub title: String,
+    pub source_path: String,
+    pub format: String,
+    pub chapter: Option<String>,
+    pub page: Option<u32>,
+}
+
 /// A row read back from the store (vector column omitted).
 #[derive(Debug, Clone)]
 pub struct RetrievedChunk {
@@ -258,6 +273,82 @@ impl Store {
             let sp = str_col(&batch, "source_path")?;
             for i in 0..bid.len() {
                 out.insert((bid.value(i).to_string(), sp.value(i).to_string()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// One metadata row per chunk — text and vector are EXCLUDED by the
+    /// projection (a full-table text scan would hold hundreds of MB; fetch
+    /// text for a sampled id set afterwards via [`Self::chunk_texts`]).
+    pub async fn scan_chunk_meta(&self) -> Result<Vec<ChunkMeta>, StoreError> {
+        let mut stream = self
+            .table
+            .query()
+            .select(Select::columns(&[
+                "id".to_string(),
+                "book_id".to_string(),
+                "title".to_string(),
+                "source_path".to_string(),
+                "format".to_string(),
+                "chapter".to_string(),
+                "page".to_string(),
+            ]))
+            .execute()
+            .await?;
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| StoreError::Stream(e.to_string()))?;
+            let id = str_col(&batch, "id")?;
+            let bid = str_col(&batch, "book_id")?;
+            let title = str_col(&batch, "title")?;
+            let sp = str_col(&batch, "source_path")?;
+            let fmt = str_col(&batch, "format")?;
+            let chap = str_col(&batch, "chapter")?;
+            let page = int_col(&batch, "page")?;
+            for i in 0..id.len() {
+                let p = page.value(i);
+                out.push(ChunkMeta {
+                    id: id.value(i).to_string(),
+                    book_id: bid.value(i).to_string(),
+                    title: title.value(i).to_string(),
+                    source_path: sp.value(i).to_string(),
+                    format: fmt.value(i).to_string(),
+                    chapter: (!chap.value(i).is_empty()).then(|| chap.value(i).to_string()),
+                    page: if p < 0 { None } else { Some(p as u32) },
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Text for an explicit chunk-id set (the sampled rows) — id-IN-list per
+    /// 256, mirroring the predicate batching of the write-side helpers.
+    pub async fn chunk_texts(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in ids.chunks(256) {
+            let list = chunk
+                .iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stream = self
+                .table
+                .query()
+                .only_if(format!("id IN ({list})"))
+                .select(Select::columns(&["id".to_string(), "text".to_string()]))
+                .execute()
+                .await?;
+            while let Some(item) = stream.next().await {
+                let batch = item.map_err(|e| StoreError::Stream(e.to_string()))?;
+                let id = str_col(&batch, "id")?;
+                let text = str_col(&batch, "text")?;
+                for i in 0..id.len() {
+                    out.insert(id.value(i).to_string(), text.value(i).to_string());
+                }
             }
         }
         Ok(out)

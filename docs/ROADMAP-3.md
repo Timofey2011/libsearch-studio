@@ -729,3 +729,109 @@ but only under one id scheme). Fix (adversarially critiqued, 9 confirmed amendme
   path-keyed delete would otherwise remove the new row) — kills the legacy-id manifest
   rows that would otherwise hold the legacy count above zero forever.
 - plan-soak reads the flag: arming + soak previews the forced set without embedding.
+
+---
+
+## §17 addendum — citation-integrity metric + golden chapter Q/A (post-re-chunk)
+
+The §5.5 metric predates the completed library re-chunk (v0.15.5: 764/765 books on the
+current chunker; 97% of epub chunks and 96% of md chunks carry `chapter`; pdf carries
+pages). Adversarially critiqued (2 lenses, 20 confirmed amendments); the critique's
+central finding REFRAMES the live tier: a pure-Rust harness re-extracts with the same
+code that produced the chunks, so it cannot measure real foliate-DOM jump success — it
+measures **extractor determinism + store↔display integrity**, which is what it is
+honestly named. True DOM-side measurement (headless webview / exported-DOM fixtures over
+the actual foliate search) is a recorded follow-up, and thresholds stay UNFROZEN until
+it exists.
+
+Corrected ground truths (critique findings 5, 9): `clean_text` (dehyphenation) applies
+to **pdf extraction only** — ebook/text chunk text is html2text/raw-scan output; and
+`format_citation`'s `Ch. {chapter}` arm is format-independent (Epub only suppresses the
+page arm). Known frontend divergences the report header must enumerate: foliate search
+joins text nodes with NO separator (`strs.join('')` — `<br>`/block boundaries inflate a
+text-side match); html2text decorations (bullets, 200-col wrap) exist on both proxy
+sides but not in the DOM; foliate's collator is case/diacritic-insensitive while
+normText is not; JS `\w` is ASCII-only so Cyrillic is never dehyphenated by the
+frontend (a Unicode-`\w` Rust port would silently diverge on RU).
+
+### 17.1 Live tier — `ls-cli cite-metric <app-dir> [coll] [--books B] [--per-book K]`
+
+Store↔display integrity harness over the REAL store. New `Store::scan_chunks()` —
+projection WITHOUT text/vector for pass 1 (metadata), then an id-IN-list fetch of text
+for the sampled rows only (~300-500 MB avoided). Sampling: FNV-1a hash of chunk id XOR
+fixed seed (no rand dep, survives lance compaction/version churn); stratified —
+hash-select B books per (family × script[RU/EN by Cyrillic fraction]) stratum first,
+then ≤K chunks per book; strata and per-book counts printed so bias is visible.
+
+Matcher replicas ported VERBATIM from the frontend, with a fixture-string unit-test
+table + cross-pin comments in BookReader.tsx (minimum anti-drift bar; gen-exts-style
+codegen is the stretch goal):
+- probe = `citeJump`'s exact selection incl. the `at=0` junk-prefix fallback;
+- `normText` with ASCII-`\w` dehyphenation (JS parity) + an explicit lowercase step
+  labeled "collator emulation";
+- `normChapter` prefix-strip.
+
+Outcomes per family:
+- **book (epub/fb2/fb2.zip):** "direct" = normChapter label resolves against re-extracted
+  labels AND probe occurs in the FIRST spine block-run carrying that label (frontend
+  phase-1 is confined to one spine item; ls-extract carries labels across items —
+  finding 3); "located" = probe anywhere; "miss-in-chapter" = label resolved, probe
+  missing (frontend still lands the user in the chapter + overlay); "cold-miss" = neither.
+  Chapterless chunks are their OWN row, excluded from the direct denominator. mobi/azw3
+  → "unverifiable (extractor best-effort)" bucket, never "miss".
+- **text (md/txt ONLY):** replicate renderRich+renderInline segmentation (~60-line pure
+  port): strip block markers, split fragments at inline-markup boundaries, 60-char
+  needle / 40-char match per fragment — raw-file matching is near-vacuous (finding 7).
+  html/office/pages/djvu → "unverified-family" rows (different render pipelines).
+- **pdf:** reframed as "stored page still contains the passage per lopdf" (integrity;
+  the frontend does a page-ordinal scroll with no text match at open). "near ±1" =
+  probe crossing a chunk's page boundary. lopdf-vs-pdfjs ordinal spot-check = follow-up.
+
+Per-book extraction wrapped in spawn_blocking + timeout → explicit "extract-timeout"
+outcome; `[n/N]` stderr progress (run_ingest style); no models, no network (guard: the
+subcommand follows the maintenance/plan-soak pattern, never touches models_dir).
+Report: per-stratum table + provisional (unfrozen) reference rates: book ≥80% direct &
+≥95% located+; text ≥90% located; pdf ≥95% on-page — first run IS the baseline.
+
+### 17.2 CI tier — golden chapter Q/A (extends golden_set.rs)
+
+- Corpus chunker gains heading tracking: standalone heading paragraphs become the
+  running `chapter` label and are CONSUMED (excluded from chunk text) — every existing
+  chunk stays byte-identical, protecting the fragile within_top-3 rank assertions
+  (verify pre/post ranks once before committing).
+- `chapter` set on a fixture subset; 2 books flip to `Format::Epub` to also pin the
+  no-page rendering (delete the stale "Pdf keeps citations page-shaped" comment; no page
+  stamps on the Epub ones).
+- `Case.expect_chapter: Option<&str>`: assert **at least one expected-book hit within
+  FINAL_K** whose `chapter` contains the substring (case-insensitive) — the top-chunk
+  variant is reranker-configuration-dependent (int8 vs f32 tie-breaks).
+- ~6 new chapter-targeted cases (EN + RU). Existing cases untouched.
+- New `crates/ls-index/tests/store_scan.rs`: dummy-vector chunks; scan_chunks projection
+  + row shape + id-IN-list text fetch.
+
+### 17.2b Baseline (2026-07-24, seed 0xC17E_0017, --books 12 --per-book 4)
+
+- **Book/en (48):** Direct 8% · Located 60% · MissInChapter 2% · ColdMiss 17% ·
+  ChapterlessMiss 4% · ExtractError 8%. The low Direct is dominated by label
+  PROVENANCE drift, exactly as the critique predicted: stored chapters came
+  from the GPU pipeline (fitz get_toc), the proxy re-extracts with rbook —
+  different label strings fail norm_chapter equality and demote to Located.
+  In the app, phase-2 whole-book search still lands ~68% (Direct+Located);
+  ~23% would show the explicit-miss overlay. Which label set foliate's TOC
+  actually matches is the DOM-side follow-up's first question.
+- **Pdf (48+48):** Direct+Near 62% en / 56% ru; "page stamp exists, probe
+  nowhere per lopdf" 29% en / 44% ru — fitz-extracted chunk text vs lopdf
+  re-extraction drift (finding 6), worse for Cyrillic. The app's pdf open is
+  a page-ordinal scroll, so user-visible jump health hinges on ordinal
+  fidelity, not text match — unmeasured until the pdfjs spot-check.
+- **Text/en (48):** Located 77% · Miss 23% — a REAL frontend gap (needle
+  spanning inline markup / weaker md normalizer), the strongest candidate
+  for an actual UX fix from this baseline.
+- Extraction p50 374 ms · p95 2.9 s · max 3.4 s per book; no timeouts.
+
+### 17.3 Explicitly out of scope (follow-ups, gated on measured rates)
+
+- DOM-side jump measurement (headless webview over the real foliate search) — the true
+  §5.5 metric; unblocking threshold freeze.
+- Auto-highlight of citeText on PDF open; sharing one normalization helper across the
+  three frontend paths; OCR for the scanned-PDF straggler.

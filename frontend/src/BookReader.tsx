@@ -43,6 +43,8 @@ interface FoliateView extends HTMLElement {
 
 /// Whitespace/hyphenation normalization shared by cite text and DOM text —
 /// extractor output and foliate-rendered text differ exactly there.
+/// CROSS-PIN: ported verbatim in crates/ls-cli/src/citemetric.rs (norm_text,
+/// norm_chapter, probe_of) for the §17.1 metric — change both together.
 function normText(s: string): string {
   return s
     .replace(/­/g, "") // soft hyphens

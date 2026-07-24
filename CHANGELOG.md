@@ -2,6 +2,26 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.16.0 — 2026-07-24
+
+Bump manifests 0.15.5 → 0.16.0. Citation accuracy becomes measurable
+(ROADMAP-3 §17, adversarially critiqued — 20 confirmed amendments).
+
+- **New `ls-cli cite-metric`** — a citation-integrity harness over the real
+  library: stratified sample (family × RU/EN, hash-keyed and reproducible),
+  verbatim Rust ports of the frontend's three citation matchers (book
+  reader, markdown TreeWalker, pdf page), honest outcome taxonomy
+  (direct / located / miss-in-chapter / cold-miss / chapterless /
+  unverifiable / extract-timeout) and a caveats header stating exactly
+  what a pure-Rust proxy can and cannot prove. Read-only; no models.
+- **Golden chapter Q/A in CI** — the committed retrieval corpus now carries
+  real chapter labels (existing chunks byte-identical; all prior ranks
+  preserved) and four new chapter-targeted cases (EN + RU) assert that
+  retrieval surfaces the *right chapter*, guarding the
+  embed→store→retrieve→citation chapter plumbing end to end.
+- New `Store::scan_chunk_meta` / `chunk_texts` (projected, two-pass — no
+  full-table text scan) with an integration test.
+
 ## v0.15.5 — 2026-07-24
 
 Bump manifests 0.15.4 → 0.15.5.

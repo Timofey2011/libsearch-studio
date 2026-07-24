@@ -374,6 +374,8 @@ export default function App() {
     const host = mdReaderRef.current;
     const cite = reader?.citeText;
     if (!host || !(reader?.text || reader?.html) || !cite) return;
+    // CROSS-PIN: ported verbatim in crates/ls-cli/src/citemetric.rs (md_norm,
+    // md_match) for the §17.1 metric — change both together.
     const norm = (x: string) => x.replace(/\s+/g, " ").trim().toLowerCase();
     const needle = norm(cite).slice(0, 60);
     if (!needle) return;
@@ -1491,6 +1493,8 @@ export default function App() {
   }
 
   // Inline markdown: **bold**, *italic*, `code`, and [n] citation links.
+  // CROSS-PIN: the block/inline segmentation is replicated in
+  // crates/ls-cli/src/citemetric.rs (md_fragments) — change both together.
   function renderInline(text: string, sources: Src[]) {
     const nodes: React.ReactNode[] = [];
     const re = /\*\*([^*]+)\*\*|\*([^*]+)\*|`([^`]+)`|\[[\d,\s]+\]/g;

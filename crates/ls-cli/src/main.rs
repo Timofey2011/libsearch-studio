@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+
+mod citemetric;
 use ls_embed::{BgeTokenCounter, Embedder, Reranker};
 use ls_index::{chunk_book, ChunkParams, Store};
 use ls_llm::{build_prompt, OllamaClient};
@@ -88,6 +90,32 @@ async fn main() -> Result<()> {
             }
             run_maintenance(&app_dir, &coll, fo, fs_, fd, fm).await
         }
+        Some("cite-metric") => {
+            // §17.1 citation-integrity metric: store↔display integrity over
+            // the real store. Read-only; no models, no network.
+            let mut app_dir = String::new();
+            let mut coll = "default".to_string();
+            let (mut books, mut per_book) = (12usize, 4usize);
+            let mut rest = args;
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--books" => {
+                        books = rest.next().and_then(|v| v.parse().ok()).unwrap_or(books)
+                    }
+                    "--per-book" => {
+                        per_book = rest.next().and_then(|v| v.parse().ok()).unwrap_or(per_book)
+                    }
+                    other if app_dir.is_empty() => app_dir = other.to_string(),
+                    other => coll = other.to_string(),
+                }
+            }
+            if app_dir.is_empty() {
+                bail!(
+                    "usage: ls-cli cite-metric <app-data-dir> [collection_id] [--books B] [--per-book K]"
+                );
+            }
+            run_cite_metric(&app_dir, &coll, books, per_book).await
+        }
         Some("gen-exts") => {
             // Regenerate the frontend's extension map from the ls-core
             // canonical list; a freshness test keeps the copy honest.
@@ -98,8 +126,193 @@ async fn main() -> Result<()> {
             eprintln!("wrote {}", out.display());
             Ok(())
         }
-        _ => bail!("usage: ls-cli <search|ingest|import|backfill-state|gen-exts|ask> ..."),
+        _ => bail!("usage: ls-cli <search|ingest|ask|import|backfill-state|plan-soak|maintenance|cite-metric|gen-exts> ..."),
     }
+}
+
+async fn run_cite_metric(
+    app_dir: &str,
+    coll_id: &str,
+    books_n: usize,
+    per_book: usize,
+) -> Result<()> {
+    use citemetric::{
+        classify_book, classify_pdf, family_of, fnv1a, md_fragments, md_match, script_of, BookText,
+        Family, Outcome,
+    };
+    const SEED: u64 = 0xC17E_0017;
+    const EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    let db = ls_app::Db::open(Path::new(app_dir).join("app.db")).context("open app.db")?;
+    let coll = db
+        .list_collections()
+        .context("list collections")?
+        .into_iter()
+        .find(|c| c.id == coll_id)
+        .with_context(|| format!("collection '{coll_id}' not found"))?;
+    let store = Store::open_or_create(&coll.db_path, "chunks")
+        .await
+        .context("open store")?;
+
+    eprintln!("scanning chunk metadata…");
+    let meta = store.scan_chunk_meta().await.map_err(anyhow::Error::msg)?;
+    eprintln!("  {} chunks", meta.len());
+
+    // Stratified sample: hash-select B books per (family × script), then ≤K
+    // chunks per book — identity-keyed (survives compaction/version churn).
+    let mut by_book: std::collections::HashMap<String, Vec<&ls_index::ChunkMeta>> =
+        std::collections::HashMap::new();
+    for m in &meta {
+        by_book.entry(m.book_id.clone()).or_default().push(m);
+    }
+    let mut strata: std::collections::HashMap<(Family, &'static str), Vec<(u64, String)>> =
+        std::collections::HashMap::new();
+    for (bid, chunks) in &by_book {
+        let fam = family_of(&chunks[0].format);
+        let script = script_of(&chunks[0].title);
+        strata
+            .entry((fam, script))
+            .or_default()
+            .push((fnv1a(bid, SEED), bid.clone()));
+    }
+    let mut sampled: Vec<(Family, &'static str, Vec<&ls_index::ChunkMeta>)> = Vec::new();
+    for ((fam, script), mut ids) in strata {
+        ids.sort();
+        for (_, bid) in ids.into_iter().take(books_n) {
+            let mut chunks: Vec<&ls_index::ChunkMeta> = by_book[&bid].clone();
+            chunks.sort_by_key(|c| fnv1a(&c.id, SEED));
+            chunks.truncate(per_book);
+            sampled.push((fam, script, chunks));
+        }
+    }
+    let ids: Vec<String> = sampled
+        .iter()
+        .flat_map(|(_, _, cs)| cs.iter().map(|c| c.id.clone()))
+        .collect();
+    eprintln!(
+        "sampled {} chunks across {} books (seed {SEED:#x}, --books {books_n}, --per-book {per_book})",
+        ids.len(),
+        sampled.len()
+    );
+    let texts = store.chunk_texts(&ids).await.map_err(anyhow::Error::msg)?;
+
+    // Per-book verification with a hard extraction timeout.
+    let mut tally: std::collections::HashMap<(Family, &'static str, Outcome), usize> =
+        std::collections::HashMap::new();
+    let mut extract_ms: Vec<u128> = Vec::new();
+    let total_books = sampled.len();
+    for (bi, (fam, script, chunks)) in sampled.into_iter().enumerate() {
+        let path = chunks[0].source_path.clone();
+        let name = Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        eprintln!("[{}/{}] {}", bi + 1, total_books, name);
+        let mut mark = |o: Outcome, n: usize| *tally.entry((fam, script, o)).or_default() += n;
+        match fam {
+            Family::BookUnverifiable => mark(Outcome::Unverifiable, chunks.len()),
+            Family::Unverified | Family::Unknown => mark(Outcome::UnverifiedFamily, chunks.len()),
+            Family::Text => {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        // 8 MiB display cap (read_source_text semantics).
+                        let cap = bytes.len().min(8 * 1024 * 1024);
+                        let content = String::from_utf8_lossy(&bytes[..cap]);
+                        let frags = md_fragments(&content);
+                        for c in &chunks {
+                            let Some(t) = texts.get(&c.id) else { continue };
+                            if md_match(t, &frags) {
+                                mark(Outcome::ChapterlessLocated, 1);
+                            } else {
+                                mark(Outcome::ChapterlessMiss, 1);
+                            }
+                        }
+                    }
+                    Err(_) => mark(Outcome::ExtractError, chunks.len()),
+                }
+            }
+            Family::Book | Family::Pdf => {
+                let p = PathBuf::from(&path);
+                let t0 = std::time::Instant::now();
+                let extraction = tokio::time::timeout(
+                    EXTRACT_TIMEOUT,
+                    tokio::task::spawn_blocking(move || ls_extract::extract(&p)),
+                )
+                .await;
+                extract_ms.push(t0.elapsed().as_millis());
+                match extraction {
+                    Err(_) => mark(Outcome::ExtractTimeout, chunks.len()),
+                    Ok(Err(_)) | Ok(Ok(Err(_))) => mark(Outcome::ExtractError, chunks.len()),
+                    Ok(Ok(Ok(doc))) => {
+                        let bt = BookText::from_doc(&doc);
+                        for c in &chunks {
+                            let Some(t) = texts.get(&c.id) else { continue };
+                            let o = if fam == Family::Pdf {
+                                classify_pdf(c.page, t, &bt)
+                            } else {
+                                classify_book(c.chapter.as_deref(), t, &bt)
+                            };
+                            mark(o, 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Report.
+    println!("== citation-integrity metric (§17.1) ==");
+    println!(
+        "PROXY, not DOM truth: re-extraction shares the ingest code path. Known caveats:\n\
+         - foliate joins text nodes with NO separator (a text-side match can inflate)\n\
+         - html2text decorations exist on both proxy sides, not in the DOM (inflates)\n\
+         - collator emulation is lowercase-only (no diacritic folding)\n\
+         - JS \\w is ASCII: RU is never dehyphenated (ported faithfully)\n\
+         Thresholds are UNFROZEN reference rates until a DOM-side subsample exists."
+    );
+    let order = [
+        Outcome::Direct,
+        Outcome::Near,
+        Outcome::Located,
+        Outcome::MissInChapter,
+        Outcome::ColdMiss,
+        Outcome::ChapterlessLocated,
+        Outcome::ChapterlessMiss,
+        Outcome::Unverifiable,
+        Outcome::UnverifiedFamily,
+        Outcome::ExtractTimeout,
+        Outcome::ExtractError,
+    ];
+    let mut keys: Vec<(Family, &'static str)> = tally.keys().map(|(f, s, _)| (*f, *s)).collect();
+    keys.sort_by_key(|k| format!("{k:?}"));
+    keys.dedup();
+    for (fam, script) in keys {
+        let n: usize = order
+            .iter()
+            .filter_map(|o| tally.get(&(fam, script, *o)))
+            .sum();
+        println!("-- {fam:?} / {script} ({n} chunks)");
+        for o in order {
+            if let Some(c) = tally.get(&(fam, script, o)) {
+                println!("   {o:?}: {c} ({:.0}%)", 100.0 * *c as f64 / n as f64);
+            }
+        }
+    }
+    if !extract_ms.is_empty() {
+        let mut ms = extract_ms.clone();
+        ms.sort();
+        let p95 = ms[((ms.len() * 95) / 100).min(ms.len() - 1)];
+        println!(
+            "extraction per book: p50 {} ms · p95 {p95} ms · max {} ms",
+            ms[ms.len() / 2],
+            ms[ms.len() - 1]
+        );
+    }
+    println!(
+        "reference rates (unfrozen): book ≥80% Direct & ≥95% Direct+Located; \
+         text ≥90% located; pdf ≥95% Direct+Near"
+    );
+    Ok(())
 }
 
 async fn run_maintenance(
