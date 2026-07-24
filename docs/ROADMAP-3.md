@@ -1040,3 +1040,93 @@ Recommendation: build the capability (a file class the library silently cannot
 read is against the project's ethos), gate per book on §18.4, expect 2–3 of the
 7 to pass — and treat the stale framework guides as a Maintenance/curation
 decision separate from OCR.
+
+
+---
+
+## §19 — Library curation: representing weak books, and removing them for good
+
+Status 2026-07-24: designed, not built. Prompted by §18.5 — deciding what to
+OCR turned out to be a curation question, and the library has no vocabulary for
+"this book is in here but shouldn't be."
+
+### 19.1 The missing primitive
+
+There is today **no way to say "stop indexing this book"**. Deleting its chunks
+is not removal: `remove_path()` clears the store rows, `book_state` and
+`skip_state`, and then the very next index run walks the folder, finds the file
+unchanged, and re-ingests it. Every existing state is either ingest-side and
+caps-invalidated (`skip_state`) or a freshness record (`book_state`); neither
+expresses user intent, and both are designed to be forgotten.
+
+So the one genuinely new mechanism is a durable, user-owned exclusion:
+
+    excluded_book(collection_id, source_path, reason, note, excluded_at)
+
+Path-keyed (like `reindex_book`, so it survives re-chunking and id changes) and
+**never invalidated by caps or fingerprint changes** — that is exactly the
+difference from `skip_state`. `plan_index_run` consults it as a new first
+stage; the planner already has the shape for this.
+
+The payoff is that the *query* side needs no changes at all: an excluded book's
+chunks are deleted, so retrieval simply cannot reach it. Exclusion = delete the
+chunks + remember the decision.
+
+### 19.2 What "remove from the library" must mean
+
+**It must not delete the user's file.** `maintenance.rs` states the invariant
+("NEVER source files") and the UI repeats it; a curation feature is the most
+tempting place to break it and the worst place to do so — these are books in a
+synced Dropbox, and an index is a rebuildable artifact while a book is not.
+
+Removal therefore means: *drop it from the index and never pick it up again.*
+The UI must say precisely that, and offer **Reveal in Finder** for the user to
+delete the file themselves if that is what they meant. Reversible by design:
+un-exclude, and the next index run re-adds the book.
+
+### 19.3 Representing weakness — evidence, not a verdict
+
+The temptation is a "quality score" that ranks books. Resist it: the signals
+are heterogeneous and a wrong auto-verdict silently loses a good book. Present
+**evidence columns** and let the user judge, in the §17 spirit of naming what a
+number can and cannot prove.
+
+Signals available cheaply, and what each is actually worth:
+
+| signal | source | strength |
+|---|---|---|
+| chars indexed, chunk count | store; needs `book_catalog` to sum `loc_end-loc_start` | **strong** for ghosts — 22 chars in a 62.9 MB book is unambiguous |
+| chars per page | ditto ÷ page count | **strong**; the ghost trigger of §18.3.3 |
+| publication year | PDF `creationDate` (present in **31 of 40** sampled books; range 2019-2025), epub `dc:date` (one line from `ebook.rs:67`, currently unread) | **medium** — a scan's creationDate is when it was *scanned*, so it bounds the edition from below, no more |
+| OCR quality | §18.4 metrics, when the book came from OCR | **medium**, and only exists post-OCR |
+| never retrieved | the app already stores conversations and messages | **weak alone** — absence of evidence — but useful to sort by |
+| superseded duplicate | the existing office-dedup ranking generalizes | **strong** when two editions share a title |
+
+Deliberately NOT built: content-based staleness detection ("mentions Next.js
+12"). It is a heuristic dressed as a fact, it would need per-framework
+knowledge that rots, and the user can read a title and a year.
+
+### 19.4 Where it lives
+
+A **Library review** category in the existing Maintenance tab, which already
+has the card shape (`renderMaintenanceTab`) and the re-derive-don't-trust-the-
+client contract. Two frictions to fix rather than work around: the panel is
+single-collection (curation wants library-wide), and its four fix flags are
+positional (a fifth wants a struct). The review queue is also the first
+*stateful* Maintenance category — the existing four re-derive their targets on
+apply, which is right for them and impossible here, since the state IS the
+user's decision.
+
+Per-book actions: **Exclude** (delete chunks + remember), **Re-index**
+(exists), **Reveal in Finder**, **Un-exclude** from a separate Excluded list —
+which must be visible, or the app has silently disappeared a book, exactly the
+failure §17 spent four releases eliminating elsewhere.
+
+### 19.5 Ranking demotion — explicitly deferred
+
+A middle tier ("keep it, trust it less") is tempting for dated-but-useful books
+and is the natural home for a per-book penalty at the `min_relevance` tier.
+Deferred: it needs a number to justify a weight, retrieval has no per-book
+weight today, and a demotion the user cannot see is the opposite of this
+project's habits. Binary in/out first; revisit if the excluded list fills with
+books the user hesitates over.
