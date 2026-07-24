@@ -31,7 +31,7 @@ import pathlib
 import sys
 import time
 
-SCRIPT_VERSION = 8
+SCRIPT_VERSION = 9
 
 # The extension universe this script handles / deliberately skips. The Rust
 # lockstep test parses these literals out of the embedded script and asserts
@@ -397,6 +397,8 @@ def chunk_book(full, page_offsets, tokenizer):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
+    ap.add_argument("--converted-dir", default=None,
+                    help="app's <data_dir>/converted, where OCR'd twins live")
     ap.add_argument("--device", default="mps")
     ap.add_argument("--batch", type=int, default=EMBED_BATCH)
     ap.add_argument("--fp32", action="store_true", help="disable fp16 (slower, exact)")
@@ -488,6 +490,25 @@ def main() -> None:
                 if ext in FITZ_EXTS:
                     fitz_path = path
                     tmp_fb2 = None
+                    # A scanned pdf has an OCR'd twin in the conversion cache
+                    # once the OCR pre-pass has run over it. Reading THAT gives
+                    # the text — and the page numbers, which the invisible text
+                    # layer preserves — with no OCR work inside the index batch.
+                    # The key is cross-pinned with ls-extract's ocr_cache_key.
+                    if ext == "pdf" and args.converted_dir:
+                        try:
+                            from ocr_pdf import ocr_cache_key
+                            twin = (pathlib.Path(args.converted_dir)
+                                    / f"{ocr_cache_key(path)}.ocr.pdf")
+                            if twin.exists():
+                                fitz_path = twin
+                                print(f"ocr: using searchable copy for {p}",
+                                      file=sys.stderr, flush=True)
+                        except Exception as e:  # noqa: BLE001
+                            # A cache miss or a bad key must never cost the book
+                            # its normal extraction.
+                            print(f"ocr: twin lookup failed ({e})",
+                                  file=sys.stderr, flush=True)
                     if ext == "fb2.zip":
                         # fitz can't read the zip wrapper: unzip the single
                         # .fb2 entry to a temp file first.

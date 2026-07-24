@@ -428,13 +428,17 @@ async fn run_py_batch(
     gi: &mut usize,
     total: usize,
     embed_batch: Option<u32>,
+    converted_dir: &Path,
 ) -> Result<Option<Vec<SidecarOutcome>>, String> {
     let mut cmd = tokio::process::Command::new(py);
     cmd.arg(script)
         .arg("--out")
         .arg(parquet)
         .arg("--device")
-        .arg(device);
+        .arg(device)
+        // Scanned pdfs read their OCR'd twin from here instead of the original.
+        .arg("--converted-dir")
+        .arg(converted_dir);
     if let Some(b) = embed_batch {
         cmd.arg("--batch").arg(b.to_string());
     }
@@ -983,6 +987,7 @@ async fn fast_index_collection(
                 &mut gi,
                 total,
                 embed_batch,
+                &state.data_dir.join("converted"),
             )
             .await
             {
@@ -1750,6 +1755,21 @@ async fn resolve_display_path(
                 }),
                 Err(_) => Ok(original),
             };
+        }
+        // A scanned pdf displays via its OCR'd copy when one has been made.
+        // That copy is what makes an OCR'd book behave like any other: it
+        // carries an invisible text layer, so cite-highlighting, Cmd-F and
+        // text selection work against it, while the ORIGINAL file remains the
+        // book's identity everywhere else (ROADMAP-3 §18.3.1).
+        if ext == "pdf" {
+            if let Some(pdf) = ls_extract::ocr_display_pdf(Path::new(&path), &dir) {
+                return Ok(DisplayPath {
+                    display_path: pdf.to_string_lossy().into_owned(),
+                    converted: true,
+                    converter: Some("OCR (scanned)".into()),
+                });
+            }
+            return Ok(original);
         }
         // .webarchive IS html — unwrap the plist and cache the page.
         if ext == "webarchive" {
