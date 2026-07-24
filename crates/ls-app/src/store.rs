@@ -788,9 +788,33 @@ impl Db {
         Ok(rows.next().transpose()?)
     }
 
+    /// Legacy-chunker books an armed re-chunk could actually re-embed: books
+    /// with a skip_state row are excluded — the planner silences them at stage
+    /// 0.5, so counting them would promise a re-chunk that can never happen
+    /// (the count is what the nudge/armed banner shows). If capabilities
+    /// change, the retried book either indexes (leaves the count) or re-skips
+    /// (stays excluded) on the very next run, so the count self-corrects.
     pub fn legacy_chunker_count(&self, collection_id: &str) -> Result<usize, DbError> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM book_state WHERE collection_id = ?1 AND chunker_ver < ?2",
+            "SELECT COUNT(*) FROM book_state b \
+             WHERE b.collection_id = ?1 AND b.chunker_ver < ?2 \
+             AND NOT EXISTS (SELECT 1 FROM skip_state s \
+                             WHERE s.collection_id = ?1 AND s.source_path = b.source_path)",
+            params![collection_id, CURRENT_CHUNKER_VER],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Legacy-chunker books that are skip-silenced (quarantined, no
+    /// extractable text, …) — permanently stuck on the old chunker until
+    /// capabilities change. Shown as an informational note, never a nudge.
+    pub fn legacy_skipped_count(&self, collection_id: &str) -> Result<usize, DbError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM book_state b \
+             WHERE b.collection_id = ?1 AND b.chunker_ver < ?2 \
+             AND EXISTS (SELECT 1 FROM skip_state s \
+                         WHERE s.collection_id = ?1 AND s.source_path = b.source_path)",
             params![collection_id, CURRENT_CHUNKER_VER],
             |r| r.get(0),
         )?;
@@ -865,6 +889,27 @@ mod tests {
         // Reset forgets fingerprints so a re-index re-embeds everything.
         assert_eq!(db.clear_book_state("c1").unwrap(), 2);
         assert_eq!(db.legacy_chunker_count("c1").unwrap(), 0);
+    }
+
+    #[test]
+    fn legacy_count_excludes_skip_silenced_books() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_book_state_ver("c1", "a", "fp1", "s1", "/lib/a.pdf", 0)
+            .unwrap();
+        db.set_book_state_ver("c1", "b", "fp2", "s2", "/lib/b.pdf", 0)
+            .unwrap();
+        assert_eq!(db.legacy_chunker_count("c1").unwrap(), 2);
+        assert_eq!(db.legacy_skipped_count("c1").unwrap(), 0);
+        // A quarantined/no-text book is silenced at plan stage 0.5 — an armed
+        // re-chunk can never re-embed it, so the nudge must not count it.
+        db.upsert_skip("c1", "/lib/b.pdf", "gpu", "fp2", "quarantined", "caps1")
+            .unwrap();
+        assert_eq!(db.legacy_chunker_count("c1").unwrap(), 1);
+        assert_eq!(db.legacy_skipped_count("c1").unwrap(), 1);
+        // Once the skip is erased (book indexed or caps changed), it counts again.
+        db.erase_skips("c1", "/lib/b.pdf").unwrap();
+        assert_eq!(db.legacy_chunker_count("c1").unwrap(), 2);
+        assert_eq!(db.legacy_skipped_count("c1").unwrap(), 0);
     }
 
     #[test]

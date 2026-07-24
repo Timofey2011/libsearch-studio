@@ -262,6 +262,7 @@ export default function App() {
   // Re-index nudge: books chunked by an older scheme in the current collection.
   const [legacyBooks, setLegacyBooks] = useState(0);
   const [nudgeDismissed, setNudgeDismissed] = useState(false);
+  const [legacySkipped, setLegacySkipped] = useState(0);
   const [rechunkNote, setRechunkNote] = useState<string | null>(null);
   // Persistent re-chunk armed flag (v0.15) — sourced from index_health, so it
   // survives restarts and clears itself once a run reaches the fixed point.
@@ -513,9 +514,10 @@ export default function App() {
   // Index health for the passive re-index nudge (manifest-only, no folder scan).
   useEffect(() => {
     if (!toolsOpen || toolsTab !== "collections" || !currentColl) return;
-    invoke<{ legacy_books: number; rechunk_pending: boolean }>("index_health", { collectionId: currentColl.id })
+    invoke<{ legacy_books: number; legacy_skipped: number; rechunk_pending: boolean }>("index_health", { collectionId: currentColl.id })
       .then((h) => {
         setLegacyBooks(h.legacy_books);
+        setLegacySkipped(h.legacy_skipped);
         setRechunkArmed(h.rechunk_pending);
       })
       .catch(console.error);
@@ -1307,6 +1309,9 @@ export default function App() {
     setIndexing(true);
     setIndexKind(kind);
     setIndexNote(null);
+    // The static "Armed — …" note is consumed by this run: after it, the live
+    // index_health state (armed banner / nudge) is the truth again.
+    setRechunkNote(null);
     setProgress(null);
     setIndexLog([]);
     setIdxCount({ done: 0, total: 0, chunks: 0 });
@@ -1680,6 +1685,13 @@ export default function App() {
               </div>
             )}
             {rechunkNote && <div className="note-ok" style={{ marginTop: 6, fontSize: 12.5 }}>{rechunkNote}</div>}
+            {legacySkipped > 0 && !rechunkNote && (
+              <div className="muted" style={{ marginTop: 6, fontSize: 12.5 }}>
+                {legacySkipped} legacy book(s) can't be re-chunked right now (skipped — e.g. no
+                extractable text, or embedding crashes the GPU helper). Their existing chunks stay
+                searchable; see the index Log for reasons.
+              </div>
+            )}
           </div>
         )}
 

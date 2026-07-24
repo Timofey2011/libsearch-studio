@@ -427,6 +427,7 @@ async fn run_py_batch(
     batch: &[String],
     gi: &mut usize,
     total: usize,
+    embed_batch: Option<u32>,
 ) -> Result<Option<Vec<SidecarOutcome>>, String> {
     let mut cmd = tokio::process::Command::new(py);
     cmd.arg(script)
@@ -434,6 +435,9 @@ async fn run_py_batch(
         .arg(parquet)
         .arg("--device")
         .arg(device);
+    if let Some(b) = embed_batch {
+        cmd.arg("--batch").arg(b.to_string());
+    }
     for f in batch {
         cmd.arg(f);
     }
@@ -934,11 +938,19 @@ async fn fast_index_collection(
         // one book that kills the process stands alone — it then gets a real
         // caps-scoped skip (quarantine) instead of poisoning a batch every run.
         const CHECKPOINT_N: usize = 40;
+        /// Last-resort encode micro-batch for a book that crashed the helper
+        /// alone at the default batch size — a fraction of the peak memory.
+        const MICRO_BATCH: u32 = 8;
         let mut gi = 0usize; // global book counter for progress numbering
-        let mut queue: std::collections::VecDeque<Vec<ls_app::EmbedItem>> =
-            to_embed.chunks(CHECKPOINT_N).map(|c| c.to_vec()).collect();
+                             // Queue item: (books, encode-batch override). The override is None for
+                             // normal attempts; a single book that crashed at the default size gets
+                             // one retry at MICRO_BATCH before quarantine.
+        let mut queue: std::collections::VecDeque<(Vec<ls_app::EmbedItem>, Option<u32>)> = to_embed
+            .chunks(CHECKPOINT_N)
+            .map(|c| (c.to_vec(), None))
+            .collect();
         let mut seq = 0usize; // helper-attempt counter (batch numbering + tmp names)
-        while let Some(batch) = queue.pop_front() {
+        while let Some((batch, embed_batch)) = queue.pop_front() {
             if state.cancel.load(Ordering::SeqCst) {
                 cancelled = true;
                 break;
@@ -970,6 +982,7 @@ async fn fast_index_collection(
                 &batch_paths,
                 &mut gi,
                 total,
+                embed_batch,
             )
             .await
             {
@@ -999,13 +1012,25 @@ async fn fast_index_collection(
                             ),
                         );
                         let (a, b) = batch.split_at(mid);
-                        queue.push_front(b.to_vec());
-                        queue.push_front(a.to_vec());
+                        queue.push_front((b.to_vec(), None));
+                        queue.push_front((a.to_vec(), None));
+                    } else if embed_batch.is_none() {
+                        // Alone but still at the default encode batch: one
+                        // last try at a tiny micro-batch — a fraction of the
+                        // peak memory lets some giant books squeeze through.
+                        let _ = window.emit(
+                            "index-log",
+                            format!(
+                                "retrying alone with encode micro-batch {MICRO_BATCH}: {}",
+                                batch[0].path
+                            ),
+                        );
+                        queue.push_front((batch, Some(MICRO_BATCH)));
                     } else {
-                        // Alone (max free GPU memory) and still crashing: this
-                        // book is the culprit. Quarantine with a caps-scoped
-                        // skip so it stops voiding batches — retried only when
-                        // capabilities (python env / GPU) change.
+                        // Alone at the micro-batch (best possible shot) and
+                        // still crashing: this book is the culprit. Quarantine
+                        // with a caps-scoped skip so it stops voiding batches
+                        // — retried only when capabilities change.
                         let it = &batch[0];
                         gi += 1;
                         skipped += 1;
@@ -1858,8 +1883,12 @@ async fn export_note(state: State<'_, AppState>, scope: String) -> Result<String
 
 #[derive(serde::Serialize)]
 struct IndexHealth {
-    /// Books whose chunks predate the current chunking scheme (v0.5.8 cross-page).
+    /// Legacy-chunker books an armed re-chunk can actually re-embed
+    /// (skip-silenced books excluded — the nudge must not promise them).
     legacy_books: usize,
+    /// Legacy-chunker books stuck behind a skip (quarantined, no extractable
+    /// text) — informational only, resolved by a capability change.
+    legacy_skipped: usize,
     /// The armed re-chunk flag (v0.15): persists until an Index run reaches
     /// the nothing-left-to-force fixed point.
     rechunk_pending: bool,
@@ -1875,9 +1904,11 @@ async fn index_health(
     let db = state.db()?;
     Ok(IndexHealth {
         rechunk_pending: db.rechunk_pending(&collection_id).unwrap_or(false),
-        legacy_books: state
-            .db()?
+        legacy_books: db
             .legacy_chunker_count(&collection_id)
+            .map_err(|e| e.to_string())?,
+        legacy_skipped: db
+            .legacy_skipped_count(&collection_id)
             .map_err(|e| e.to_string())?,
     })
 }

@@ -2,6 +2,24 @@
 
 All notable changes to LibSearch Studio, newest first. Each version is a git tag (`vN`) and a GitHub release with the `.dmg` attached.
 
+## v0.15.5 — 2026-07-24
+
+Bump manifests 0.15.4 → 0.15.5.
+
+- **Fixed: the re-chunk nudge could never resolve.** Books that are
+  skip-listed (no extractable text, or quarantined for crashing the GPU
+  helper) were counted as "legacy books" by the nudge and armed banner,
+  promising a re-chunk that the planner (correctly) never performs. The
+  count now includes only books a re-chunk can actually reach; permanently
+  skipped legacy books get their own informational note instead (their
+  existing chunks stay searchable).
+- **Fixed: the "Armed — …" confirmation message stuck around forever**,
+  hiding the live banner/nudge state even after the run that consumed it.
+- **One last chance before quarantine:** a book that crashes the helper
+  alone is retried once with a tiny encode micro-batch (8) — a fraction of
+  the peak memory — which can squeeze very large books through; only if
+  that also crashes is it quarantined.
+
 ## v0.15.4 — 2026-07-23
 
 Bump manifests 0.15.3 → 0.15.4.
